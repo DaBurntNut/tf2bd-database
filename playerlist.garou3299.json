@@ -1389,6 +1389,20 @@
 		},
 		{
 			"attributes": [
+				"suspicious",
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "monkeyspeed",
+				"time": 1793903045
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"niggas down there camping\""
+			],
+			"steamid": "[U:1:477647173]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -4556,6 +4570,16 @@
 				"[auto] automatically marked: Racist | reason: \"nigga\""
 			],
 			"steamid": "[U:1:1563821474]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "sadpuppy",
+				"time": 1793898528
+			},
+			"steamid": "[U:1:1566519060]"
 		},
 		{
 			"attributes": [
