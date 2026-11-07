@@ -2071,6 +2071,19 @@
 				"cheater"
 			],
 			"last_seen": {
+				"player_name": "Songke\ud83c\uddf9\ud83c\udded",
+				"time": 1794076288
+			},
+			"proof": [
+				"Silent Aim, Crit Bucket & ESP"
+			],
+			"steamid": "[U:1:726169310]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
 				"player_name": "\u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22",
 				"time": 1784819053
 			},
@@ -3342,6 +3355,19 @@
 				"[auto] automatically marked: Racist | reason: \"retarded niggers\""
 			],
 			"steamid": "[U:1:1092055476]"
+		},
+		{
+			"attributes": [
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "Arthur",
+				"time": 1794072362
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"nigga\""
+			],
+			"steamid": "[U:1:1097348177]"
 		},
 		{
 			"attributes": [
@@ -5320,6 +5346,19 @@
 				"https://youtu.be/mgZOjEOqYiQ?t=5"
 			],
 			"steamid": "[U:1:1904438385]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "Aim Hero",
+				"time": 1793989312
+			},
+			"proof": [
+				"ESP"
+			],
+			"steamid": "[U:1:1904970538]"
 		},
 		{
 			"attributes": [
