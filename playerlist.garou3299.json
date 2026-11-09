@@ -1637,6 +1637,16 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "nukebais1",
+				"time": 1794248565
+			},
+			"steamid": "[U:1:676354081]"
+		},
+		{
+			"attributes": [
 				"cheater"
 			],
 			"last_seen": {
@@ -4406,11 +4416,12 @@
 				"racist"
 			],
 			"last_seen": {
-				"player_name": "moby octopad",
-				"time": 1791738379
+				"player_name": "aspiring child actress",
+				"time": 1794244832
 			},
 			"proof": [
-				"[auto] automatically marked: Racist | reason: \"nigga hes useless\""
+				"[auto] automatically marked: Racist | reason: \"nigga hes useless\"",
+				"[auto] automatically marked: Racist | reason: \"nigga invite me\""
 			],
 			"steamid": "[U:1:1507063209]"
 		},
