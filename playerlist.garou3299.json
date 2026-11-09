@@ -104,6 +104,21 @@
 		},
 		{
 			"attributes": [
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "Carmar",
+				"time": 1794158317
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"NIGGER PLEASE\"",
+				"[auto] automatically marked: Racist | reason: \"ok i'll just NIGGER\"",
+				"[auto] automatically marked: Racist | reason: \"NIGGER NIGGER NIGGER NIGGER NIGGER NIGGER\""
+			],
+			"steamid": "[U:1:67771041]"
+		},
+		{
+			"attributes": [
 				"cheater"
 			],
 			"last_seen": {
@@ -252,6 +267,16 @@
 				"[auto] automatically marked: Racist | reason: \"thickthighspussysaladlover01 :  salty nigger\""
 			],
 			"steamid": "[U:1:120315676]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "Alston",
+				"time": 1794161049
+			},
+			"steamid": "[U:1:120668409]"
 		},
 		{
 			"attributes": [
@@ -911,6 +936,19 @@
 				"time": 1786728762
 			},
 			"steamid": "[U:1:303893457]"
+		},
+		{
+			"attributes": [
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "Zero San",
+				"time": 1794162525
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"really nigga\""
+			],
+			"steamid": "[U:1:312594624]"
 		},
 		{
 			"attributes": [
@@ -3371,6 +3409,19 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "StaryKope",
+				"time": 1794155678
+			},
+			"proof": [
+				"When spectating in first-person mode, he's doing some really weird, extremely fast flicks as Spy"
+			],
+			"steamid": "[U:1:1098472230]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -4629,7 +4680,7 @@
 				"time": 1793298796
 			},
 			"proof": [
-				"Silent Aim & ESP"
+				"Silent Aim, Crit Bucket & ESP"
 			],
 			"steamid": "[U:1:1567276698]"
 		},
