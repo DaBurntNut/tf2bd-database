@@ -1202,6 +1202,19 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "Nobody Of Note",
+				"time": 1794336183
+			},
+			"proof": [
+				"Silent Aim & ESP"
+			],
+			"steamid": "[U:1:409793288]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -1432,10 +1445,13 @@
 			],
 			"last_seen": {
 				"player_name": "monkeyspeed",
-				"time": 1793903045
+				"time": 1794334624
 			},
 			"proof": [
-				"[auto] automatically marked: Racist | reason: \"niggas down there camping\""
+				"Silent Aim & ESP",
+				"[auto] automatically marked: Racist | reason: \"niggas down there camping\"",
+				"[auto] automatically marked: Racist | reason: \"nigga u used the healthkit\"",
+				"[auto] automatically marked: Racist | reason: \"meet me in the sewers nigga\""
 			],
 			"steamid": "[U:1:477647173]"
 		},
@@ -1468,6 +1484,19 @@
 				"[auto] automatically marked: Racist | reason: \"fucking nigger nobody guard the intel\""
 			],
 			"steamid": "[U:1:487915443]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "SignalExtinction",
+				"time": 1794333092
+			},
+			"proof": [
+				"Aimbot & ESP"
+			],
+			"steamid": "[U:1:649148258]"
 		},
 		{
 			"attributes": [
@@ -1621,6 +1650,16 @@
 				"Bot Account"
 			],
 			"steamid": "[U:1:662301978]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "starxnamoon",
+				"time": 1794331370
+			},
+			"steamid": "[U:1:671572854]"
 		},
 		{
 			"attributes": [
