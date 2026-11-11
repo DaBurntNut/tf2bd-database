@@ -16,3 +16,40 @@ I’m currently using [this](https://github.com/surepy/tf2_bot_detector), which 
 **Q:** *How I can contribute to your Database?*
 
 **A:** If you have a cheater’s permanent Steam profile link or ID along with video evidence proving the behavior, please submit it [here](https://github.com/Garou3299/tf2bd-database/discussions/1).
+
+---
+
+
+---
+
+## What does the Bot do?
+
+Every day, a bot compares `playerlist.garou3299.json` with the
+[Vorobey hackerpolice cheater list](https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json)
+and opens a pull request with its proposals. **Nothing changes until the
+pull request is merged.**
+
+### Promote (player is also on Vorobey's list)
+
+| Tags before | Tags after |
+| --- | --- |
+| `suspicious` | `cheater` |
+| `racist` | `cheater` + `racist` |
+| `suspicious` + `racist` | `cheater` + `racist` |
+| `cheater` (already) | unchanged |
+
+### Demote (player was on Vorobey's list before, but has been removed from it)
+
+| Tags before | Tags after |
+| --- | --- |
+| `cheater` | entry removed from the database |
+| `cheater` + `racist` | `racist` (`cheater` and its proofs are removed, the racist proofs stay) |
+
+Players who were added to this database and were never on
+Vorobey's list are **never** demoted or removed by the bot.
+
+### Update the Vorobey database copy
+
+| File | What the bot does |
+| --- | --- |
+| `snapshot/playerlist.vorobey-hackerpolice.json` | Updated in the same pull request to an exact, byte-for-byte copy of the current `playerlist.vorobey-hackerpolice.json` list. By comparing the previous copy against the new list, the bot knows exactly who was removed from the Vorobey hackerpolice list and it never touches players who were added manually to this database. |
