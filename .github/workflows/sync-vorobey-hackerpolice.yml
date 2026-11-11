@@ -1,0 +1,187 @@
+name: Sync Vorobey hackerpolice
+
+# Checks the Vorobey hackerpolice list (Nocrex/Tom) against this database:
+# Promotes matching entries that are not already cheaters:
+#   * "suspicious"             -> "cheater"
+#   * "racist"                 -> "cheater" + "racist"
+#   * "suspicious" + "racist"  -> "cheater" + "racist"
+# Demotes entries that carry cheater, but ONLY SteamIDs that were in the
+# previous hackerpolice snapshot (snapshot/playerlist.vorobey-hackerpolice.json)
+# and have since been removed from the hackerpolice list:
+#   * "cheater" + "racist"     -> only "cheater" is removed ("racist" kept)
+#   * "cheater" alone          -> whole entry is removed
+# Cheaters that were never on the hackerpolice list (added manually) are
+# never demoted. Everything else is never touched, and the hackerpolice proof
+# links are shown in the pull request only - they are never written into
+# playerlist.garou3299.json. The snapshot is refreshed to the current list in the SAME
+# pull request, so the baseline only advances when the PR is merged - no
+# separate snapshot bot/PR is needed (a separate weekly snapshot PR would
+# race this workflow: merging it first would erase the very removals this
+# workflow is supposed to detect).
+#
+# Creating pull requests with the default GITHUB_TOKEN requires this repository
+# setting to be enabled (Settings -> Actions -> General -> Workflow permissions):
+#   [x] Allow GitHub Actions to create and approve pull requests
+# If it is disabled, the workflow still pushes the branch and prints a one-click
+# "Compare & pull request" link in the job summary. Alternatively, store a
+# personal access token with contents + pull-requests write access in the
+# BOT_TOKEN secret and it will be used instead of GITHUB_TOKEN.
+
+on:
+  schedule:
+    # DAILY at 05:23 UTC (GitHub may delay scheduled runs by a few minutes).
+    # For a WEEKLY run instead, comment the line below and uncomment the next one
+    # (Mondays at 05:23 UTC):
+    - cron: "23 5 * * *"
+    # - cron: "23 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What should happen when entries need updating?"
+        type: choice
+        options:
+          - pull-request
+          - commit
+        default: pull-request
+      dry_run:
+        description: "Only report the changes, do not write or publish anything"
+        type: boolean
+        default: false
+      allow_mass_demotion:
+        description: "Demote even if a large share of the snapshot disappeared upstream (e.g. after a long absence)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-vorobey-hackerpolice
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Check Vorobey hackerpolice list
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE: playerlist.garou3299.json
+      SNAPSHOT: snapshot/playerlist.vorobey-hackerpolice.json
+      BOT_BRANCH: bot/vorobey-hackerpolice-sync
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+      # Scheduled runs always open a pull request; manual runs choose.
+      MODE: ${{ github.event_name == 'schedule' && 'pull-request' || inputs.mode }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Lint (ruff)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check ruff==0.17.4
+          ruff check scripts tests
+          ruff format --check scripts tests
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Sync database with Vorobey hackerpolice list
+        id: sync
+        # No third-party dependencies at runtime: the scripts only use the
+        # Python standard library.
+        env:
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+          ALLOW_MASS_DEMOTION: ${{ inputs.allow_mass_demotion && '--allow-mass-demotion' || '' }}
+        run: >
+          python3 scripts/sync_vorobey_hackerpolice.py
+          --database "$DATABASE"
+          --snapshot "$SNAPSHOT"
+          --report "$RUNNER_TEMP/hackerpolice-sync-report.md"
+          $DRY_RUN
+          $ALLOW_MASS_DEMOTION
+          --demote
+
+      - name: Show report in the job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/hackerpolice-sync-report.md" ]; then
+            cat "$RUNNER_TEMP/hackerpolice-sync-report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Open or update pull request
+        id: pr
+        # A missing PR permission is handled by the fallback step below.
+        continue-on-error: true
+        if: steps.sync.outputs.changed == 'true' && env.MODE != 'commit'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.BOT_TOKEN || github.token }}
+          add-paths: |
+            ${{ env.DATABASE }}
+            ${{ env.SNAPSHOT }}
+          branch: ${{ env.BOT_BRANCH }}
+          delete-branch: true
+          title: "Sync the Vorobey hackerpolice matches"
+          commit-message: |
+            Sync the Vorobey hackerpolice matches
+
+            Auto-generated by .github/workflows/sync-vorobey-hackerpolice.yml
+          body-path: ${{ runner.temp }}/hackerpolice-sync-report.md
+
+      - name: Push branch and link a manual pull request
+        if: steps.sync.outputs.changed == 'true' && env.MODE != 'commit' && steps.pr.outcome == 'failure'
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # create-pull-request may already have committed the change locally
+          # before failing on the pull request API call.
+          if ! git rev-parse --verify --quiet "refs/heads/$BOT_BRANCH" > /dev/null; then
+            git checkout -B "$BOT_BRANCH"
+            git add -- "$DATABASE" "$SNAPSHOT"
+            git commit -m "Sync the Vorobey hackerpolice matches"
+          fi
+          # --force-with-lease only works if the remote ref is known locally;
+          # a fresh checkout has never seen the bot branch.
+          git fetch --quiet origin "$BOT_BRANCH" || true
+          git push --force-with-lease --set-upstream origin "$BOT_BRANCH"
+
+          compare_url="https://github.com/${{ github.repository }}/compare/$BASE_BRANCH...$BOT_BRANCH?expand=1"
+          {
+            echo ""
+            echo "### Pull request could not be created automatically"
+            echo ""
+            echo "The branch \`$BOT_BRANCH\` was pushed, but this repository does not allow"
+            echo "\`GITHUB_TOKEN\` to open pull requests."
+            echo ""
+            echo "**Option 1:** open the pull request with one click: $compare_url"
+            echo ""
+            echo "**Option 2:** enable *Settings → Actions → General → Workflow permissions →"
+            echo "Allow GitHub Actions to create and approve pull requests* so future runs"
+            echo "open the pull request on their own."
+            echo ""
+            echo "**Option 3:** add a personal access token (contents + pull requests: write)"
+            echo "as the \`BOT_TOKEN\` repository secret; it is used instead of \`GITHUB_TOKEN\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit directly to the default branch
+        if: steps.sync.outputs.changed == 'true' && env.MODE == 'commit'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$DATABASE" "$SNAPSHOT"
+          git commit -m "Sync the Vorobey hackerpolice matches"
+          git push
+
+      - name: Nothing to do
+        if: steps.sync.outputs.changed != 'true'
+        run: echo "Nothing to publish (no database or snapshot changes, or this was a dry run)."
