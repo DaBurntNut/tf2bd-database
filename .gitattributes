@@ -1,0 +1,6 @@
+# Data files must be stored and checked out byte-for-byte on every platform.
+# In particular, snapshot/playerlist.vorobey-hackerpolice.json is maintained by
+# the sync bot as an exact replica of the upstream Vorobey file: Git must
+# never apply CRLF/LF conversion to it (or to the other JSON data files),
+# regardless of a contributor's core.autocrlf setting.
+*.json -text
