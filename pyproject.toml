@@ -1,0 +1,29 @@
+# Tooling configuration only: the scripts run on a bare Python 3.10+ install,
+# ruff is used by contributors and by CI to keep the code tidy.
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "PIE", "RUF"]
+ignore = [
+    "RUF001", # ambiguous unicode in strings (the report uses arrows on purpose)
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["playerlist", "sources", "policy", "report", "sync_vorobey_hackerpolice"]
+
+# The scripts are imported as top-level modules (scripts/ is on sys.path in
+# tests and in the workflow), so tell type checkers where to find them.
+[tool.pyright]
+include = ["scripts"]
+extraPaths = ["scripts"]
+
+[tool.mypy]
+mypy_path = "scripts"
