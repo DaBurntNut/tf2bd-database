@@ -2508,6 +2508,19 @@
 		},
 		{
 			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "\ud835\ude73\ud835\ude8a\ud835\ude9f\ud835\ude8e",
+				"time": 1794416552
+			},
+			"proof": [
+				"Silent Aim & ESP"
+			],
+			"steamid": "[U:1:800717766]"
+		},
+		{
+			"attributes": [
 				"cheater",
 				"racist"
 			],
@@ -2623,6 +2636,21 @@
 				"https://youtu.be/hf1TIfdjnJo?t=650"
 			],
 			"steamid": "[U:1:846398794]"
+		},
+		{
+			"attributes": [
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "H3Y",
+				"time": 1794416871
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"of yea this nigga\"",
+				"[auto] automatically marked: Racist | reason: \"why steamhistory said otherwise nigga\"",
+				"[auto] automatically marked: Racist | reason: \"nigga cheating\""
+			],
+			"steamid": "[U:1:854511426]"
 		},
 		{
 			"attributes": [
@@ -3469,6 +3497,16 @@
 				"When spectating in first-person mode, he's doing some really weird, extremely fast flicks as Spy"
 			],
 			"steamid": "[U:1:1098472230]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "C+",
+				"time": 1794423033
+			},
+			"steamid": "[U:1:1099179829]"
 		},
 		{
 			"attributes": [
