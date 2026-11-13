@@ -83,6 +83,7 @@ writes a file it could not read back.
 | Snapshot advances last | The baseline is only refreshed after the changes derived from it were applied, so a refused demotion is re-evaluated on the next run instead of being lost. |
 | Path aliasing | `--report` and `--source` may not point at the database or the snapshot — sharing a path would overwrite an input file. |
 | Atomic writes | The database and the snapshot are written to a temp file and renamed into place, so a crash (or two runs at once) can never leave a half-written file behind. |
+| Symlink-safe writes | If the playerlist or the snapshot is a symbolic link — the usual way to point TF2BD's `cfg/playerlist.json` at this repository — the file it points at is updated. The link itself is never replaced. |
 | Clean failures | Bad JSON, a corrupt snapshot, a non-UTF-8 database or an unreachable source ends in exit code 2 with a readable message, never a traceback. |
 | Size limits | A fetched or local list over 64 MiB is refused instead of being read into memory, and the pull request body is always kept below GitHub's 65,536-character limit. |
 | Untrusted text stays text | Proof strings and names coming from Vorobey's list are escaped, so they can never inject HTML (a phishing link) into this repository's pull request or a newline into the database. |

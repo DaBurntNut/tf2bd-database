@@ -222,8 +222,9 @@ def load(path: Path, *, encoding: str = "utf-8-sig") -> tuple[PlayerList, str]:
 
     The default ``utf-8-sig`` accepts an optional byte-order mark: a file
     saved by an editor that adds one must not make every run fail with
-    "not valid JSON". The BOM is stripped from the returned text, so the
-    next write normalises the file back to plain UTF-8.
+    "not valid JSON". The BOM is dropped from the returned text, so an
+    unchanged file is not rewritten for it -- the mark simply disappears the
+    next time the file is written for a real reason.
     """
     try:
         original = path.read_text(encoding=encoding)

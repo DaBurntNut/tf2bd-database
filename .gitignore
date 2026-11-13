@@ -6,3 +6,5 @@ __pycache__/
 .pyright_cache/
 .venv/
 venv/
+# Atomic-write temp files: a killed run can leave one behind.
+.*.tmp

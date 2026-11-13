@@ -182,6 +182,24 @@ def _fsync_directory(directory: Path) -> None:
         pass  # e.g. platforms that cannot fsync directories
 
 
+def _write_target(path: Path) -> Path:
+    """The file an atomic write must replace, following a symbolic link.
+
+    ``os.replace`` replaces the *path*, so writing straight to a symlink
+    would delete the link and leave the real file untouched. That is exactly
+    how a playerlist is usually wired into TF2BD (``cfg/playerlist.json`` ->
+    this repository), so the write goes to the link's target instead. A
+    dangling link resolves to the path it points at, so the first write
+    creates the file the user asked for.
+    """
+    if not path.is_symlink():
+        return path
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError) as exc:  # RuntimeError: symlink loop
+        raise SyncError(f"{path} is a symbolic link that cannot be resolved: {exc}") from exc
+
+
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """Write bytes via a temp file in the same directory, then atomically replace.
 
@@ -190,14 +208,16 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     an exact replica of the upstream file (no encoding/newline translation
     ever touches them).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # mkstemp creates the file with O_EXCL and a unique name, so concurrent
-    # runs -- separate processes or threads -- never share (and interleave
-    # writes into) one temp file. The final replace is atomic, so readers
-    # only ever see complete files.
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    tmp = Path(tmp_name)
+    target = _write_target(path)
+    tmp: Path | None = None
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # mkstemp creates the file with O_EXCL and a unique name, so
+        # concurrent runs -- separate processes or threads -- never share
+        # (and interleave writes into) one temp file. The final replace is
+        # atomic, so readers only ever see complete files.
+        fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+        tmp = Path(tmp_name)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
@@ -205,15 +225,20 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         # mkstemp forces 0600 permissions; keep the file's usual mode: the
         # replaced file's own permissions, or a plain 0644 for new ones.
         try:
-            mode = stat.S_IMODE(path.stat().st_mode)
+            mode = stat.S_IMODE(target.stat().st_mode)
         except FileNotFoundError:
             mode = 0o644
         tmp.chmod(mode)
-        tmp.replace(path)
-        _fsync_directory(path.parent)  # make the rename itself durable
-    except OSError:
-        tmp.unlink(missing_ok=True)  # never leave a stale .tmp file behind
-        raise
+        tmp.replace(target)
+        _fsync_directory(target.parent)  # make the rename itself durable
+    except OSError as exc:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)  # never leave a stale .tmp file behind
+        # Name the file the user asked for, not the temp file we were
+        # creating: "Permission denied: /…/.list.json.k2j4.tmp" helps nobody.
+        # strerror is the OS reason alone ("Permission denied"), without the
+        # temp-file path the exception object carries.
+        raise SyncError(f"cannot write {path}: {exc.strerror or exc}") from exc
 
 
 def write_database(path: Path, rendered: str, original: str, *, dry_run: bool) -> bool:
@@ -495,10 +520,11 @@ def run(args: argparse.Namespace) -> int:
     # same removals are re-evaluated next run.
     modified = write_database(database_path, rendered, original, dry_run=args.dry_run)
     _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
-    if plan.advance_snapshot:
-        write_snapshot(snapshot_path, source_bytes, previous_bytes, dry_run=args.dry_run)
-        if snapshot_changed:
-            LOGGER.info("%s snapshot %s.", "Would update" if args.dry_run else "Updated", snapshot_path)
+    refreshed = plan.advance_snapshot and write_snapshot(
+        snapshot_path, source_bytes, previous_bytes, dry_run=args.dry_run
+    )
+    if refreshed:
+        LOGGER.info("%s snapshot %s.", "Would update" if args.dry_run else "Updated", snapshot_path)
 
     _write_github_outputs(
         changed=(modified or snapshot_changed) and not args.dry_run,

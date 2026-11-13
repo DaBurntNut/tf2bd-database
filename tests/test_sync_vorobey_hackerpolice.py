@@ -18,6 +18,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1162,6 +1163,108 @@ class CliTests(unittest.TestCase):
         ):
             code = main(argv)
         return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_a_symlinked_database_is_updated_through_the_link(self):
+        """Replacing the link instead would silently stop TF2BD's updates.
+
+        ``cfg/playerlist.json`` pointing at this repository is the usual way
+        people wire the file into the game, so the link must survive and the
+        real file must be the one that changes.
+        """
+        real = self.root / "real-list.json"
+        real.write_bytes(self.database.read_bytes())
+        try:
+            self.database.unlink()
+            self.database.symlink_to(real)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available here")
+
+        code, _, _ = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 0)
+        self.assertTrue(self.database.is_symlink())  # the link survived
+        players = {p["steamid"]: p for p in json.loads(real.read_text(encoding="utf-8"))["players"]}
+        self.assertEqual(players["[U:1:100]"]["attributes"], ["cheater"])  # target updated
+        self.assertEqual(players["[U:1:200]"]["attributes"], ["cheater", "racist"])
+
+    def test_a_symlinked_snapshot_is_updated_through_the_link(self):
+        real = self.root / "real-snapshot.json"
+        real.write_text(
+            dumps({"$schema": "x", "file_info": {}, "players": [hackerpolice_entry("[U:1:100]")]}), encoding="utf-8"
+        )
+        snapshot = self.root / "snapshot.json"
+        try:
+            snapshot.symlink_to(real)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available here")
+
+        code, _, _ = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 0)
+        self.assertTrue(snapshot.is_symlink())
+        self.assertEqual(real.read_bytes(), self.source.read_bytes())  # verbatim copy of upstream
+
+    def test_a_snapshot_symlink_loop_is_a_clean_error(self):
+        """Path.exists() is False for a looping link, so the write is where it surfaces."""
+        loop = self.root / "loop-snapshot"
+        try:
+            loop.symlink_to(loop)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available here")
+
+        code, _, stderr = self.run_cli("--source", str(self.source), "--snapshot", str(loop))
+        self.assertEqual(code, 2)
+        self.assertIn("cannot be resolved", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertIn("players", json.loads(self.database.read_text(encoding="utf-8")))  # never corrupted
+
+    def test_a_dangling_snapshot_symlink_creates_its_target(self):
+        target = self.root / "not-created-yet.json"
+        snapshot = self.root / "snapshot.json"
+        try:
+            snapshot.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available here")
+
+        code, _, stderr = self.run_cli("--source", str(self.source), "--demote")
+        self.assertEqual(code, 0)
+        self.assertIn("no snapshot", stderr)  # nothing can be demoted without a baseline
+        self.assertTrue(snapshot.is_symlink())
+        self.assertEqual(target.read_bytes(), self.source.read_bytes())  # the baseline was created
+
+    def test_a_write_failure_names_the_file_not_a_temp_file(self):
+        locked = self.root / "locked"
+        locked.mkdir()
+        database = locked / "list.json"
+        database.write_bytes(self.database.read_bytes())
+        os.chmod(locked, 0o500)
+        self.addCleanup(os.chmod, locked, 0o700)
+        script = Path(__file__).resolve().parents[1] / "scripts" / "sync_vorobey_hackerpolice.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--database",
+                str(database),
+                "--snapshot",
+                str(self.root / "snapshot.json"),
+                "--source",
+                str(self.source),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"cannot write {database}", result.stderr)
+        self.assertNotIn(".tmp", result.stderr)  # no temp-file name leaked to the user
+
+    def test_the_database_file_mode_is_preserved(self):
+        # mkstemp creates 0600 files: the replacement must not silently make
+        # a shared/read-only playerlist unreadable to everyone else.
+        os.chmod(self.database, 0o444)
+        code, _, _ = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 0)
+        self.assertEqual(stat.S_IMODE(self.database.stat().st_mode), 0o444)
 
     def test_a_failed_write_leaves_no_temp_file_and_no_half_written_file(self):
         original = self.database.read_text(encoding="utf-8")
