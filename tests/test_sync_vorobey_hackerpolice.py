@@ -353,6 +353,13 @@ class PromoteTests(unittest.TestCase):
         database, _ = self.promote([player("[U:1:300]", ["suspicious", "racist"])])
         self.assertEqual(database["players"][0]["attributes"], ["cheater", "racist"])
 
+    def test_suspicious_and_racist_keeps_its_existing_proofs(self):
+        """Promotion adds no proof: the entry's own proofs stay as they were."""
+        proofs = ['[auto] automatically marked: Racist | reason: "chat log"', "https://existing.test/1"]
+        database, _ = self.promote([player("[U:1:300]", ["suspicious", "racist"], proof=list(proofs))])
+        self.assertEqual(database["players"][0]["attributes"], ["cheater", "racist"])
+        self.assertEqual(database["players"][0]["proof"], proofs)
+
     def test_attribute_order_is_normalised(self):
         database, _ = self.promote([player("[U:1:300]", ["racist", "suspicious"])])
         self.assertEqual(database["players"][0]["attributes"], ["cheater", "racist"])
@@ -563,6 +570,25 @@ class DemoteTests(unittest.TestCase):
         self.assertEqual(changes[0].kind, "demote")
         self.assertEqual(changes[0].before, ("cheater",))
         self.assertEqual(changes[0].after, ())
+
+    def test_only_the_exact_racist_prefix_survives_a_demotion(self):
+        proofs = [
+            '[auto] automatically marked: Racist | reason: "keep me"',
+            "[auto] automatically marked: Racist | reason:",  # bare, but exactly the prefix
+            "[auto] automatically marked: Racist | reason",  # no colon -> cheater evidence
+            "[auto] automatically marked: Racist",  # no reason at all -> cheater evidence
+            '[auto] automatically marked: racist | reason: "x"',  # wrong case
+            f"{PROOF_MARKER} (https://github.com/Nocrex/Tom)",  # our own promotion line
+            "https://video.test/1",
+        ]
+        database, _ = self.demote([player("[U:1:200]", ["cheater", "racist"], proof=list(proofs))])
+        self.assertEqual(
+            database["players"][0]["proof"],
+            [
+                '[auto] automatically marked: Racist | reason: "keep me"',
+                "[auto] automatically marked: Racist | reason:",
+            ],
+        )
 
     def test_still_on_hackerpolice_list_is_untouched(self):
         database, changes = self.demote([player("[U:1:100]", ["cheater", "racist"])])
@@ -1628,6 +1654,118 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("2 entries promoted", stdout)
+
+
+# --------------------------------------------------------------------------- #
+# The five behaviours the database owner requires, end to end
+# --------------------------------------------------------------------------- #
+class AcceptedRequirementsTests(unittest.TestCase):
+    """One test per required rule, run exactly like the workflow runs the bot.
+
+    The same flags the workflow passes (``--demote --report``, never
+    ``--include-proof``) against a database and an upstream list that cover
+    all five cases at once.
+    """
+
+    RACIST_LINE = '[auto] automatically marked: Racist | reason: "sample chat log"'
+    OTHER_LINE = "https://video.test/1"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.database = self.root / "list.json"
+        self.snapshot = self.root / "snapshot.json"
+        self.upstream = self.root / "upstream.json"
+        self.report = self.root / "report.md"
+
+        # [U:1:100]/[U:1:200] are on the upstream list; [U:1:300]/[U:1:400]
+        # were in the previous snapshot and have since disappeared from it.
+        self.database.write_text(
+            dumps(
+                {
+                    "$schema": "x",
+                    "file_info": {},
+                    "players": [
+                        player("[U:1:100]", ["suspicious"], proof=["https://existing.test/1"]),
+                        player(
+                            "[U:1:200]",
+                            ["suspicious", "racist"],
+                            proof=[self.RACIST_LINE, "https://existing.test/2"],
+                        ),
+                        player("[U:1:300]", ["cheater"], proof=[self.OTHER_LINE]),
+                        player("[U:1:400]", ["cheater", "racist"], proof=[self.OTHER_LINE, self.RACIST_LINE, "note"]),
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.snapshot.write_text(
+            dumps(
+                {
+                    "$schema": "x",
+                    "file_info": {},
+                    "players": [
+                        hackerpolice_entry("[U:1:100]"),
+                        hackerpolice_entry("[U:1:200]"),
+                        hackerpolice_entry("[U:1:300]"),
+                        hackerpolice_entry("[U:1:400]"),
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        live = {
+            "$schema": "x",
+            "file_info": {},
+            "players": [hackerpolice_entry("[U:1:100]"), hackerpolice_entry("[U:1:200]")],
+        }
+        # Deliberately NOT in the shape dumps() produces (two-space indent, no
+        # trailing newline): the snapshot must be a byte copy of whatever
+        # upstream served, never a re-render of it.
+        self.upstream_bytes = json.dumps(live, indent="  ", ensure_ascii=False).encode("utf-8")
+        self.upstream.write_bytes(self.upstream_bytes)
+
+    def run_bot(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        argv = [
+            "--database",
+            str(self.database),
+            "--snapshot",
+            str(self.snapshot),
+            "--source",
+            str(self.upstream),
+            "--demote",
+            "--report",
+            str(self.report),
+        ]
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(argv)
+        self.assertEqual(code, 0, stderr.getvalue())
+        return {p["steamid"]: p for p in json.loads(self.database.read_text(encoding="utf-8"))["players"]}
+
+    def test_1_suspicious_becomes_cheater_with_no_proof_added(self):
+        players = self.run_bot()
+        self.assertEqual(players["[U:1:100]"]["attributes"], ["cheater"])
+        self.assertEqual(players["[U:1:100]"]["proof"], ["https://existing.test/1"])
+
+    def test_2_suspicious_and_racist_becomes_cheater_and_racist_with_no_new_proof(self):
+        players = self.run_bot()
+        self.assertEqual(players["[U:1:200]"]["attributes"], ["cheater", "racist"])
+        self.assertEqual(players["[U:1:200]"]["proof"], [self.RACIST_LINE, "https://existing.test/2"])
+
+    def test_3_cheater_only_entry_is_deleted_when_it_leaves_the_upstream_list(self):
+        players = self.run_bot()
+        self.assertNotIn("[U:1:300]", players)
+
+    def test_4_cheater_and_racist_keeps_racist_and_only_auto_racist_proofs(self):
+        players = self.run_bot()
+        self.assertEqual(players["[U:1:400]"]["attributes"], ["racist"])
+        self.assertEqual(players["[U:1:400]"]["proof"], [self.RACIST_LINE])
+
+    def test_5_snapshot_is_a_byte_for_byte_copy_of_the_upstream_file(self):
+        self.run_bot()
+        self.assertEqual(self.snapshot.read_bytes(), self.upstream_bytes)
 
 
 # --------------------------------------------------------------------------- #
