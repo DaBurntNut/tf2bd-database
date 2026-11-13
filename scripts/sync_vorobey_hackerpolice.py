@@ -88,7 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--source",
         action="append",
         metavar="URL_OR_PATH",
-        help="Vorobey hackerpolice list URL or local path; repeat for fallbacks (default: built-in GitHub URLs)",
+        help="Vorobey hackerpolice list URL or local path (never the database or the snapshot file); "
+        "repeat for fallbacks (default: built-in GitHub URLs)",
     )
     parser.add_argument("--report", metavar="PATH", help="also write the Markdown summary to this file")
     parser.add_argument("--dry-run", action="store_true", help="report what would change without writing the database")
@@ -239,7 +240,7 @@ def _log_outcome(modified: bool, changes: list[Change], path: Path, *, dry_run: 
     count = len(changes)
     what = f"{count} {plural(count, 'entry', 'entries')}"
     if not modified:
-        LOGGER.info("No changes: nothing to update.")
+        LOGGER.info("No database changes: nothing to update.")
     elif dry_run:
         LOGGER.info("Dry run: would update %s in %s.", what, path)
     else:
@@ -398,6 +399,17 @@ def _plan_demotion(
     return _DemotionPlan(candidates=removed, note=None, advance_snapshot=advance)
 
 
+def _github_warning(message: str) -> None:
+    """Emit a GitHub Actions warning annotation (no-op elsewhere).
+
+    A run that only *skips* something -- the mass-demotion guard, or a
+    missing baseline -- changes no file, so it would otherwise end as a
+    silent green workflow run that nobody looks at.
+    """
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::{message}", flush=True)
+
+
 def _emit_report(path: str | None, report: str) -> None:
     """Print the report and, when asked, write it where the workflow wants it."""
     if path:
@@ -414,13 +426,20 @@ def run(args: argparse.Namespace) -> int:
     database_path = Path(args.database)
     snapshot_path = Path(args.snapshot)
 
+    # Everything local is read and validated BEFORE the network is touched:
+    # a corrupt database or snapshot fails immediately instead of after a
+    # fetch (or several, with retries), and the baseline is known before any
+    # decision is made.
     database, original = load_database(database_path)
-    index, source, source_bytes = _load_upstream(args.source or DEFAULT_SOURCES)
-
     snapshot = load_snapshot(snapshot_path)
     previous_index, previous_bytes = snapshot if snapshot is not None else (None, None)
+
+    index, source, source_bytes = _load_upstream(args.source or DEFAULT_SOURCES)
+
     diff = _snapshot_diff(previous_index, index)
     plan = _plan_demotion(args, diff, snapshot_path=snapshot_path)
+    if plan.note:
+        _github_warning(f"Demotion {plan.note}")
 
     changes = sync(
         database,
@@ -484,6 +503,7 @@ def run(args: argparse.Namespace) -> int:
         snapshot_changed=snapshot_changed,
         snapshot_added=diff.added,
         snapshot_removed=len(diff.removed),
+        demotion_skipped=bool(plan.note),
     )
     return 0
 

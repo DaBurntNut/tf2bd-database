@@ -16,6 +16,7 @@ import io
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -40,13 +41,23 @@ from playerlist import (
     validate,
 )
 from policy import Change, demote, promote, sync
-from report import MAX_REMOVED_ROWS, RunInfo, plural, render_closing, render_report
+from report import (
+    MAX_CLOSING_STEAMIDS,
+    MAX_DEMOTION_CHARS,
+    MAX_PROMOTION_CHARS,
+    MAX_REMOVED_CHARS,
+    RunInfo,
+    plural,
+    render_closing,
+    render_report,
+)
 from sources import (
     PROOF_MARKER,
     HackerpoliceIndex,
     SyncError,
     added_steamids,
     load_first_available_raw,
+    load_snapshot,
     removed_steamids,
 )
 from sync_vorobey_hackerpolice import DEFAULT_SNAPSHOT, build_parser, main
@@ -142,9 +153,15 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(len(document["players"]), 1)
 
     def test_non_https_download_url_is_never_followed(self):
-        # download_url is untrusted response data: a plaintext or local
-        # target must be rejected, not fetched.
-        for bad_url in ("http://example.invalid/raw.json", "/etc/passwd"):
+        # download_url is untrusted response data: a plaintext, local or
+        # third-party target must be rejected, not fetched (SSRF).
+        for bad_url in (
+            "http://example.invalid/raw.json",
+            "/etc/passwd",
+            "https://example.invalid/raw.json",
+            "https://internal-metadata.example/latest",
+            "https://github.com.evil.example/raw.json",  # look-alike host
+        ):
             envelope = json.dumps({"encoding": "none", "content": "", "download_url": bad_url}).encode("utf-8")
             with (
                 mock.patch("sources.urllib.request.urlopen", side_effect=[_FakeResponse(envelope)]) as urlopen,
@@ -156,7 +173,11 @@ class SourceFetchTests(unittest.TestCase):
 
     def test_large_file_envelope_falls_back_to_download_url(self):
         envelope = json.dumps(
-            {"encoding": "none", "content": "", "download_url": "https://example.invalid/raw.json"}
+            {
+                "encoding": "none",
+                "content": "",
+                "download_url": "https://raw.githubusercontent.com/Nocrex/Tom/main/playerlist.vorobey-hackerpolice.json",
+            }
         ).encode("utf-8")
         (document, _, raw), calls = self.fetch([_FakeResponse(envelope), _FakeResponse(self.BODY)])
         self.assertEqual(raw, self.BODY)
@@ -179,6 +200,23 @@ class SourceFetchTests(unittest.TestCase):
             self.assertRaises(SyncError),
         ):
             load_first_available_raw([self.URL])
+
+    def test_oversized_local_source_is_rejected(self):
+        # A local --source is operator-chosen, but pointing it at a huge file
+        # must be a clean error, not an out-of-memory kill mid-run.
+        big = Path(tempfile.mkdtemp()) / "big.json"
+        self.addCleanup(shutil.rmtree, big.parent)
+        big.write_bytes(b'{"players": []}' + b" " * 5_000_000)
+        with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError) as caught:
+            load_first_available_raw([str(big)])
+        self.assertIn("safety limit", str(caught.exception))
+
+    def test_oversized_snapshot_is_rejected(self):
+        path = Path(tempfile.mkdtemp()) / "snap.json"
+        self.addCleanup(shutil.rmtree, path.parent)
+        path.write_bytes(b'{"players": []}' + b" " * 5_000_000)
+        with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError):
+            load_snapshot(path)
 
     def test_permanent_http_error_is_not_retried(self):
         error = urllib.error.HTTPError(self.URL, 404, "not found", Message(), None)
@@ -260,6 +298,28 @@ class PromoteTests(unittest.TestCase):
         _, changes = self.promote(database["players"], include_proof=True)
         self.assertEqual(changes, [])
         self.assertEqual(len(database["players"][0]["proof"]), 1)
+
+    def test_include_proof_sanitises_and_caps_upstream_evidence(self):
+        """Upstream proof text ends up in OUR database with --include-proof.
+
+        So it must not be able to smuggle a newline/control character into
+        the JSON, and one hostile entry must not add a huge proof line.
+        """
+        proofs = [
+            "https://x/1\nDROP TABLE",
+            "https://x/1\nDROP TABLE",  # duplicate once normalised
+            "\x00\x07",  # control characters only -> empty after cleaning
+            None,
+            42,
+        ] + [f"https://x/{n}" for n in range(50)]
+        index = index_of(hackerpolice_entry("[U:1:100]", proofs))
+        database = {"$schema": "x", "file_info": {"title": "t"}, "players": [player("[U:1:100]", ["suspicious"])]}
+        promote(database, index, include_proof=True)
+        line = database["players"][0]["proof"][0]
+        self.assertNotIn("\n", line)
+        self.assertNotIn("\x00", line)
+        self.assertEqual(line.count("https://x/1 DROP TABLE"), 1)
+        self.assertEqual(line.count("https://x/"), 10)  # capped
 
     def test_existing_proof_is_kept_and_extended_once(self):
         database, _ = self.promote([player("[U:1:100]", ["suspicious"], proof=["manual note"])], include_proof=True)
@@ -646,6 +706,21 @@ class ReportTests(unittest.TestCase):
         report = render_report(self.info([change]))
         self.assertIn("https://example.invalid/a%20%28b%29", report)
 
+    def test_untrusted_cell_text_cannot_inject_html(self):
+        # The Vorobey list is outside our control: markup in a proof line (or
+        # in a name) must render as text, not as a live <a href> phishing
+        # link inside this repository's pull request.
+        name = '<img src=x onerror=alert(1)> & "Tom & Jerry"'
+        proof = '<a href="https://evil.example">Free items</a>'
+        report = render_report(self.info([Change("[U:1:1]", name, ("suspicious",), ("cheater",), (proof,))]))
+        self.assertNotIn("<img", report)
+        self.assertNotIn("<a href", report)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", report)
+        # No tag can be formed at all once < and > are escaped; the visible
+        # text (entities render back to the original characters) is intact.
+        self.assertIn('&lt;a href="https://evil.example"&gt;Free items&lt;/a&gt;', report)
+        self.assertIn('&amp; "Tom &amp; Jerry"', report)
+
     def test_link_targets_escape_backslashes_and_brackets(self):
         # The Vorobey list is outside our control: a proof string must not be
         # able to close the link target early and inject Markdown.
@@ -705,12 +780,65 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| `[U:1:7]` | [profile](https://steamcommunity.com/profiles/76561197960265735) |", report)
 
     def test_removed_table_is_capped_so_the_pr_body_cannot_explode(self):
-        removed = tuple(f"[U:1:{account}]" for account in range(1, MAX_REMOVED_ROWS + 6))
+        accounts = range(1, 5000)
+        removed = tuple(f"[U:1:{account}]" for account in accounts)
         report = render_report(
             self.info(previous_source_total=10000, removed_from_source=len(removed), removed_upstream=removed)
         )
-        self.assertEqual(report.count("| [profile]("), MAX_REMOVED_ROWS)
-        self.assertIn("…and 5 more SteamIDs (the snapshot diff in this pull request lists every one).", report)
+        rows = report.count("| [profile](")
+        self.assertLess(rows, len(removed))
+        self.assertGreater(rows, 100)  # a normal day is never truncated
+        self.assertIn(f"…and {len(removed) - rows} more SteamIDs (the snapshot diff", report)
+        self.assertLess(len(report), 65536)
+
+    def test_table_budgets_always_leave_room_under_the_github_body_limit(self):
+        # GitHub rejects a pull request body above 65536 characters and this
+        # report IS that body: the three table budgets plus the prose around
+        # them must never add up to it.
+        tables = MAX_PROMOTION_CHARS + MAX_DEMOTION_CHARS + MAX_REMOVED_CHARS
+        self.assertLess(tables, 65536 - 4000)
+
+    def test_a_massive_run_still_produces_a_deliverable_pull_request_body(self):
+        """GitHub rejects a body over 65536 characters: the report IS the body.
+
+        A run where upstream suddenly matches (or drops) the whole database
+        used to render ~108k characters, so the API call failed and the report
+        was lost. Every table is budgeted, with a pointer to the diff.
+        """
+        names = ["x" * 31] * 800
+        promotions = tuple(
+            Change(
+                f"[U:1:{n}]",
+                names[n],
+                ("suspicious", "racist"),
+                ("cheater", "racist"),
+                ("https://discord.com/channels/1/" + "9" * 40,),
+            )
+            for n in range(800)
+        )
+        demotions = tuple(
+            Change(f"[U:1:{n}]", names[n], ("cheater", "racist"), ("racist",), kind="demote") for n in range(800)
+        )
+        removed = tuple(f"[U:1:{n}]" for n in range(1, 3000))
+        report = render_report(
+            self.info(
+                [*promotions, *demotions],
+                previous_source_total=5800,
+                added_to_source=0,
+                removed_from_source=len(removed),
+                removed_upstream=removed,
+                snapshot_changed=True,
+            )
+        )
+        self.assertLess(len(report), 65536, "the PR body would be rejected by GitHub")
+        self.assertIn("promoted to `cheater`", report)
+        self.assertIn("…and", report)
+        self.assertIn("the database diff", report)
+        self.assertIn("the snapshot diff", report)
+        # The counts in the headings stay truthful even when rows are hidden.
+        self.assertIn("**800 entries promoted", report)
+        self.assertIn("**800 entries demoted", report)
+        self.assertIn("**2999 SteamIDs removed", report)
 
 
 # --------------------------------------------------------------------------- #
@@ -770,6 +898,19 @@ class ClosingMessageTests(unittest.TestCase):
 
     def test_no_changes(self):
         self.assertEqual(render_closing([]), "; nothing else is modified.")
+
+    def test_a_long_list_of_steamids_is_truncated(self):
+        # The closing sentence must not become a second, uncapped copy of the
+        # tables: on a mass run that alone blew past the PR body limit.
+        changes = [
+            Change(f"[U:1:{account}]", "a", ("suspicious",), ("cheater",))
+            for account in range(MAX_CLOSING_STEAMIDS + 5)
+        ]
+        closing = render_closing(changes)
+        self.assertIn(f"and {len(changes) - MAX_CLOSING_STEAMIDS} more", closing)
+        self.assertNotIn(f"[U:1:{MAX_CLOSING_STEAMIDS + 1}]", closing)
+        self.assertIn(f"[U:1:{MAX_CLOSING_STEAMIDS - 1}]", closing)  # the last shown one
+        self.assertLess(len(closing), 400)
 
 
 # --------------------------------------------------------------------------- #
@@ -1018,6 +1159,35 @@ class CliTests(unittest.TestCase):
         self.assertIn(PROOF_MARKER, proof[0])
         self.assertIn(HACKERPOLICE_PROOF, proof[0])
 
+    def test_verbose_really_logs_fetch_attempts(self):
+        # Regression: -v used to change nothing at all (there were no debug
+        # messages), while --help promised "log fetch attempts".
+        code, _, stderr = self.run_cli("--source", str(self.source), "--dry-run", "-v")
+        self.assertEqual(code, 0)
+        self.assertIn("Source 1/1: trying", stderr)
+        self.assertIn("Reading local file", stderr)
+        self.assertIn("Source", stderr)
+
+    def test_skipped_demotion_is_annotated_and_exposed(self):
+        # A skip changes no file, so it would otherwise be a silent green run:
+        # emit an Actions warning annotation and a step output.
+        output_file = self.root / "github_output"
+        output_file.write_text("", encoding="utf-8")
+        code, stdout, _ = self.run_cli(
+            "--source",
+            str(self.source),
+            "--demote",
+            env={"GITHUB_OUTPUT": str(output_file), "GITHUB_ACTIONS": "true"},
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("::warning::Demotion skipped - no snapshot at", stdout)
+        self.assertIn("demotion_skipped=true", output_file.read_text(encoding="utf-8").splitlines())
+
+    def test_no_annotation_outside_github_actions(self):
+        code, stdout, _ = self.run_cli("--source", str(self.source), "--demote")
+        self.assertEqual(code, 0)
+        self.assertNotIn("::warning::", stdout)
+
     def test_github_outputs(self):
         output_file = self.root / "github_output"
         output_file.write_text("", encoding="utf-8")
@@ -1029,6 +1199,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("modified=true", lines)
         self.assertIn("snapshot_added=2", lines)
         self.assertIn("snapshot_removed=0", lines)
+        self.assertIn("demotion_skipped=false", lines)
 
     def test_concurrent_runs_never_corrupt_the_files(self):
         # Four processes sync the SAME database/snapshot at the same time:
@@ -1197,6 +1368,78 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("2 entries promoted", stdout)
+
+
+# --------------------------------------------------------------------------- #
+# The committed data files and the workflow glue
+# --------------------------------------------------------------------------- #
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+
+
+class RepositoryDataTests(unittest.TestCase):
+    """The data files ARE the product: they must stay canonical and usable."""
+
+    def test_the_database_is_valid_and_round_trips_byte_for_byte(self):
+        database, original = load(REPO_ROOT / "playerlist.garou3299.json")
+        result = validate(database)
+        self.assertFalse(result.errors, result.errors[:3])
+        players = database["players"]
+        self.assertTrue(players)
+        # If this ever fails, someone hand-edited the formatting: the next bot
+        # run would rewrite the whole file and hide the real change in a huge
+        # diff no reviewer can read.
+        self.assertEqual(dumps(database), original)
+        ids = [p["steamid"] for p in players]
+        self.assertEqual(ids, sorted(ids, key=account_id))  # numeric order, not lexical
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_the_snapshot_is_a_usable_baseline(self):
+        snapshot = load_snapshot(REPO_ROOT / DEFAULT_SNAPSHOT)
+        self.assertIsNotNone(snapshot, "the demotion baseline is missing from the repository")
+        index, raw = snapshot
+        self.assertEqual(raw, (REPO_ROOT / DEFAULT_SNAPSHOT).read_bytes())
+        self.assertGreater(len(index.by_steamid), 0)
+        for steamid in index.by_steamid:
+            self.assertEqual(normalize_steamid(steamid), steamid)  # canonical keys only
+
+    def test_the_other_published_files_are_valid_json(self):
+        for name in ("rules.garou3299.json", "playerlist.scammers.json"):
+            document = json.loads((REPO_ROOT / name).read_text(encoding="utf-8"))
+            self.assertIsInstance(document, dict, name)
+            self.assertIn("file_info", document, name)
+
+
+@unittest.skipUnless(WORKFLOWS.is_dir(), "workflow files are not present")
+class WorkflowTests(unittest.TestCase):
+    """Guards the glue no Python test would otherwise cover."""
+
+    def read(self, name):
+        return (WORKFLOWS / name).read_text(encoding="utf-8")
+
+    def test_sync_workflow_still_demotes_and_uses_the_real_paths(self):
+        text = self.read("sync-vorobey-hackerpolice.yml")
+        # Dropping --demote would silently make the bot promote-only; a
+        # renamed data file would point it at nothing.
+        self.assertIn("--demote", text)
+        self.assertIn("playerlist.garou3299.json", text)
+        self.assertIn(DEFAULT_SNAPSHOT, text)
+        # The PR body must come from the report the run wrote.
+        self.assertIn("--report", text)
+        self.assertIn("body-path:", text)
+
+    def test_ci_runs_the_same_checks_on_pull_requests(self):
+        text = self.read("ci.yml")
+        self.assertIn("pull_request:", text)
+        for check in ("ruff check", "ruff format --check", "mypy scripts", "unittest discover"):
+            self.assertIn(check, text)
+
+    def test_both_workflows_pin_the_same_tool_versions(self):
+        sync, ci = self.read("sync-vorobey-hackerpolice.yml"), self.read("ci.yml")
+        for tool in ("ruff", "mypy"):
+            pinned = set(re.findall(rf"\b{tool}==([\w.]+)", sync))
+            self.assertTrue(pinned, f"{tool} is not pinned in the sync workflow")
+            self.assertEqual(pinned, set(re.findall(rf"\b{tool}==([\w.]+)", ci)), f"{tool} pins drifted")
 
 
 # --------------------------------------------------------------------------- #
@@ -1400,6 +1643,20 @@ class SortPlayersTests(unittest.TestCase):
             {"steamid": "worse", "attributes": []},
         ]
         self.assertEqual([player["steamid"] for player in sort_players(players)], ["[U:1:7]", "bad", "worse"])
+
+
+class LoadTests(unittest.TestCase):
+    def test_a_utf8_bom_is_tolerated(self):
+        # Editors on Windows happily add a BOM; that must not make every run
+        # fail with "not valid JSON" until a human fixes the file by hand.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "list.json"
+            text = dumps({"$schema": "x", "file_info": {}, "players": []})
+            path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+            database, original = load(path)
+            self.assertEqual(database["players"], [])
+            self.assertEqual(original, text)  # BOM stripped, not carried into the output
+            self.assertEqual(dumps(database), original)
 
 
 class SerialisationTests(unittest.TestCase):

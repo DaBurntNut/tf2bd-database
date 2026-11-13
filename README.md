@@ -60,9 +60,14 @@ the table only has the SteamID and a link to the Steam profile:
 
 This is the raw snapshot diff: it is shown whether or not `--demote` is
 enabled, and it includes IDs this database never contained (those produce no
-database change, they were simply dropped upstream). Very large diffs are
-truncated after 200 rows to keep the pull request readable — the snapshot
-file's own diff still shows every removed SteamID.
+database change, they were simply dropped upstream).
+
+Every table in the report has a size budget, because the report *is* the pull
+request body and GitHub rejects anything over 65,536 characters. A normal run
+is never truncated; a mass run (upstream suddenly matching or dropping most of
+the database) keeps the counts and the first rows and adds a
+`…and N more …` line — the file diffs in the same pull request always list
+every single change.
 
 ### Safety guards
 
@@ -78,6 +83,9 @@ writes a file it could not read back.
 | Path aliasing | `--report` and `--source` may not point at the database or the snapshot — sharing a path would overwrite an input file. |
 | Atomic writes | The database and the snapshot are written to a temp file and renamed into place, so a crash (or two runs at once) can never leave a half-written file behind. |
 | Clean failures | Bad JSON, a corrupt snapshot, a non-UTF-8 database or an unreachable source ends in exit code 2 with a readable message, never a traceback. |
+| Size limits | A fetched or local list over 64 MiB is refused instead of being read into memory, and the pull request body is always kept below GitHub's 65,536-character limit. |
+| Untrusted text stays text | Proof strings and names coming from Vorobey's list are escaped, so they can never inject HTML (a phishing link) into this repository's pull request or a newline into the database. |
+| Visible skips | A run that skips demotion (no baseline yet, or the mass-demotion guard) changes no file, so it also emits a GitHub Actions warning annotation instead of ending as a silent green run. |
 
 ### Update the Vorobey database copy
 
@@ -98,4 +106,6 @@ ruff format --check scripts tests          # formatting
 mypy scripts                               # type-check
 ```
 
-All four run in CI before the bot is allowed to open a pull request.
+CI (`.github/workflows/ci.yml`) runs them for every pull request and for
+pushes to `master`, on Python 3.10 (the minimum) and 3.12 (what the bot runs).
+The sync workflow repeats them inline, so the bot never commits untested code.

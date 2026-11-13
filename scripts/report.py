@@ -15,15 +15,31 @@ from playerlist import account_id, steam_profile_url
 from policy import Change
 from sources import DEFAULT_SNAPSHOT, SOURCE_REPO_URL
 
-__all__ = ["MAX_REMOVED_ROWS", "RunInfo", "plural", "render_closing", "render_report"]
+__all__ = [
+    "MAX_CLOSING_STEAMIDS",
+    "MAX_DEMOTION_CHARS",
+    "MAX_PROMOTION_CHARS",
+    "MAX_REMOVED_CHARS",
+    "RunInfo",
+    "plural",
+    "render_closing",
+    "render_report",
+]
 
-# Cap on the "removed from the Vorobey list" table. A normal run removes a
-# handful of IDs, but a mass upstream change (or a forced
-# --allow-mass-demotion run) can remove thousands: the table would then blow
-# past GitHub's ~64k pull request body limit. The snapshot file committed in
-# the same pull request still shows every removal in its own diff, so the
-# table is truncated with a pointer there instead of breaking the body.
-MAX_REMOVED_ROWS = 200
+# This report IS the pull request body, and GitHub refuses a body above
+# 65536 characters. Rows are long (SteamID, name, profile link, attribute
+# lists, proof links -- ~240 characters with real data), so a mass promotion
+# would otherwise produce a body the API rejects, taking the whole report
+# with it. Each table gets a character budget; whatever does not fit is
+# summarised with a pointer to the diff, which always lists every row.
+MAX_PROMOTION_CHARS = 24_000
+MAX_DEMOTION_CHARS = 20_000
+MAX_REMOVED_CHARS = 12_000
+
+# The closing sentence repeats the changed SteamIDs, which is handy for a
+# handful of changes. On a mass run it used to be a second, uncapped copy of
+# the tables (1600 IDs alone added ~17 KB to a body limited to 65536).
+MAX_CLOSING_STEAMIDS = 10
 
 # Characters that would break a Markdown link target -- or let an
 # untrusted proof string (the Vorobey list is outside our control) break out
@@ -57,9 +73,30 @@ def _safe(text: str) -> str:
     return _SURROGATES_RE.sub("\ufffd", text)
 
 
+# Markdown table cells still allow raw HTML, so an untrusted string -- an
+# upstream proof line, or a player name from a list we did not write -- could
+# render as a real clickable <a href="..."> inside this repository's pull
+# request. HTML-escaping makes it display literally instead; the renderer
+# turns the entities back into the original characters, so legitimate names
+# ("Tom & Jerry") look unchanged.
+_HTML_ESCAPES = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
+
+
 def _cell(value: str) -> str:
-    """Make a string safe inside a Markdown table cell."""
-    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ").strip() or "-"
+    """Make an untrusted string safe inside a Markdown table cell.
+
+    HTML first (so ``&lt;`` never becomes ``&amp;lt;``), then the Markdown
+    escaping, then whitespace tidy-up.
+    """
+    return (
+        value.translate(_HTML_ESCAPES)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .strip()
+        or "-"
+    )
 
 
 def _name_cell(change: Change) -> str:
@@ -76,9 +113,7 @@ def _name_cell(change: Change) -> str:
     label = "UNKNOWN" if not change.name.strip() else _cell(change.name)
     label = label.replace("[", "\\[").replace("]", "\\]")
     url = steam_profile_url(change.steamid)
-    if url is None:
-        return label
-    return f"[{label}]({url})"
+    return label if url is None else _markdown_link(url, label)
 
 
 def _is_url(text: str) -> bool:
@@ -111,6 +146,23 @@ def plural(count: int, singular: str, plural_form: str) -> str:
     return singular if count == 1 else plural_form
 
 
+def _take_rows(rows: Sequence[str], budget: int) -> tuple[list[str], int]:
+    """As many rows as fit in ``budget`` characters, plus how many did not."""
+    kept: list[str] = []
+    used = 0
+    for row in rows:
+        if used + len(row) + 1 > budget:  # +1 for the newline
+            break
+        kept.append(row)
+        used += len(row) + 1
+    return kept, len(rows) - len(kept)
+
+
+def _truncation_note(hidden: int, singular: str, plural_form: str, where: str) -> str:
+    """One line explaining that a table was cut short, and where to look."""
+    return f"…and {hidden} more {plural(hidden, singular, plural_form)} ({where} in this pull request lists every one)."
+
+
 def _sorted_steamids(steamids: Sequence[str]) -> list[str]:
     """Canonical SteamIDs in numeric order, unusable ones last and stable.
 
@@ -137,7 +189,6 @@ def _removed_section(removed: Sequence[str]) -> list[str]:
         return []
     ordered = _sorted_steamids(removed)
     count = len(ordered)
-    shown = ordered[:MAX_REMOVED_ROWS]
     lines = [
         f"**{count} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey list "
         "since the previous snapshot.**",
@@ -147,18 +198,24 @@ def _removed_section(removed: Sequence[str]) -> list[str]:
         "| SteamID | Profile Link |",
         "| --- | --- |",
     ]
-    for steamid in shown:
+    rows = []
+    for steamid in ordered:
         url = steam_profile_url(steamid)
-        link = f"[profile]({url.translate(_LINK_ESCAPES)})" if url else "-"
-        lines.append(f"| `{_cell(steamid)}` | {link} |")
+        rows.append(f"| `{_cell(steamid)}` | {_markdown_link(url, 'profile') if url else '-'} |")
+    shown, hidden = _take_rows(rows, MAX_REMOVED_CHARS)
+    lines += shown
     lines.append("")
-    if count > len(shown):
-        lines += [
-            f"…and {count - len(shown)} more {plural(count - len(shown), 'SteamID', 'SteamIDs')} "
-            "(the snapshot diff in this pull request lists every one).",
-            "",
-        ]
+    if hidden:
+        lines += [_truncation_note(hidden, "SteamID", "SteamIDs", "the snapshot diff"), ""]
     return lines
+
+
+def _steamid_list(steamids: Sequence[str]) -> str:
+    """Comma-separated SteamIDs, truncated once the list gets long."""
+    shown = list(steamids[:MAX_CLOSING_STEAMIDS])
+    hidden = len(steamids) - len(shown)
+    text = ", ".join(shown)
+    return text if hidden <= 0 else f"{text} and {hidden} more"
 
 
 def render_closing(changes: Sequence[Change]) -> str:
@@ -175,12 +232,12 @@ def render_closing(changes: Sequence[Change]) -> str:
         if len(changed_steamids) == 1:
             parts.append("Attribute is changed for this SteamID: " + changed_steamids[0])
         else:
-            parts.append("Attributes are changed for these SteamIDs: " + ", ".join(changed_steamids))
+            parts.append("Attributes are changed for these SteamIDs: " + _steamid_list(changed_steamids))
     if removed_steamids:
         if len(removed_steamids) == 1:
             parts.append("Entry is removed from the database for this SteamID: " + removed_steamids[0])
         else:
-            parts.append("Entries are removed from the database for these SteamIDs: " + ", ".join(removed_steamids))
+            parts.append("Entries are removed from the database for these SteamIDs: " + _steamid_list(removed_steamids))
 
     return "; ".join(parts) + "; nothing else is modified."
 
@@ -272,7 +329,7 @@ def _promotion_section(promotions: Sequence[Change]) -> list[str]:
         "| SteamID | Last known name | Before | After | Hackerpolice proof |",
         "| --- | --- | --- | --- | --- |",
     ]
-    lines += [
+    rows = [
         "| `{steamid}` | {name} | {before} | {after} | {evidence} |".format(
             steamid=change.steamid,
             name=_name_cell(change),
@@ -282,7 +339,11 @@ def _promotion_section(promotions: Sequence[Change]) -> list[str]:
         )
         for change in promotions
     ]
+    shown, hidden = _take_rows(rows, MAX_PROMOTION_CHARS)
+    lines += shown
     lines.append("")
+    if hidden:
+        lines += [_truncation_note(hidden, "entry", "entries", "the database diff"), ""]
     return lines
 
 
@@ -295,7 +356,7 @@ def _demotion_section(demotions: Sequence[Change]) -> list[str]:
         "| SteamID | Last known name | Before | After |",
         "| --- | --- | --- | --- |",
     ]
-    lines += [
+    rows = [
         "| `{steamid}` | {name} | {before} | {after} |".format(
             steamid=change.steamid,
             name=_name_cell(change),
@@ -304,7 +365,11 @@ def _demotion_section(demotions: Sequence[Change]) -> list[str]:
         )
         for change in demotions
     ]
+    shown, hidden = _take_rows(rows, MAX_DEMOTION_CHARS)
+    lines += shown
     lines.append("")
+    if hidden:
+        lines += [_truncation_note(hidden, "entry", "entries", "the database diff"), ""]
     return lines
 
 

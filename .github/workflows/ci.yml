@@ -1,0 +1,57 @@
+name: Checks
+
+# Lint, type-check and test every change WITHOUT touching any data file.
+# This is the contributor-facing check: the sync workflow only runs on a
+# schedule (or manually), so without this nothing would validate a pull
+# request before it is merged.
+# The sync workflow runs the same three checks inline before it is allowed to
+# open its own pull request, so bot-generated changes are covered too.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Lint, type-check and tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The scripts claim Python 3.10+: test the minimum and the version the
+        # bot itself runs on.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Lint (ruff)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check ruff==0.17.4
+          ruff check scripts tests
+          ruff format --check scripts tests
+
+      - name: Type-check (mypy)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check mypy==2.4.1
+          mypy scripts
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v

@@ -31,3 +31,5 @@ extraPaths = ["scripts"]
 
 [tool.mypy]
 mypy_path = "scripts"
+# The scripts are small and fully annotated: keep them that way.
+strict = true

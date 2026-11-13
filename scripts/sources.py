@@ -16,6 +16,7 @@ import base64
 import binascii
 import http.client
 import json
+import logging
 import time
 import urllib.error
 import urllib.parse
@@ -26,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from playerlist import normalize_steamid
+
+LOGGER = logging.getLogger("sources")
 
 SOURCE_REPO_URL = "https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json"
 
@@ -143,10 +146,7 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     """
     if not path.exists():
         return None
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise SyncError(f"cannot read {path}: {exc}") from exc
+    raw = _read_local_bytes(path)
     return HackerpoliceIndex.build(_parse_document(raw, str(path))), raw
 
 
@@ -164,7 +164,8 @@ def _http_get(url: str, timeout: int) -> bytes:
     # data: or another local scheme (Bandit/ruff B310/S310 audit).
     request = urllib.request.Request(url, headers=headers)  # noqa: S310
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        body = response.read(MAX_SOURCE_BYTES + 1)
+        # urlopen is untyped (Any); the annotation keeps --strict honest.
+        body: bytes = response.read(MAX_SOURCE_BYTES + 1)
     if len(body) > MAX_SOURCE_BYTES:
         raise SyncError(f"{url} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
     return body
@@ -189,6 +190,7 @@ def _fetch_bytes(
     """
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
+        LOGGER.debug("GET %s (attempt %d/%d)", url, attempt, attempts)
         try:
             return _http_get(url, timeout)
         except urllib.error.HTTPError as exc:
@@ -208,17 +210,34 @@ def _fetch_bytes(
     raise SyncError(f"could not fetch {url}: {last_error}")
 
 
+def _read_local_bytes(path: Path) -> bytes:
+    """Read a local file, refusing anything above the fetch size cap.
+
+    Local files are operator-chosen (``--source``, ``--snapshot``), but
+    "pointed it at a 5 GB file by accident" must be a clean error rather than
+    an out-of-memory kill in the middle of a scheduled run. The cap is the
+    same one HTTP downloads use.
+    """
+    try:
+        size = path.stat().st_size
+        if size > MAX_SOURCE_BYTES:
+            raise SyncError(
+                f"{path} is {size} bytes, larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit"
+            )
+        return path.read_bytes()
+    except OSError as exc:
+        raise SyncError(f"cannot read {path}: {exc}") from exc
+
+
 def _read_bytes(source: str) -> bytes:
     """Return the raw bytes of an HTTP(S) URL or a local path, raising SyncError."""
     if source.startswith(("http://", "https://")):
         return _fetch_bytes(source)
-    try:
-        return Path(source).read_bytes()
-    except OSError as exc:
-        raise SyncError(f"cannot read {source}: {exc}") from exc
+    LOGGER.debug("Reading local file %s", source)
+    return _read_local_bytes(Path(source))
 
 
-def _unwrap_github_contents_envelope(document: dict[str, Any], raw: bytes) -> bytes | None:
+def _unwrap_github_contents_envelope(document: dict[str, Any]) -> bytes | None:
     """Decode a GitHub Contents API envelope to the file bytes it wraps.
 
     Normally the ``Accept: application/vnd.github.raw`` header makes the API
@@ -240,15 +259,30 @@ def _unwrap_github_contents_envelope(document: dict[str, Any], raw: bytes) -> by
     return decoded or None
 
 
+# Hosts GitHub itself serves repository blobs from. A download_url is
+# untrusted response data, so following it anywhere else would be a
+# server-side request forgery primitive: a hostile upstream file could point
+# the CI runner at an internal service and have the response parsed.
+GITHUB_DOWNLOAD_HOSTS = frozenset({"github.com", "codeload.github.com", "raw.githubusercontent.com"})
+
+
+def _is_github_host(url: str) -> bool:
+    """True if an HTTPS URL points at GitHub (``*.github.com``/``*.githubusercontent.com``)."""
+    if not url.startswith("https://"):
+        return False
+    host = urllib.parse.urlparse(url).hostname or ""
+    return host in GITHUB_DOWNLOAD_HOSTS or host.endswith((".github.com", ".githubusercontent.com"))
+
+
 def _download_url(document: dict[str, Any]) -> str | None:
     """The envelope's ``download_url``, if it is safe to follow.
 
     ``download_url`` comes from the fetched document itself, so unlike an
-    operator-supplied ``--source`` it is untrusted: HTTPS only -- never a
-    local path or a plaintext URL.
+    operator-supplied ``--source`` it is untrusted: HTTPS on a GitHub host
+    only -- never a local path, a plaintext URL, or an arbitrary third party.
     """
     url = document.get("download_url")
-    return url if isinstance(url, str) and url.startswith("https://") else None
+    return url if isinstance(url, str) and _is_github_host(url) else None
 
 
 def _load_source(source: str) -> tuple[dict[str, Any], bytes]:
@@ -262,7 +296,7 @@ def _load_source(source: str) -> tuple[dict[str, Any], bytes]:
     if isinstance(document.get("players"), list):
         return document, raw
 
-    unwrapped = _unwrap_github_contents_envelope(document, raw)
+    unwrapped = _unwrap_github_contents_envelope(document)
     if unwrapped is None:
         download_url = _download_url(document)
         if download_url is None:
@@ -283,12 +317,16 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
     re-serialised on the way to the snapshot.
     """
     failures: list[str] = []
-    for source in sources:
+    candidates = list(sources)
+    for position, source in enumerate(candidates, start=1):
+        LOGGER.debug("Source %d/%d: trying %s", position, len(candidates), source)
         try:
             document, raw = _load_source(source)
         except SyncError as exc:
+            LOGGER.debug("Source %s failed: %s", source, exc)
             failures.append(str(exc))
             continue
+        LOGGER.debug("Source %s ok: %d bytes", source, len(raw))
         return document, source, raw
 
     raise SyncError("cannot load the Vorobey hackerpolice list:\n  " + "\n  ".join(failures))

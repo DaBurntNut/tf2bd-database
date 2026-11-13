@@ -11,6 +11,7 @@ database were added manually and must survive every sync.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +29,14 @@ from sources import PROOF_MARKER, SOURCE_REPO_URL, HackerpoliceIndex
 PROMOTABLE_ATTRIBUTES = frozenset({"suspicious", "racist"})
 DROPPED_ATTRIBUTE = "suspicious"
 PROMOTED_TO = "cheater"
+
+# Upstream evidence is untrusted text that --include-proof copies into our own
+# database, so it is normalised (any whitespace/control character becomes one
+# space, no entry can smuggle a newline or a null byte into the JSON) and
+# capped: one hostile entry must not be able to add a megabyte-long proof
+# line. Real entries carry a link or two.
+MAX_EVIDENCE_ITEMS = 10
+_EVIDENCE_SEPARATORS_RE = re.compile(r"[\x00-\x1f\x7f\s]+")
 
 __all__ = [
     "RACIST_PROOF_PREFIX",
@@ -78,12 +87,25 @@ class Change:
 
 
 def _evidence_links(entry: dict[str, Any]) -> tuple[str, ...]:
-    """Proof links the Vorobey hackerpolice list recorded for one player (de-duplicated)."""
+    """Proof links the Vorobey hackerpolice list recorded for one player.
+
+    Whitespace and control characters are collapsed to single spaces and
+    duplicates dropped, because this text can end up in our own playerlist
+    (``--include-proof``) as well as in the pull request.
+    """
     proofs = entry.get("proof")
     if not isinstance(proofs, list):
         return ()
-    links = (item.strip() for item in proofs if isinstance(item, str) and item.strip())
-    return tuple(dict.fromkeys(links))
+    cleaned: list[str] = []
+    for item in proofs:
+        if not isinstance(item, str):
+            continue
+        text = _EVIDENCE_SEPARATORS_RE.sub(" ", item).strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+            if len(cleaned) == MAX_EVIDENCE_ITEMS:  # stop early: bounded work and memory
+                break
+    return tuple(cleaned)
 
 
 def _write_proof(player: Player, evidence: tuple[str, ...]) -> None:

@@ -82,15 +82,19 @@ def _bounded_int(digits: str) -> int | None:
     return int(significant)
 
 
-def _canonical(account: int | None) -> str | None:
-    """Wrap an account id in canonical ``[U:1:<id>]`` form, or reject it.
+def _valid_account(account: int | None) -> int | None:
+    """The account id if it can be a real Steam account, otherwise ``None``.
 
     Account ids are 32-bit and never 0: out-of-range input is rejected
     instead of minting a canonical ID no real account can have.
     """
-    if account is None or not 0 < account < MAX_ACCOUNT_ID:
-        return None
-    return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+    return account if account is not None and 0 < account < MAX_ACCOUNT_ID else None
+
+
+def _canonical(account: int | None) -> str | None:
+    """Wrap an account id in canonical ``[U:1:<id>]`` form, or reject it."""
+    valid = _valid_account(account)
+    return None if valid is None else f"{CANONICAL_PREFIX}{valid}{CANONICAL_SUFFIX}"
 
 
 def _account_from_text(text: str) -> int | None:
@@ -144,11 +148,19 @@ def normalize_steamid(value: Any) -> str | None:
 
 
 def account_id(steamid: Any) -> int | None:
-    """Numeric account id of a SteamID in any accepted notation."""
-    canonical = normalize_steamid(steamid)
-    if canonical is None:
+    """Numeric account id of a SteamID in any accepted notation.
+
+    Parses the input directly instead of formatting a canonical ID and
+    slicing the number back out of it -- this runs once per player on every
+    sort and once per removed SteamID in the report.
+    """
+    if isinstance(steamid, bool):  # bool is an int subclass; not a SteamID
         return None
-    return int(canonical[len(CANONICAL_PREFIX) : -len(CANONICAL_SUFFIX)])
+    if isinstance(steamid, int):
+        return _valid_account(steamid if 0 < steamid < MAX_ACCOUNT_ID else _account_from_steamid64(steamid))
+    if not isinstance(steamid, str):
+        return None
+    return _valid_account(_account_from_text(steamid.strip()))
 
 
 def steam_profile_url(steamid: Any) -> str | None:
@@ -205,8 +217,14 @@ def dumps(database: PlayerList) -> str:
     return json.dumps(database, indent="\t", sort_keys=True, ensure_ascii=True) + "\n"
 
 
-def load(path: Path, *, encoding: str = "utf-8") -> tuple[PlayerList, str]:
-    """Read a playerlist, returning the parsed document and its original text."""
+def load(path: Path, *, encoding: str = "utf-8-sig") -> tuple[PlayerList, str]:
+    """Read a playerlist, returning the parsed document and its original text.
+
+    The default ``utf-8-sig`` accepts an optional byte-order mark: a file
+    saved by an editor that adds one must not make every run fail with
+    "not valid JSON". The BOM is stripped from the returned text, so the
+    next write normalises the file back to plain UTF-8.
+    """
     try:
         original = path.read_text(encoding=encoding)
     except (OSError, UnicodeDecodeError) as exc:
