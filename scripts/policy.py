@@ -98,6 +98,19 @@ def _write_proof(player: Player, evidence: tuple[str, ...]) -> None:
     player["proof"] = proof
 
 
+def _promoted_attributes(before: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Attributes after promotion, or ``None`` if this entry is out of scope.
+
+    ``suspicious`` and/or ``racist`` entries gain ``cheater``; ``suspicious``
+    is dropped (a cheater list settles it) while ``racist`` is kept.
+    """
+    if PROMOTED_TO in before:
+        return None  # already a cheater, nothing to add
+    if not PROMOTABLE_ATTRIBUTES.intersection(before):
+        return None  # exploiter / unknown attribute only - out of scope
+    return tuple(order_attributes({*before, PROMOTED_TO} - {DROPPED_ATTRIBUTE}))
+
+
 def promote(database: PlayerList, index: HackerpoliceIndex, *, include_proof: bool = False) -> list[Change]:
     """Apply the promotion policy in place and return what changed.
 
@@ -132,12 +145,10 @@ def promote(database: PlayerList, index: HackerpoliceIndex, *, include_proof: bo
             continue  # malformed entry; the caller's validation reports it
 
         before = tuple(attributes)
-        if PROMOTED_TO in before:
-            continue  # already a cheater, nothing to add
-        if not PROMOTABLE_ATTRIBUTES.intersection(before):
-            continue  # exploiter / unknown attribute only - out of scope
+        after = _promoted_attributes(before)
+        if after is None:
+            continue
 
-        after = tuple(order_attributes({*before, PROMOTED_TO} - {DROPPED_ATTRIBUTE}))
         player["attributes"] = list(after)
 
         evidence = _evidence_links(entry)
@@ -155,6 +166,49 @@ def promote(database: PlayerList, index: HackerpoliceIndex, *, include_proof: bo
         )
 
     return changes
+
+
+def _demote_player(player: Player, removed: frozenset[str]) -> tuple[Player | None, Change | None]:
+    """Apply the demotion policy to one entry.
+
+    Returns the entry to keep (``None`` when the whole entry is removed) and
+    the :class:`Change` describing it, if anything changed.
+    """
+    canonical = normalize_steamid(player.get("steamid"))
+    if canonical is None:
+        return player, None
+
+    # Not proven to have been removed upstream (never listed, or still
+    # listed) - nothing to demote, however the entry got its cheater tag.
+    if canonical not in removed:
+        return player, None
+
+    attributes = player.get("attributes")
+    if not isinstance(attributes, list) or not attributes:
+        return player, None
+    if not all(isinstance(attribute, str) for attribute in attributes):
+        return player, None  # malformed entry; validation reports it
+
+    before = tuple(attributes)
+    if PROMOTED_TO not in before:
+        return player, None  # not a cheater - nothing to demote
+
+    name = player_name(player)
+    if "racist" not in before:
+        # cheater without racist: the whole entry goes, along with its proofs
+        return None, Change(steamid=canonical, name=name, before=before, after=(), kind="demote")
+
+    # cheater + racist: remove only cheater, keep racist
+    after = tuple(order_attributes({*before} - {PROMOTED_TO}))
+    player["attributes"] = list(after)
+
+    # Drop every proof except the "[auto] ... Racist" lines: the cheater tag
+    # was a false positive, so its evidence must not stay behind pretending
+    # to justify the remaining racist tag.
+    if "proof" in player:
+        player["proof"] = _filter_racist_proofs(player.get("proof"))
+
+    return player, Change(steamid=canonical, name=name, before=before, after=after, kind="demote")
 
 
 def demote(database: PlayerList, removed_ids: Collection[str]) -> list[Change]:
@@ -179,71 +233,17 @@ def demote(database: PlayerList, removed_ids: Collection[str]) -> list[Change]:
     players = database.get("players")
     if not isinstance(players, list):
         return changes
-    kept: list[Player] = []
 
+    kept: list[Player] = []
     for player in players:
         if not isinstance(player, dict):
-            kept.append(player)
-            continue
-
-        canonical = normalize_steamid(player.get("steamid"))
-        if canonical is None:
-            kept.append(player)
-            continue
-
-        # Not proven to have been removed upstream (never listed, or still
-        # listed) - nothing to demote, however the entry got its cheater tag.
-        if canonical not in removed:
-            kept.append(player)
-            continue
-
-        attributes = player.get("attributes")
-        if not isinstance(attributes, list) or not attributes:
-            kept.append(player)
-            continue
-        if not all(isinstance(attribute, str) for attribute in attributes):
             kept.append(player)  # malformed entry; validation reports it
             continue
-
-        before = tuple(attributes)
-        if PROMOTED_TO not in before:
-            # Not a cheater - nothing to demote
-            kept.append(player)
-            continue
-
-        if "racist" in before:
-            # Remove only cheater, keep racist
-            after = tuple(order_attributes({*before} - {PROMOTED_TO}))
-            player["attributes"] = list(after)
-
-            # Drop every proof except the "[auto] ... Racist" lines: the
-            # cheater tag was a false positive, so its evidence must not
-            # stay behind pretending to justify the remaining racist tag.
-            if "proof" in player:
-                player["proof"] = _filter_racist_proofs(player.get("proof"))
-
-            changes.append(
-                Change(
-                    steamid=canonical,
-                    name=player_name(player),
-                    before=before,
-                    after=after,
-                    kind="demote",
-                )
-            )
-            kept.append(player)
-        else:
-            # Remove the whole entry (cheater without racist)
-            changes.append(
-                Change(
-                    steamid=canonical,
-                    name=player_name(player),
-                    before=before,
-                    after=(),
-                    kind="demote",
-                )
-            )
-            # Entry is dropped - not added to kept
+        kept_player, change = _demote_player(player, removed)
+        if kept_player is not None:
+            kept.append(kept_player)
+        if change is not None:
+            changes.append(change)
 
     database["players"] = kept
     return changes

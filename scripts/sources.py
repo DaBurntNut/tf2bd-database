@@ -29,6 +29,11 @@ from playerlist import normalize_steamid
 
 SOURCE_REPO_URL = "https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json"
 
+# The demotion baseline: a byte-for-byte replica of the upstream file, kept
+# in the repository so removals can be proven (and reviewed) in a pull
+# request. Owned here because the snapshot IS the Vorobey list.
+DEFAULT_SNAPSHOT = "snapshot/playerlist.vorobey-hackerpolice.json"
+
 # Marks the proof line this tool owns, so it is never added twice.
 PROOF_MARKER = "[auto] cheater: matched Vorobey hackerpolice list"
 
@@ -41,7 +46,7 @@ DEFAULT_SOURCES: tuple[str, ...] = (
 )
 
 # Single source of truth for the tool version (also used for --version).
-VERSION = "3.4"
+VERSION = "3.5"
 
 USER_AGENT = (
     f"Garou3299-tf2bd-database-vorobey-hackerpolice-sync/{VERSION} (+https://github.com/Garou3299/tf2bd-database)"
@@ -51,11 +56,12 @@ FETCH_TIMEOUT_SECONDS = 30
 FETCH_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 2
 
-# Sanity cap on a fetched list (currently ~2 MB): a misbehaving or hostile
-# endpoint must not be able to exhaust memory by streaming forever.
+# Sanity cap on a fetched list (the real one is ~1.9 MB): a misbehaving or
+# hostile endpoint must not be able to exhaust memory by streaming forever.
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 
 __all__ = [
+    "DEFAULT_SNAPSHOT",
     "DEFAULT_SOURCES",
     "PROOF_MARKER",
     "SOURCE_REPO_URL",
@@ -144,6 +150,31 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     return HackerpoliceIndex.build(_parse_document(raw, str(path))), raw
 
 
+def _http_get(url: str, timeout: int) -> bytes:
+    """One GET, returning the body bytes VERBATIM (no decoding, no newline fixes)."""
+    if not url.startswith(("https://", "http://")):
+        raise SyncError(f"refusing to fetch non-HTTP(S) URL: {url}")
+    headers = {"User-Agent": USER_AGENT}
+    # Hostname comparison, not a substring match: a look-alike URL such as
+    # https://api.github.com.example.invalid/ must not be treated as the
+    # GitHub API.
+    if urllib.parse.urlparse(url).hostname == "api.github.com":
+        headers["Accept"] = "application/vnd.github.raw"
+    # The scheme is checked above, so urlopen can never be pointed at file:,
+    # data: or another local scheme (Bandit/ruff B310/S310 audit).
+    request = urllib.request.Request(url, headers=headers)  # noqa: S310
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+        body = response.read(MAX_SOURCE_BYTES + 1)
+    if len(body) > MAX_SOURCE_BYTES:
+        raise SyncError(f"{url} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
+    return body
+
+
+def _is_transient(error: urllib.error.HTTPError) -> bool:
+    """True for HTTP statuses where retrying the same URL may succeed."""
+    return error.code == 429 or 500 <= error.code < 600
+
+
 def _fetch_bytes(
     url: str,
     *,
@@ -156,40 +187,24 @@ def _fetch_bytes(
     will fail identically on every attempt, and the caller falls back to
     the next source instead.
     """
-    if not url.startswith(("https://", "http://")):
-        raise SyncError(f"refusing to fetch non-HTTP(S) URL: {url}")
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            headers = {"User-Agent": USER_AGENT}
-            # Hostname comparison, not a substring match: a look-alike URL
-            # such as https://api.github.com.example.invalid/ must not be
-            # treated as the GitHub API.
-            if urllib.parse.urlparse(url).hostname == "api.github.com":
-                headers["Accept"] = "application/vnd.github.raw"
-            request = urllib.request.Request(url, headers=headers)
-            # Scheme is restricted to HTTP(S) above (Bandit B310).
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
-                body = response.read(MAX_SOURCE_BYTES + 1)
-            if len(body) > MAX_SOURCE_BYTES:
-                raise SyncError(f"{url} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
-            return body
+            return _http_get(url, timeout)
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if exc.code != 429 and not 500 <= exc.code < 600:
+            if not _is_transient(exc):
                 break  # permanent: don't waste attempts, fall back sooner
-            if attempt < attempts:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             last_error = exc
-            if attempt < attempts:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
         except (ValueError, http.client.HTTPException) as exc:
             # A malformed URL (bad IPv6 literal, control characters, ...)
             # fails identically on every attempt and every machine: report
             # it as a fetch failure so the caller falls back / exits cleanly
             # instead of crashing with a traceback.
             raise SyncError(f"could not fetch {url}: {exc}") from exc
+        if attempt < attempts:
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
     raise SyncError(f"could not fetch {url}: {last_error}")
 
 
@@ -225,6 +240,40 @@ def _unwrap_github_contents_envelope(document: dict[str, Any], raw: bytes) -> by
     return decoded or None
 
 
+def _download_url(document: dict[str, Any]) -> str | None:
+    """The envelope's ``download_url``, if it is safe to follow.
+
+    ``download_url`` comes from the fetched document itself, so unlike an
+    operator-supplied ``--source`` it is untrusted: HTTPS only -- never a
+    local path or a plaintext URL.
+    """
+    url = document.get("download_url")
+    return url if isinstance(url, str) and url.startswith("https://") else None
+
+
+def _load_source(source: str) -> tuple[dict[str, Any], bytes]:
+    """Load one source and return its document plus the bytes to snapshot.
+
+    The returned bytes are always the upstream FILE, never a GitHub API
+    envelope: the snapshot written from them stays an exact replica.
+    """
+    raw = _read_bytes(source)
+    document = _parse_document(raw, source)
+    if isinstance(document.get("players"), list):
+        return document, raw
+
+    unwrapped = _unwrap_github_contents_envelope(document, raw)
+    if unwrapped is None:
+        download_url = _download_url(document)
+        if download_url is None:
+            raise SyncError(f"{source}: no 'players' array and no usable HTTPS download_url in response")
+        unwrapped = _read_bytes(download_url)
+    document = _parse_document(unwrapped, source)
+    if not isinstance(document.get("players"), list):
+        raise SyncError(f"{source}: no 'players' array in response")
+    return document, unwrapped
+
+
 def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], str, bytes]:
     """Return the parsed document, source name, and RAW bytes of the first usable source.
 
@@ -236,39 +285,10 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
     failures: list[str] = []
     for source in sources:
         try:
-            raw = _read_bytes(source)
-            document = _parse_document(raw, source)
+            document, raw = _load_source(source)
         except SyncError as exc:
             failures.append(str(exc))
             continue
-        if not isinstance(document.get("players"), list):
-            unwrapped = _unwrap_github_contents_envelope(document, raw)
-            if unwrapped is None:
-                # Large-file envelopes carry no inline content, only a
-                # download_url pointing at the raw file: follow it, and the
-                # bytes downloaded there become the (exact) snapshot bytes.
-                download_url = document.get("download_url")
-                # download_url comes from the fetched document itself, so
-                # unlike an operator-supplied --source it is untrusted:
-                # HTTPS only -- never a local path or a plaintext URL.
-                if isinstance(download_url, str) and download_url.startswith("https://"):
-                    try:
-                        unwrapped = _read_bytes(download_url)
-                    except SyncError as exc:
-                        failures.append(str(exc))
-                        continue
-                else:
-                    failures.append(f"{source}: no 'players' array and no usable HTTPS download_url in response")
-                    continue
-            try:
-                document = _parse_document(unwrapped, source)
-            except SyncError as exc:
-                failures.append(str(exc))
-                continue
-            if not isinstance(document.get("players"), list):
-                failures.append(f"{source}: no 'players' array in response")
-                continue
-            raw = unwrapped
         return document, source, raw
 
     raise SyncError("cannot load the Vorobey hackerpolice list:\n  " + "\n  ".join(failures))

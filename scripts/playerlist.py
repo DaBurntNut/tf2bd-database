@@ -24,13 +24,17 @@ CANONICAL_SUFFIX = "]"
 ATTRIBUTE_ORDER: tuple[str, ...] = ("cheater", "suspicious", "exploiter", "racist")
 KNOWN_ATTRIBUTES = frozenset(ATTRIBUTE_ORDER)
 
-_ACCOUNT_ID_RE = re.compile(r"\d+")
-_U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$")
-_U_BARE_RE = re.compile(rf"^U:1:({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE)
-_U_INSTANCE_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):{_ACCOUNT_ID_RE.pattern}\]$")
-_STEAM2_RE = re.compile(r"^STEAM_[0-5]:([01]):(\d+)$", re.IGNORECASE)
-_STEAMID64_RE = re.compile(r"^\d{17}$")
-_PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/(\d{17})", re.IGNORECASE)
+# re.ASCII: \d must only ever match 0-9. Without it "\d" also matches
+# non-ASCII decimal digits (e.g. Arabic-Indic "١٢٣"), which int() happily
+# accepts -- that would silently turn garbage into a valid-looking SteamID.
+_ASCII = re.ASCII
+_ACCOUNT_ID_RE = re.compile(r"\d+", _ASCII)
+_U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$", _ASCII)
+_U_BARE_RE = re.compile(rf"^U:1:({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE | _ASCII)
+_U_INSTANCE_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):{_ACCOUNT_ID_RE.pattern}\]$", _ASCII)
+_STEAM2_RE = re.compile(r"^STEAM_[0-5]:([01]):(\d+)$", re.IGNORECASE | _ASCII)
+_STEAMID64_RE = re.compile(r"^\d{17}$", _ASCII)
+_PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/(\d{17})", re.IGNORECASE | _ASCII)
 
 
 class PlayerListError(Exception):
@@ -78,6 +82,47 @@ def _bounded_int(digits: str) -> int | None:
     return int(significant)
 
 
+def _canonical(account: int | None) -> str | None:
+    """Wrap an account id in canonical ``[U:1:<id>]`` form, or reject it.
+
+    Account ids are 32-bit and never 0: out-of-range input is rejected
+    instead of minting a canonical ID no real account can have.
+    """
+    if account is None or not 0 < account < MAX_ACCOUNT_ID:
+        return None
+    return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+
+
+def _account_from_text(text: str) -> int | None:
+    """Account id from any accepted textual SteamID notation, or ``None``."""
+    for pattern in (_U_RE, _U_BARE_RE, _U_INSTANCE_RE):
+        match = pattern.match(text)
+        if match:
+            return _bounded_int(match.group(1))
+
+    match = _STEAM2_RE.match(text)
+    if match:
+        # STEAM_X:Y:Z -> account id is Z * 2 + Y (Y is the auth-server bit).
+        auth_server, account_half = match.groups()
+        half = _bounded_int(account_half)
+        return None if half is None else half * 2 + int(auth_server)
+
+    if _STEAMID64_RE.match(text):
+        return _account_from_steamid64(int(text))
+
+    if text.isascii() and text.isdigit():
+        # Bare account id given as a string, e.g. "1730017" (the int form of
+        # this is accepted below, so accept the string form too). isascii()
+        # keeps non-ASCII digits from being parsed as an account id.
+        return _bounded_int(text)
+
+    match = _PROFILE_URL_RE.search(text)
+    if match:
+        return _account_from_steamid64(int(match.group(1)))
+
+    return None
+
+
 def normalize_steamid(value: Any) -> str | None:
     """Return canonical ``[U:1:<account id>]`` form, or ``None`` if unusable.
 
@@ -88,52 +133,14 @@ def normalize_steamid(value: Any) -> str | None:
         return None
 
     if isinstance(value, int):
+        # A bare account id, or a full SteamID64.
         account = value if 0 < value < MAX_ACCOUNT_ID else _account_from_steamid64(value)
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
+        return _canonical(account)
 
     if not isinstance(value, str):
         return None
 
-    text = value.strip()
-    for pattern in (_U_RE, _U_BARE_RE, _U_INSTANCE_RE):
-        match = pattern.match(text)
-        if match:
-            account = _bounded_int(match.group(1))
-            # Account ids are 32-bit and never 0; reject out-of-range input
-            # instead of minting a canonical ID no real account can have.
-            if account is None or not 0 < account < MAX_ACCOUNT_ID:
-                return None
-            return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
-
-    match = _STEAM2_RE.match(text)
-    if match:
-        # STEAM_X:Y:Z -> account id is Z * 2 + Y (Y is the auth-server bit).
-        # Same range rule as every other form: 32-bit and never 0.
-        auth_server, account_half = match.groups()
-        half = _bounded_int(account_half)
-        if half is None:
-            return None
-        account = half * 2 + int(auth_server)
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if 0 < account < MAX_ACCOUNT_ID else None
-
-    if _STEAMID64_RE.match(text):
-        account = _account_from_steamid64(int(text))
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
-
-    if text.isdigit():
-        # Bare account id given as a string, e.g. "1730017" (the int form of
-        # this is accepted above, so accept the string form too).
-        account = _bounded_int(text)
-        if account is None or not 0 < account < MAX_ACCOUNT_ID:
-            return None
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
-
-    match = _PROFILE_URL_RE.search(text)
-    if match:
-        account = _account_from_steamid64(int(match.group(1)))
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
-
-    return None
+    return _canonical(_account_from_text(value.strip()))
 
 
 def account_id(steamid: Any) -> int | None:
@@ -239,39 +246,52 @@ def validate(database: PlayerList) -> ValidationResult:
 
     seen: set[str] = set()
     for position, player in enumerate(players):
-        if not isinstance(player, dict):
-            result.errors.append(f"players[{position}] is not an object")
-            continue
-
-        steamid = player.get("steamid")
-        canonical = normalize_steamid(steamid)
-        if canonical is None:
-            result.errors.append(f"players[{position}] has an unusable steamid: {steamid!r}")
-        elif canonical in seen:
-            result.errors.append(f"duplicate steamid {canonical}")
-        else:
-            seen.add(canonical)
-
-        attributes = player.get("attributes")
-        if not isinstance(attributes, list) or not attributes:
-            result.errors.append(f"players[{position}] ({steamid}) has no attributes")
-            continue
-        if not all(isinstance(attribute, str) for attribute in attributes):
-            # Also guards the set() below against unhashable attribute values.
-            result.errors.append(f"players[{position}] ({steamid}) has a non-string attribute")
-            continue
-        if len(set(attributes)) != len(attributes):
-            result.errors.append(f"players[{position}] ({steamid}) has duplicate attributes")
-        for attribute in attributes:
-            if attribute not in KNOWN_ATTRIBUTES:
-                result.warnings.append(f"players[{position}] ({steamid}) uses unknown attribute {attribute!r}")
-
-        # The sync policy rewrites `proof` when demoting, so its shape is an
-        # invariant this tool relies on: an array of strings, if present.
-        proof = player.get("proof")
-        if proof is not None and (not isinstance(proof, list) or not all(isinstance(item, str) for item in proof)):
-            result.errors.append(
-                f"players[{position}] ({steamid}) has a malformed 'proof' (must be an array of strings)"
-            )
-
+        _validate_player(position, player, seen, result)
     return result
+
+
+def _validate_player(position: int, player: Any, seen: set[str], result: ValidationResult) -> None:
+    """Validate one entry, appending every problem found to ``result``.
+
+    All checks run even when an earlier one failed, so a run reports the
+    complete list of problems instead of one per entry per attempt.
+    """
+    if not isinstance(player, dict):
+        result.errors.append(f"players[{position}] is not an object")
+        return
+
+    steamid = player.get("steamid")
+    canonical = normalize_steamid(steamid)
+    if canonical is None:
+        result.errors.append(f"players[{position}] has an unusable steamid: {steamid!r}")
+    elif canonical in seen:
+        result.errors.append(f"duplicate steamid {canonical}")
+    else:
+        seen.add(canonical)
+
+    _validate_attributes(position, steamid, player, result)
+    _validate_proof(position, steamid, player, result)
+
+
+def _validate_attributes(position: int, steamid: Any, player: dict[str, Any], result: ValidationResult) -> None:
+    attributes = player.get("attributes")
+    if not isinstance(attributes, list) or not attributes:
+        result.errors.append(f"players[{position}] ({steamid}) has no attributes")
+        return
+    if not all(isinstance(attribute, str) for attribute in attributes):
+        # Also guards the set() below against unhashable attribute values.
+        result.errors.append(f"players[{position}] ({steamid}) has a non-string attribute")
+        return
+    if len(set(attributes)) != len(attributes):
+        result.errors.append(f"players[{position}] ({steamid}) has duplicate attributes")
+    for attribute in attributes:
+        if attribute not in KNOWN_ATTRIBUTES:
+            result.warnings.append(f"players[{position}] ({steamid}) uses unknown attribute {attribute!r}")
+
+
+def _validate_proof(position: int, steamid: Any, player: dict[str, Any], result: ValidationResult) -> None:
+    # The sync policy rewrites `proof` when demoting, so its shape is an
+    # invariant this tool relies on: an array of strings, if present.
+    proof = player.get("proof")
+    if proof is not None and (not isinstance(proof, list) or not all(isinstance(item, str) for item in proof)):
+        result.errors.append(f"players[{position}] ({steamid}) has a malformed 'proof' (must be an array of strings)")

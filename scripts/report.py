@@ -13,7 +13,7 @@ from pathlib import Path
 
 from playerlist import account_id, steam_profile_url
 from policy import Change
-from sources import SOURCE_REPO_URL
+from sources import DEFAULT_SNAPSHOT, SOURCE_REPO_URL
 
 __all__ = ["MAX_REMOVED_ROWS", "RunInfo", "plural", "render_closing", "render_report"]
 
@@ -25,8 +25,24 @@ __all__ = ["MAX_REMOVED_ROWS", "RunInfo", "plural", "render_closing", "render_re
 # table is truncated with a pointer there instead of breaking the body.
 MAX_REMOVED_ROWS = 200
 
-# Characters that would break a Markdown link target.
-_LINK_ESCAPES = str.maketrans({"(": "%28", ")": "%29", " ": "%20", "<": "%3C", ">": "%3E", "\n": "%0A", "\r": "%0D"})
+# Characters that would break a Markdown link target -- or let an
+# untrusted proof string (the Vorobey list is outside our control) break out
+# of it and inject arbitrary Markdown. Percent-encoded rather than
+# backslash-escaped so the URL stays valid.
+_LINK_ESCAPES = str.maketrans(
+    {
+        "\\": "%5C",
+        "(": "%28",
+        ")": "%29",
+        " ": "%20",
+        "[": "%5B",
+        "]": "%5D",
+        "<": "%3C",
+        ">": "%3E",
+        "\n": "%0A",
+        "\r": "%0D",
+    }
+)
 
 # Lone UTF-16 surrogates: legal in JSON input (e.g. "\ud800" in a player
 # name) and loadable by Python, but impossible to encode as UTF-8 -- one in
@@ -66,7 +82,12 @@ def _name_cell(change: Change) -> str:
 
 
 def _is_url(text: str) -> bool:
-    return text.startswith(("http://", "https://"))
+    """True for http(s) URLs, whatever the case of the scheme.
+
+    Anything else -- including ``javascript:`` -- is rendered as escaped
+    text, never as a link.
+    """
+    return text.lower().startswith(("http://", "https://"))
 
 
 def _markdown_link(url: str, label: str) -> str:
@@ -187,11 +208,14 @@ class RunInfo:
     # True when the snapshot file itself was refreshed this run, so a
     # snapshot-only PR does not misleadingly report "No changes."
     snapshot_changed: bool = False
+    # The baseline file this run actually used. Reported verbatim: --snapshot
+    # can point anywhere, so a hardcoded path would lie in the PR.
+    snapshot_path: Path = Path(DEFAULT_SNAPSHOT)
 
 
-def render_report(info: RunInfo) -> str:
-    """Render the PR body / job summary as Markdown."""
-    source_note = f"{info.source_total} entries"
+def _summary_lines(info: RunInfo) -> list[str]:
+    """Header and bullet list: what was compared, and the snapshot diff."""
+    source_note = f"{info.source_total} {plural(info.source_total, 'entry', 'entries')}"
     if info.source_skipped:
         source_note += f", {info.source_skipped} unusable"
 
@@ -205,19 +229,23 @@ def render_report(info: RunInfo) -> str:
     ]
     if info.dry_run:
         lines.append("- Mode: **dry run** (no files written)")
+
     if info.previous_source_total is not None:
         current_total = info.previous_source_total + info.added_to_source - info.removed_from_source
         net = info.added_to_source - info.removed_from_source
+        removed = info.removed_from_source
+        previous_total = info.previous_source_total
         lines.append(
-            f"- Previous snapshot: {info.previous_source_total} entries; "
-            f"{info.removed_from_source} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} "
-            "removed upstream since then (only those are demotion candidates)"
+            f"- Previous snapshot: {previous_total} {plural(previous_total, 'entry', 'entries')}; "
+            f"{removed} {plural(removed, 'SteamID', 'SteamIDs')} removed upstream since then "
+            "(the only IDs that may be demoted)"
         )
         lines.append(
             f"- Snapshot diff: **{info.added_to_source} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
-            f"**{info.removed_from_source} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} removed** "
-            f"({info.previous_source_total} → {current_total} entries; net {net:+d})"
+            f"**{removed} {plural(removed, 'SteamID', 'SteamIDs')} removed** "
+            f"({info.previous_source_total} → {current_total} "
+            f"{plural(current_total, 'entry', 'entries')}; net {net:+d})"
         )
     elif info.snapshot_changed:
         # No baseline existed: every current ID is new in the initial snapshot.
@@ -226,15 +254,82 @@ def render_report(info: RunInfo) -> str:
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
             "**0 SteamIDs removed** (no previous snapshot; initial snapshot)"
         )
+
     if info.demotion_note:
         lines.append(f"- Demotion: **{info.demotion_note}**")
     if info.snapshot_changed:
         verb = "would be updated" if info.dry_run else "updated"
-        lines.append(
-            f"- Snapshot: `snapshot/playerlist.vorobey-hackerpolice.json` {verb} "
-            "to an exact copy of the current upstream file"
-        )
+        lines.append(f"- Snapshot: `{info.snapshot_path}` {verb} to an exact copy of the current upstream file")
     lines.append("")
+    return lines
+
+
+def _promotion_section(promotions: Sequence[Change]) -> list[str]:
+    count = len(promotions)
+    lines = [
+        f"**{count} {plural(count, 'entry', 'entries')} promoted to `cheater`.**",
+        "",
+        "| SteamID | Last known name | Before | After | Hackerpolice proof |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    lines += [
+        "| `{steamid}` | {name} | {before} | {after} | {evidence} |".format(
+            steamid=change.steamid,
+            name=_name_cell(change),
+            before=", ".join(f"`{attribute}`" for attribute in change.before),
+            after=", ".join(f"`{attribute}`" for attribute in change.after),
+            evidence=_evidence_cell(change.evidence),
+        )
+        for change in promotions
+    ]
+    lines.append("")
+    return lines
+
+
+def _demotion_section(demotions: Sequence[Change]) -> list[str]:
+    count = len(demotions)
+    lines = [
+        f"**{count} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
+        "removed from the hackerpolice list since).**",
+        "",
+        "| SteamID | Last known name | Before | After |",
+        "| --- | --- | --- | --- |",
+    ]
+    lines += [
+        "| `{steamid}` | {name} | {before} | {after} |".format(
+            steamid=change.steamid,
+            name=_name_cell(change),
+            before=", ".join(f"`{attribute}`" for attribute in change.before),
+            after=", ".join(f"`{attribute}`" for attribute in change.after) or "entry removed",
+        )
+        for change in demotions
+    ]
+    lines.append("")
+    return lines
+
+
+def _footnotes(info: RunInfo, promotions: Sequence[Change]) -> list[str]:
+    """Closing sentence plus the notes that explain where the data came from."""
+    lines = [render_closing(info.changes)]
+    total_links = sum(len(change.evidence) for change in promotions)
+    if total_links == 1:
+        lines += ["Proof link comes from the Vorobey hackerpolice list and is shown for review only.", ""]
+    elif total_links > 1:
+        lines += ["Proof links come from the Vorobey hackerpolice list and are shown for review only.", ""]
+    else:
+        lines.append("")
+    if info.include_proof:
+        lines += [
+            "**Note:** `--include-proof` was enabled, so an `[auto]` proof line citing the",
+            "hackerpolice list was also written into each entry above.",
+            "",
+        ]
+    return lines
+
+
+def render_report(info: RunInfo) -> str:
+    """Render the PR body / job summary as Markdown."""
+    lines = _summary_lines(info)
 
     promotions = [c for c in info.changes if c.kind == "promote"]
     demotions = [c for c in info.changes if c.kind == "demote"]
@@ -251,65 +346,17 @@ def render_report(info: RunInfo) -> str:
         return _safe("\n".join(lines))
 
     if promotions:
-        count = len(promotions)
-        lines += [
-            f"**{count} {plural(count, 'entry', 'entries')} promoted to `cheater`.**",
-            "",
-            "| SteamID | Last known name | Before | After | Hackerpolice proof |",
-            "| --- | --- | --- | --- | --- |",
-        ]
-        lines += [
-            "| `{steamid}` | {name} | {before} | {after} | {evidence} |".format(
-                steamid=change.steamid,
-                name=_name_cell(change),
-                before=", ".join(f"`{attribute}`" for attribute in change.before),
-                after=", ".join(f"`{attribute}`" for attribute in change.after),
-                evidence=_evidence_cell(change.evidence),
-            )
-            for change in promotions
-        ]
-        lines.append("")
-
+        lines += _promotion_section(promotions)
     if demotions:
-        count = len(demotions)
-        lines += [
-            f"**{count} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
-            "removed from the hackerpolice list since).**",
-            "",
-            "| SteamID | Last known name | Before | After |",
-            "| --- | --- | --- | --- |",
-        ]
-        lines += [
-            "| `{steamid}` | {name} | {before} | {after} |".format(
-                steamid=change.steamid,
-                name=_name_cell(change),
-                before=", ".join(f"`{attribute}`" for attribute in change.before),
-                after=", ".join(f"`{attribute}`" for attribute in change.after) or "entry removed",
-            )
-            for change in demotions
-        ]
-        lines.append("")
+        lines += _demotion_section(demotions)
 
-    closing = render_closing(info.changes)
-
+    # Removed-upstream IDs come last, right before the closing sentence: they
+    # describe the Vorobey list rather than this database's changes.
+    footnotes = _footnotes(info, promotions)
     if removed_lines:
-        lines += removed_lines  # the last change table already ended with a blank line
-        lines.append(closing)
+        # removed_lines ends with a blank line, so no extra separator is needed.
+        lines += removed_lines
+        lines += footnotes
     else:
-        lines += ["", closing]
-    if promotions:
-        total_links = sum(len(change.evidence) for change in promotions)
-        if total_links == 1:
-            lines.append("Proof link comes from the Vorobey hackerpolice list and is shown for review only.")
-        else:
-            lines.append("Proof links come from the Vorobey hackerpolice list and are shown for review only.")
-        lines.append("")
-    else:
-        lines.append("")
-    if info.include_proof:
-        lines += [
-            "**Note:** `--include-proof` was enabled, so an `[auto]` proof line citing the",
-            "hackerpolice list was also written into each entry above.",
-            "",
-        ]
+        lines += ["", *footnotes]
     return _safe("\n".join(lines))

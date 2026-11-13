@@ -6,7 +6,9 @@ line-length = 120
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "PIE", "RUF"]
+# "S" is flake8-bandit (security), "PERF" is flake8-perf: both are cheap
+# regression nets for a tool that fetches untrusted JSON and writes files.
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "PIE", "RUF", "S", "PERF"]
 ignore = [
     "RUF001", # ambiguous unicode in strings (the report uses arrows on purpose)
     "RUF002",
@@ -14,7 +16,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["E501"]
+# Tests use long lines, deliberately non-cryptographic RNG for deterministic
+# fixtures, unittest asserts, and subprocess to drive the CLI/git.
+"tests/*" = ["E501", "S101", "S311", "S603", "S607"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["playerlist", "sources", "policy", "report", "sync_vorobey_hackerpolice"]

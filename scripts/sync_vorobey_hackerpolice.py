@@ -38,12 +38,16 @@ import stat
 import sys
 import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from playerlist import PlayerList, PlayerListError, ValidationResult, dumps, load, validate
 from policy import Change, sync
 from report import RunInfo, plural, render_report
 from sources import (
+    # Re-exported here: sources.py owns the snapshot, so the CLI default and
+    # the path named in the report cannot drift apart.
+    DEFAULT_SNAPSHOT,
     DEFAULT_SOURCES,
     VERSION,
     HackerpoliceIndex,
@@ -61,7 +65,6 @@ __all__ = ["DEFAULT_SNAPSHOT", "build_parser", "load_database", "main", "run", "
 LOGGER = logging.getLogger("sync_vorobey_hackerpolice")
 
 DEFAULT_DATABASE = "playerlist.garou3299.json"
-DEFAULT_SNAPSHOT = "snapshot/playerlist.vorobey-hackerpolice.json"
 
 # Mass-demotion guard: if upstream suddenly "removes" more than this share
 # (and more than this many IDs), something upstream broke or was renamed --
@@ -127,12 +130,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _write_github_outputs(**outputs: str | int | bool) -> None:
-    """Expose step outputs when running inside GitHub Actions."""
+    """Expose step outputs when running inside GitHub Actions.
+
+    Every value written here is a count or a flag this run computed, so the
+    ``KEY=value`` form is safe; ``str`` normalises bools to ``true``/``false``.
+    """
     path = os.environ.get("GITHUB_OUTPUT")
     if not path:
         return
     lines = [f"{key}={str(value).lower() if isinstance(value, bool) else value}" for key, value in outputs.items()]
-    with open(path, "a", encoding="utf-8") as handle:
+    with Path(path).open("a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
 
 
@@ -189,9 +196,13 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())  # content durable BEFORE it becomes visible
-        # mkstemp forces 0600 permissions; keep the file's usual mode:
-        # the replaced file's own permissions, or a plain 0644 for new ones.
-        tmp.chmod(stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644)
+        # mkstemp forces 0600 permissions; keep the file's usual mode: the
+        # replaced file's own permissions, or a plain 0644 for new ones.
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            mode = 0o644
+        tmp.chmod(mode)
         tmp.replace(path)
         _fsync_directory(path.parent)  # make the rename itself durable
     except OSError:
@@ -199,9 +210,12 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def write_database(path: Path, database: PlayerList, original: str, *, dry_run: bool) -> bool:
-    """Write the playerlist if it changed; returns whether it changed."""
-    rendered = dumps(database)
+def write_database(path: Path, rendered: str, original: str, *, dry_run: bool) -> bool:
+    """Write the already-rendered playerlist if it changed; returns whether it changed.
+
+    ``rendered`` is passed in rather than computed here so a run serialises
+    the (possibly large) playerlist exactly once.
+    """
     modified = rendered != original
     if modified and not dry_run:
         _atomic_write_bytes(path, rendered.encode("utf-8"))
@@ -233,109 +247,200 @@ def _log_outcome(modified: bool, changes: list[Change], path: Path, *, dry_run: 
 
 
 def _same_file(first: Path, second: Path) -> bool:
-    """True if two paths name the same file (via symlink, hardlink, or ``..``)."""
-    if first.resolve() == second.resolve():
-        return True
+    """True if two paths name the same file (via symlink, hardlink, or ``..``).
+
+    Never raises: a path that cannot be resolved (a symlink loop, a
+    permission problem, an exotic filesystem) is compared textually instead
+    of crashing the run with a traceback.
+    """
+    try:
+        if first.resolve() == second.resolve():
+            return True
+    except (OSError, RuntimeError):  # RuntimeError: symlink loop
+        return os.path.abspath(first) == os.path.abspath(second)
     try:
         return first.exists() and second.exists() and os.path.samefile(first, second)
     except OSError:
         return False
 
 
-def run(args: argparse.Namespace) -> int:
-    """Do the work; returns the process exit code."""
+def _local_sources(sources: Sequence[str]) -> list[Path]:
+    """The sources that are local files (as opposed to HTTP(S) URLs)."""
+    return [Path(source) for source in sources if not source.startswith(("http://", "https://"))]
+
+
+def _check_input_paths(args: argparse.Namespace) -> None:
+    """Refuse path combinations that would corrupt an input file.
+
+    The report is written BEFORE the database/snapshot, so a report path
+    aliasing one of them would destroy it: when nothing else changes,
+    nothing would ever rewrite the real content back (and a dry run would
+    corrupt the database while claiming to write nothing). A local --source
+    aliasing the database or the snapshot is just as wrong: the run would
+    "sync" our own file against itself and then overwrite the snapshot with
+    it, silently making demotion impossible.
+    """
     database_path = Path(args.database)
     snapshot_path = Path(args.snapshot)
     if _same_file(snapshot_path, database_path):
         raise SyncError("--snapshot and --database must be different files")
-    if args.report:
-        # The report is written BEFORE the database/snapshot, so a report
-        # path aliasing one of them would destroy it: when nothing else
-        # changes, nothing would ever rewrite the real content back (and a
-        # dry run would corrupt the database while claiming to write
-        # nothing). Refuse aliased paths outright.
-        report_path = Path(args.report)
-        protected = [database_path, snapshot_path]
-        protected += [Path(source) for source in args.source or [] if not source.startswith(("http://", "https://"))]
-        if any(_same_file(report_path, path) for path in protected):
-            raise SyncError("--report must not be the same file as --database, --snapshot, or a local --source")
-    database, original = load_database(database_path)
 
-    source_document, source, source_bytes = load_first_available_raw(args.source or DEFAULT_SOURCES)
-    index = HackerpoliceIndex.build(source_document)
+    local_sources = _local_sources(args.source or ())
+    for source in local_sources:
+        if _same_file(source, database_path):
+            raise SyncError(f"--source {source} must not be the same file as --database")
+        if _same_file(source, snapshot_path):
+            raise SyncError(f"--source {source} must not be the same file as --snapshot")
+
+    if not args.report:
+        return
+    report_path = Path(args.report)
+    protected = [database_path, snapshot_path, *local_sources]
+    if any(_same_file(report_path, path) for path in protected):
+        raise SyncError("--report must not be the same file as --database, --snapshot, or a local --source")
+
+
+def _load_upstream(sources: Sequence[str]) -> tuple[HackerpoliceIndex, str, bytes]:
+    """Fetch the first usable upstream list and index it.
+
+    An empty/unusable upstream list is a broken fetch, not a mass unban:
+    never promote, demote, or overwrite the snapshot from it.
+    """
+    document, source, raw = load_first_available_raw(sources)
+    index = HackerpoliceIndex.build(document)
     LOGGER.info("Indexed %d Vorobey hackerpolice SteamIDs (%d unusable).", len(index.by_steamid), index.skipped)
     if not index.by_steamid:
-        # An empty/unusable upstream list is a broken fetch, not a mass
-        # unban: never promote, demote, or overwrite the snapshot from it.
         raise SyncError("the Vorobey hackerpolice list contains no usable SteamIDs, nothing was written")
+    return index, source, raw
 
-    # --- Demotion baseline: previous snapshot vs. current list --------------
+
+@dataclass(frozen=True)
+class _SnapshotDiff:
+    """How the current upstream list differs from the previous snapshot."""
+
+    previous_total: int | None
+    added: int
+    # Every SteamID the current list no longer contains. Reported in the PR
+    # as a table (with profile links) whether or not --demote is used: it
+    # describes the upstream list, not what this database did, and the
+    # Vorobey list stores no names.
+    removed: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _DemotionPlan:
+    """Which SteamIDs may be demoted, whether the snapshot advances, and why not."""
+
+    candidates: frozenset[str]
+    note: str | None
+    advance_snapshot: bool
+
+
+def _snapshot_diff(previous: HackerpoliceIndex | None, current: HackerpoliceIndex) -> _SnapshotDiff:
+    """Compare the previous snapshot against the current upstream list."""
+    if previous is None:
+        # No baseline yet: every current ID is new in the initial snapshot.
+        return _SnapshotDiff(previous_total=None, added=len(current.by_steamid), removed=frozenset())
+    removed = frozenset(removed_steamids(previous, current))
+    diff = _SnapshotDiff(
+        previous_total=len(previous.by_steamid),
+        added=len(added_steamids(previous, current)),
+        removed=removed,
+    )
+    LOGGER.info(
+        "Snapshot diff vs. previous snapshot: %d %s added, %d removed (%d -> %d entries).",
+        diff.added,
+        plural(diff.added, "SteamID", "SteamIDs"),
+        len(removed),
+        diff.previous_total,
+        len(current.by_steamid),
+    )
+    return diff
+
+
+def _plan_demotion(
+    args: argparse.Namespace,
+    diff: _SnapshotDiff,
+    *,
+    snapshot_path: Path,
+) -> _DemotionPlan:
+    """Decide what demotion may touch, refusing implausibly large removals.
+
+    The mass-demotion guard treats "most of the list vanished at once" as an
+    upstream problem (renamed file, truncated fetch) rather than as real
+    removals, so a broken upstream run cannot strip the database.
+    """
+    advance = not args.no_update_snapshot
+    if not args.demote:
+        return _DemotionPlan(candidates=frozenset(), note=None, advance_snapshot=advance)
+
+    if diff.previous_total is None:
+        note = f"skipped - no snapshot at {snapshot_path} yet, so no removal can be proven"
+        LOGGER.warning("Demotion %s.", note)
+        return _DemotionPlan(candidates=frozenset(), note=note, advance_snapshot=advance)
+
+    removed = diff.removed
+    if (
+        not args.allow_mass_demotion
+        and len(removed) > MASS_DEMOTION_MIN_IDS
+        and len(removed) > MASS_DEMOTION_MAX_FRACTION * diff.previous_total
+    ):
+        note = (
+            f"skipped - {len(removed)} of {diff.previous_total} snapshot entries "
+            "disappeared upstream at once, which looks like an upstream problem, "
+            "not real removals (re-run with --allow-mass-demotion to force)"
+        )
+        LOGGER.warning("Demotion %s.", note)
+        # The snapshot must NOT advance past removals we refused to apply,
+        # or they could never be demoted later.
+        return _DemotionPlan(candidates=frozenset(), note=note, advance_snapshot=False)
+
+    return _DemotionPlan(candidates=removed, note=None, advance_snapshot=advance)
+
+
+def _emit_report(path: str | None, report: str) -> None:
+    """Print the report and, when asked, write it where the workflow wants it."""
+    if path:
+        try:
+            Path(path).write_text(report + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise SyncError(f"cannot write report {path}: {exc}") from exc
+    print(report)
+
+
+def run(args: argparse.Namespace) -> int:
+    """Do the work; returns the process exit code."""
+    _check_input_paths(args)
+    database_path = Path(args.database)
+    snapshot_path = Path(args.snapshot)
+
+    database, original = load_database(database_path)
+    index, source, source_bytes = _load_upstream(args.source or DEFAULT_SOURCES)
+
     snapshot = load_snapshot(snapshot_path)
     previous_index, previous_bytes = snapshot if snapshot is not None else (None, None)
-    removed: set[str] = set()
-    removed_count = 0
-    # Every SteamID the current list no longer contains, compared to the
-    # previous snapshot. Reported in the PR as a table (with profile links)
-    # whether or not --demote is used: it describes the upstream list, not
-    # what this database did, and the Vorobey list stores no names.
-    removed_from_source: set[str] = set()
-    # Snapshot diff vs. the previous snapshot, independent of --demote: how
-    # many IDs the refreshed snapshot gains/loses. With no snapshot yet,
-    # every current ID counts as newly added (initial snapshot).
-    added_count = len(index.by_steamid)
-    if previous_index is not None:
-        added_count = len(added_steamids(previous_index, index))
-        removed_from_source = removed_steamids(previous_index, index)
-        removed_count = len(removed_from_source)
-        LOGGER.info(
-            "Snapshot diff vs. previous snapshot: %d SteamIDs added, %d removed (%d -> %d entries).",
-            added_count,
-            removed_count,
-            len(previous_index.by_steamid),
-            len(index.by_steamid),
-        )
-    demotion_note: str | None = None
-    # Set to False when demotion was skipped as unsafe: the snapshot must
-    # NOT advance then, or the skipped removals would be lost forever.
-    update_snapshot = not args.no_update_snapshot
-    if args.demote:
-        if previous_index is None:
-            demotion_note = f"skipped - no snapshot at {snapshot_path} yet, so no removal can be proven"
-            LOGGER.warning("Demotion %s.", demotion_note)
-        else:
-            removed = removed_from_source
-            removed_count = len(removed)
-            LOGGER.info(
-                "%d SteamIDs removed upstream since the snapshot (%d entries).",
-                len(removed),
-                len(previous_index.by_steamid),
-            )
-            if (
-                not args.allow_mass_demotion
-                and len(removed) > MASS_DEMOTION_MIN_IDS
-                and len(removed) > MASS_DEMOTION_MAX_FRACTION * len(previous_index.by_steamid)
-            ):
-                demotion_note = (
-                    f"skipped - {len(removed)} of {len(previous_index.by_steamid)} snapshot entries "
-                    "disappeared upstream at once, which looks like an upstream problem, "
-                    "not real removals (re-run with --allow-mass-demotion to force)"
-                )
-                LOGGER.warning("Demotion %s.", demotion_note)
-                removed = set()
-                update_snapshot = False
+    diff = _snapshot_diff(previous_index, index)
+    plan = _plan_demotion(args, diff, snapshot_path=snapshot_path)
 
-    changes = sync(database, index, include_proof=args.include_proof, enable_demote=args.demote, removed_ids=removed)
+    changes = sync(
+        database,
+        index,
+        include_proof=args.include_proof,
+        enable_demote=args.demote,
+        removed_ids=plan.candidates,
+    )
 
     result = validate(database)
     _log_validation(result, "refusing to write an invalid database")
     if result.errors:
         raise SyncError("the synced playerlist is invalid, nothing was written")
 
-    # Decide what WOULD change before touching any file, render and write
-    # the report first, and only then write the database and the snapshot:
-    # if the report cannot be written, nothing else has been modified yet.
-    modified = dumps(database) != original
-    snapshot_changed = update_snapshot and source_bytes != previous_bytes
+    # Decide what WOULD change before touching any file, render and write the
+    # report first, and only then write the database and the snapshot: if the
+    # report cannot be written, nothing else has been modified yet.
+    rendered = dumps(database)
+    modified = rendered != original
+    snapshot_changed = plan.advance_snapshot and source_bytes != previous_bytes
 
     report = render_report(
         RunInfo(
@@ -346,20 +451,16 @@ def run(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             include_proof=args.include_proof,
             changes=tuple(changes),
-            previous_source_total=len(previous_index.by_steamid) if previous_index is not None else None,
-            added_to_source=added_count,
-            removed_from_source=removed_count,
-            removed_upstream=tuple(removed_from_source),
-            demotion_note=demotion_note,
+            previous_source_total=diff.previous_total,
+            added_to_source=diff.added,
+            removed_from_source=len(diff.removed),
+            removed_upstream=tuple(diff.removed),
+            demotion_note=plan.note,
             snapshot_changed=snapshot_changed,
+            snapshot_path=snapshot_path,
         )
     )
-    if args.report:
-        try:
-            Path(args.report).write_text(report + "\n", encoding="utf-8")
-        except OSError as exc:
-            raise SyncError(f"cannot write report {args.report}: {exc}") from exc
-    print(report)
+    _emit_report(args.report, report)
 
     # Write the database, then refresh the snapshot in the SAME working tree
     # (=> same pull request) so the baseline only advances once a human
@@ -367,23 +468,22 @@ def run(args: argparse.Namespace) -> int:
     # run, even if the Garou database itself did not change, so a run whose
     # only change is the snapshot still opens a snapshot-only PR. Exception:
     # when demotion was skipped as unsafe (mass-demotion guard),
-    # update_snapshot is False and the snapshot is left alone so the same
-    # removals are re-evaluated next run.
-    write_database(database_path, database, original, dry_run=args.dry_run)
+    # plan.advance_snapshot is False and the snapshot is left alone so the
+    # same removals are re-evaluated next run.
+    write_database(database_path, rendered, original, dry_run=args.dry_run)
     _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
-    if update_snapshot:
+    if plan.advance_snapshot:
         write_snapshot(snapshot_path, source_bytes, previous_bytes, dry_run=args.dry_run)
         if snapshot_changed:
             LOGGER.info("%s snapshot %s.", "Would update" if args.dry_run else "Updated", snapshot_path)
 
-    changed = (modified or snapshot_changed) and not args.dry_run
     _write_github_outputs(
-        changed=changed,
+        changed=(modified or snapshot_changed) and not args.dry_run,
         count=len(changes),
         modified=modified,
         snapshot_changed=snapshot_changed,
-        snapshot_added=added_count,
-        snapshot_removed=removed_count,
+        snapshot_added=diff.added,
+        snapshot_removed=len(diff.removed),
     )
     return 0
 
@@ -415,14 +515,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(stream=sys.stderr, level=level, format="%(message)s", force=True)
     try:
         return run(args)
-    except SyncError as exc:
+    except (SyncError, OSError) as exc:
+        # A user-facing failure (bad input/unreachable source, or e.g. the
+        # database/snapshot/report path becoming unwritable mid-run): report
+        # it cleanly instead of dumping a traceback. -v still shows the
+        # traceback for debugging.
         LOGGER.error("error: %s", exc)
+        LOGGER.debug("details", exc_info=True)
         return 2
-    except OSError as exc:
-        # e.g. the database/snapshot/report path became unwritable mid-run:
-        # report it cleanly instead of dumping a traceback.
-        LOGGER.error("error: %s", exc)
-        return 2
+    except KeyboardInterrupt:
+        # 130 is the conventional exit status for an interrupted command.
+        LOGGER.error("interrupted")
+        return 130
 
 
 if __name__ == "__main__":

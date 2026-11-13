@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Tests for the Vorobey hackerpolice sync tool (stdlib only).
 
 Modules under test:
@@ -647,11 +646,27 @@ class ReportTests(unittest.TestCase):
         report = render_report(self.info([change]))
         self.assertIn("https://example.invalid/a%20%28b%29", report)
 
+    def test_link_targets_escape_backslashes_and_brackets(self):
+        # The Vorobey list is outside our control: a proof string must not be
+        # able to close the link target early and inject Markdown.
+        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://x/\\[a](b) ",))
+        report = render_report(self.info([change]))
+        self.assertIn("https://x/%5C%5Ba%5D%28b%29%20", report)
+        self.assertNotIn("](b)", report)
+
     def test_dry_run_and_include_proof_notes(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))
         report = render_report(self.info([change], dry_run=True, include_proof=True))
         self.assertIn("**dry run**", report)
         self.assertIn("`--include-proof` was enabled", report)
+
+    def test_report_names_the_snapshot_file_actually_used(self):
+        # Regression: the summary used to print a hardcoded snapshot path, so
+        # a run with --snapshot somewhere else described a file it never
+        # touched.
+        report = render_report(self.info(snapshot_changed=True, snapshot_path=Path("custom/baseline.json")))
+        self.assertIn("- Snapshot: `custom/baseline.json` updated to an exact copy", report)
+        self.assertNotIn("snapshot/playerlist.vorobey-hackerpolice.json` updated", report)
 
     def test_removed_steamids_are_tabulated_with_profile_links(self):
         # The Vorobey list stores no names, so the table only has the SteamID
@@ -901,7 +916,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("**2 SteamIDs removed from the Vorobey list since the previous snapshot.**", report)
         self.assertIn("| `[U:1:300]` | [profile](https://steamcommunity.com/profiles/76561197960266028) |", report)
         self.assertIn("| `[U:1:400]` | [profile](https://steamcommunity.com/profiles/76561197960266128) |", report)
-        self.assertNotIn("demoted", report)
+        self.assertNotIn("demoted (in the previous snapshot", report)  # no demotion table
 
     def test_demote_without_snapshot_demotes_nobody_and_creates_baseline(self):
         self.database.write_text(
@@ -1096,6 +1111,31 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("not valid JSON", stderr)
 
+    def test_source_must_not_be_the_database_or_the_snapshot(self):
+        # Syncing our own files against themselves would overwrite the
+        # snapshot with the database (or vice versa) and silently disable
+        # demotion forever, so it is refused outright.
+        snapshot_fixture = self.write_snapshot_fixture(hackerpolice_entry("[U:1:100]"))
+        for target, expected in (
+            (self.database, "must not be the same file as --database"),
+            (snapshot_fixture, "must not be the same file as --snapshot"),
+        ):
+            code, _, stderr = self.run_cli("--source", str(target))
+            self.assertEqual(code, 2)
+            self.assertIn(expected, stderr)
+        # The database and the snapshot are intact.
+        self.assertIn("[U:1:100]", self.database.read_text(encoding="utf-8"))
+        self.assertEqual(
+            snapshot_fixture.read_text(encoding="utf-8"),
+            dumps(
+                {
+                    "$schema": "x",
+                    "file_info": {},
+                    "players": [hackerpolice_entry("[U:1:100]")],
+                }
+            ),
+        )
+
     def test_report_path_must_not_alias_the_database(self):
         # Regression: the report is written before the database, so an
         # aliased --report destroyed the database (even in dry-run mode).
@@ -1105,6 +1145,32 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("--report must not be the same file", stderr)
             self.assertEqual(self.database.read_text(encoding="utf-8"), original)
+
+    def test_report_names_the_snapshot_path_the_run_used(self):
+        self.write_snapshot_fixture(hackerpolice_entry("[U:1:100]"))
+        report_file = self.root / "r.md"
+        code, _, _ = self.run_cli("--source", str(self.source), "--report", str(report_file))
+        self.assertEqual(code, 0)
+        report = report_file.read_text(encoding="utf-8")
+        self.assertIn(f"- Snapshot: `{self.root / 'snapshot.json'}` updated to an exact copy", report)
+
+    def test_symlink_loops_are_clean_errors_not_crashes(self):
+        # Path.resolve() raises RuntimeError on a symlink loop: every path
+        # comparison must survive that instead of crashing with a traceback.
+        loop = self.root / "loop"
+        try:
+            loop.symlink_to(loop)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available here")
+        # The report is unwritable -> clean "cannot write report", no traceback.
+        code, _, stderr = self.run_cli("--source", str(self.source), "--report", str(loop))
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write report", stderr)
+        self.assertNotIn("Traceback", stderr)
+        # ... and an unreadable --source is just a source failure.
+        code, _, stderr = self.run_cli("--source", str(loop))
+        self.assertEqual(code, 2)
+        self.assertNotIn("Traceback", stderr)
 
     def test_report_path_must_not_alias_the_snapshot_or_a_local_source(self):
         snapshot_fixture = self.write_snapshot_fixture(hackerpolice_entry("[U:1:100]"))
@@ -1266,6 +1332,12 @@ class NormalizeSteamIdTests(unittest.TestCase):
             self.assertIsNone(normalize_steamid(value), value[:20])
         # Leading zeros do not count towards the limit.
         self.assertEqual(normalize_steamid("0" * 5000 + "1730017"), "[U:1:1730017]")
+
+    def test_non_ascii_digits_are_not_steamids(self):
+        # "١٢٣" is Arabic-Indic for 123 and int() parses it: it used to be
+        # silently accepted as [U:1:123]. Only ASCII digits are SteamIDs.
+        for value in ("١٢٣", "[U:1:١٢٣]", "U:1:١٢٣", "١٢٣٤٥٦٧٨٩٠١٢٣٤٥٦٧٨"):
+            self.assertIsNone(normalize_steamid(value), value)
 
     def test_rejects_garbage(self):
         for value in (
