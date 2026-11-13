@@ -72,6 +72,7 @@ __all__ = [
     "HackerpoliceIndex",
     "SyncError",
     "added_steamids",
+    "is_url",
     "load_first_available_raw",
     "load_snapshot",
     "removed_steamids",
@@ -126,8 +127,10 @@ def _parse_document(raw: bytes, source: str) -> dict[str, Any]:
     """Parse raw bytes as a playerlist document, raising SyncError."""
     try:
         document = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValueError) as exc:
-        # ValueError: e.g. a JSON number beyond Python's int-parsing limit.
+    except (ValueError, RecursionError) as exc:
+        # ValueError covers JSONDecodeError, a bad UTF-8 byte sequence and a
+        # number beyond Python's int-parsing limit; RecursionError covers
+        # pathologically nested input.
         raise SyncError(f"{source} is not valid JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise SyncError(f"{source} does not contain a JSON object")
@@ -229,9 +232,18 @@ def _read_local_bytes(path: Path) -> bytes:
         raise SyncError(f"cannot read {path}: {exc}") from exc
 
 
+def is_url(source: str) -> bool:
+    """True for an ``http(s)`` URL, False for a local path.
+
+    The scheme is case-insensitive (``HTTPS://…`` is a URL, not a filename),
+    and the ``://`` keeps a path like ``httpdocs/list.json`` a path.
+    """
+    return source.lower().startswith(("http://", "https://"))
+
+
 def _read_bytes(source: str) -> bytes:
     """Return the raw bytes of an HTTP(S) URL or a local path, raising SyncError."""
-    if source.startswith(("http://", "https://")):
+    if is_url(source):
         return _fetch_bytes(source)
     LOGGER.debug("Reading local file %s", source)
     return _read_local_bytes(Path(source))

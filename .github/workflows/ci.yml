@@ -5,7 +5,10 @@ name: Checks
 # schedule (or manually), so without this nothing would validate a pull
 # request before it is merged.
 # The sync workflow runs the same three checks inline before it is allowed to
-# open its own pull request, so bot-generated changes are covered too.
+# open its own pull request, so bot-generated changes are covered too -- which
+# also covers the case where this workflow does not run at all: pull requests
+# opened with the repository's GITHUB_TOKEN do not trigger further runs
+# (a personal access token in BOT_TOKEN does trigger them).
 
 on:
   pull_request:

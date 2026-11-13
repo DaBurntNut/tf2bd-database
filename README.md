@@ -44,6 +44,7 @@ pull request is merged.**
 | --- | --- |
 | `cheater` | entry removed from the database |
 | `cheater` + `racist` | `racist` (`cheater` and its proofs are removed, the racist proofs stay) |
+| `cheater` + anything else | the other tags stay (`cheater` and the proofs that came with it are removed) |
 
 Players who were added to this database and were never on
 Vorobey's list are **never** demoted or removed by the bot.
@@ -76,7 +77,7 @@ writes a file it could not read back.
 
 | Guard | What it prevents |
 | --- | --- |
-| Snapshot-based demotion | Only a SteamID that was in the previous snapshot **and** is gone from the current list may be demoted. Cheaters added by hand are never touched. |
+| Snapshot-based demotion | Only a SteamID that was in the previous snapshot **and** is gone from the current list may be demoted, and only its `cheater` tag is removed: any other tag the entry carries survives, and the entry itself is deleted only when nothing is left. Cheaters added by hand are never touched. |
 | Mass-demotion guard | If more than 50 IDs **and** more than 20% of the snapshot vanish at once, demotion is skipped and the snapshot is left alone, because that looks like an upstream problem (renamed file, truncated fetch). `--allow-mass-demotion` overrides it. |
 | Empty upstream list | A list without a single usable SteamID is a failed fetch: nothing is promoted, demoted, or snapshotted. |
 | Snapshot advances last | The baseline is only refreshed after the changes derived from it were applied, so a refused demotion is re-evaluated on the next run instead of being lost. |
@@ -108,7 +109,9 @@ mypy scripts                               # type-check
 
 CI (`.github/workflows/ci.yml`) runs them for every pull request and for
 pushes to `master`, on Python 3.10 (the minimum) and 3.12 (what the bot runs).
-The sync workflow repeats them inline, so the bot never commits untested code.
+The sync workflow repeats them inline, so the bot never commits untested code —
+which matters because a pull request opened with `GITHUB_TOKEN` does not
+trigger other workflows.
 
 ### Running the bot from a fork
 

@@ -1,8 +1,9 @@
 """Sync policy: promote and demote entries against the hackerpolice list.
 
 Promotion: entries matching the Vorobey hackerpolice list gain ``cheater``.
-Demotion (opt-in via ``--demote``): entries carrying ``cheater`` lose it, or
-are removed entirely -- but ONLY for SteamIDs explicitly handed to
+Demotion (opt-in via ``--demote``): entries carrying ``cheater`` lose that tag
+(and are removed entirely only when nothing else is left) -- but ONLY for
+SteamIDs explicitly handed to
 :func:`demote` as "removed upstream" (present in the previous hackerpolice
 snapshot, gone from the current one). A SteamID that was never on the
 hackerpolice list is never demoted: most ``cheater`` entries in this
@@ -216,17 +217,21 @@ def _demote_player(player: Player, removed: frozenset[str]) -> tuple[Player | No
         return player, None  # not a cheater - nothing to demote
 
     name = player_name(player)
-    if "racist" not in before:
-        # cheater without racist: the whole entry goes, along with its proofs
+
+    # Demotion only ever removes the cheater tag. Anything else the entry
+    # says about this player -- racist, exploiter, an attribute this tool does
+    # not know -- was never Vorobey's business and survives.
+    after = tuple(order_attributes({*before} - {PROMOTED_TO}))
+    if not after:
+        # Nothing else was true about this player: the entry existed only
+        # because Vorobey listed them, so it goes together with its proofs.
         return None, Change(steamid=canonical, name=name, before=before, after=(), kind="demote")
 
-    # cheater + racist: remove only cheater, keep racist
-    after = tuple(order_attributes({*before} - {PROMOTED_TO}))
     player["attributes"] = list(after)
 
     # Drop every proof except the "[auto] ... Racist" lines: the cheater tag
     # was a false positive, so its evidence must not stay behind pretending
-    # to justify the remaining racist tag.
+    # to justify a tag it never supported.
     if "proof" in player:
         player["proof"] = _filter_racist_proofs(player.get("proof"))
 
@@ -241,8 +246,9 @@ def demote(database: PlayerList, removed_ids: Collection[str]) -> list[Change]:
     cheater missing from the current list", which would also delete cheaters
     this database added manually and that Vorobey never listed.
 
-    * ``cheater`` + ``racist``       -> only ``cheater`` is removed (``racist`` kept)
-    * ``cheater`` alone (or with any other attribute but ``racist``) -> whole entry removed
+    * ``cheater`` alone                      -> the whole entry is removed
+    * ``cheater`` + any other attribute      -> only ``cheater`` is removed, the
+      (``racist``, ``exploiter``, ...)         entry keeps the other attribute(s)
 
     Entries whose SteamID is not in ``removed_ids``, or without ``cheater``,
     are untouched.

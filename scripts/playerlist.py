@@ -233,9 +233,9 @@ def load(path: Path, *, encoding: str = "utf-8-sig") -> tuple[PlayerList, str]:
         raise PlayerListError(f"cannot read {path}: {exc}") from exc
     try:
         database = json.loads(original)
-    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
-        # ValueError: e.g. a JSON number with more digits than Python's
-        # int-parsing limit -- invalid input, not a crash.
+    except (ValueError, RecursionError) as exc:
+        # ValueError covers a JSON syntax error and a number with more digits
+        # than Python's int-parsing limit -- invalid input, not a crash.
         raise PlayerListError(f"{path} is not valid JSON: {exc}") from exc
     if not isinstance(database, dict):
         raise PlayerListError(f"{path} does not contain a JSON object")

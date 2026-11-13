@@ -13,7 +13,7 @@ from pathlib import Path
 
 from playerlist import account_id, steam_profile_url
 from policy import Change
-from sources import DEFAULT_SNAPSHOT, SOURCE_REPO_URL
+from sources import DEFAULT_SNAPSHOT, SOURCE_REPO_URL, is_url
 
 __all__ = [
     "MAX_CLOSING_STEAMIDS",
@@ -116,15 +116,6 @@ def _name_cell(change: Change) -> str:
     return label if url is None else _markdown_link(url, label)
 
 
-def _is_url(text: str) -> bool:
-    """True for http(s) URLs, whatever the case of the scheme.
-
-    Anything else -- including ``javascript:`` -- is rendered as escaped
-    text, never as a link.
-    """
-    return text.lower().startswith(("http://", "https://"))
-
-
 def _markdown_link(url: str, label: str) -> str:
     """Render a link, escaping the characters that would end the target early."""
     return f"[{label}]({url.translate(_LINK_ESCAPES)})"
@@ -135,7 +126,9 @@ def _evidence_cell(links: Sequence[str]) -> str:
     if not links:
         return "-"
     rendered = [
-        _markdown_link(link, "link" if len(links) == 1 else str(position)) if _is_url(link) else _cell(link)
+        _markdown_link(link, "link" if len(links) == 1 else str(position))
+        if is_url(link)  # anything else (javascript:, ...) stays escaped text
+        else _cell(link)
         for position, link in enumerate(links, start=1)
     ]
     return "<br>".join(rendered)
@@ -417,11 +410,13 @@ def render_report(info: RunInfo) -> str:
 
     # Removed-upstream IDs come last, right before the closing sentence: they
     # describe the Vorobey list rather than this database's changes.
-    footnotes = _footnotes(info, promotions)
     if removed_lines:
-        # removed_lines ends with a blank line, so no extra separator is needed.
         lines += removed_lines
-        lines += footnotes
-    else:
-        lines += ["", *footnotes]
+    # Every section ends with a blank line; keep exactly one before the
+    # closing sentence rather than stacking them.
+    if lines and lines[-1] != "":
+        lines.append("")
+    while len(lines) > 1 and lines[-1] == "" and lines[-2] == "":
+        lines.pop()
+    lines += _footnotes(info, promotions)
     return _safe("\n".join(lines))

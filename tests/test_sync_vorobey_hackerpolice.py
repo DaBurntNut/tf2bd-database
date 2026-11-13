@@ -56,6 +56,7 @@ from sources import (
     HackerpoliceIndex,
     SyncError,
     added_steamids,
+    is_url,
     load_first_available_raw,
     load_snapshot,
     removed_steamids,
@@ -405,6 +406,25 @@ class DemoteTests(unittest.TestCase):
         self.assertEqual(changes[0].before, ("cheater", "racist"))
         self.assertEqual(changes[0].after, ("racist",))
 
+    def test_cheater_and_another_tag_keeps_the_entry(self):
+        """Only the cheater tag is Vorobey's business; delete nothing else.
+
+        Demoting used to delete any entry that was not ``cheater``+``racist``
+        outright, silently dropping an ``exploiter`` / ``suspicious`` tag (and
+        the player) that the hackerpolice list had nothing to do with.
+        """
+        database, changes = self.demote(
+            [player("[U:1:200]", ["cheater", "exploiter"], proof=["https://video.test/exploit"])]
+        )
+        self.assertEqual(database["players"][0]["attributes"], ["exploiter"])
+        self.assertEqual(database["players"][0]["proof"], [])  # the cheater evidence went with it
+        self.assertEqual(changes[0].after, ("exploiter",))
+
+    def test_cheater_and_an_unknown_tag_keeps_the_entry(self):
+        database, changes = self.demote([player("[U:1:200]", ["cheater", "scammer"])])
+        self.assertEqual(database["players"][0]["attributes"], ["scammer"])
+        self.assertEqual(changes[0].after, ("scammer",))
+
     def test_cheater_and_racist_drops_cheater_proof_keeps_racist_proof(self):
         database, _ = self.demote(
             [
@@ -475,12 +495,6 @@ class DemoteTests(unittest.TestCase):
         self.assertEqual(changes[0].kind, "demote")
         self.assertEqual(changes[0].before, ("cheater",))
         self.assertEqual(changes[0].after, ())
-
-    def test_cheater_and_exploiter_removes_whole_entry(self):
-        database, changes = self.demote([player("[U:1:200]", ["cheater", "exploiter"])])
-        self.assertEqual(database["players"], [])
-        self.assertEqual(len(changes), 1)
-        self.assertEqual(changes[0].kind, "demote")
 
     def test_still_on_hackerpolice_list_is_untouched(self):
         database, changes = self.demote([player("[U:1:100]", ["cheater", "racist"])])
@@ -556,14 +570,14 @@ class PolicyFuzzTests(unittest.TestCase):
             self.assertFalse(validate(database).errors)
             for steamid, before in original.items():
                 demoted = steamid in removed and "cheater" in before["attributes"]
-                if demoted and "racist" not in before["attributes"]:
+                remaining = set(before["attributes"]) - {"cheater"}
+                if demoted and not remaining:
                     self.assertNotIn(steamid, after)  # cheater-only: entry gone
                     continue
                 self.assertIn(steamid, after)  # nothing else may ever vanish
                 got = after[steamid]
-                if demoted:  # cheater+racist: racist kept, only auto-racist proofs survive
-                    self.assertNotIn("cheater", got["attributes"])
-                    self.assertIn("racist", got["attributes"])
+                if demoted:  # only the cheater tag goes, proofs with it
+                    self.assertEqual(set(got["attributes"]), remaining)
                     for proof in got.get("proof", []):
                         self.assertTrue(proof.startswith("[auto] automatically marked: Racist | reason:"))
                 elif (
@@ -591,6 +605,21 @@ class ReportTests(unittest.TestCase):
             changes=tuple(changes),
             **{"dry_run": False, **kwargs},
         )
+
+    def test_a_demoted_entry_that_keeps_another_tag_is_not_shown_as_removed(self):
+        """Demotion only removes the cheater tag: the row must say so."""
+        change = Change("[U:1:100]", "a", ("cheater", "exploiter"), ("exploiter",), kind="demote")
+        report = render_report(self.info([change]))
+        self.assertIn("| `[U:1:100]` | [a](https://steamcommunity.com/profiles/76561197960265828)", report)
+        self.assertIn("`cheater`, `exploiter` | `exploiter` |", report)
+        self.assertNotIn("entry removed", report)
+        self.assertIn("Attribute is changed for this SteamID: [U:1:100]", report)
+
+    def test_an_entry_that_loses_its_last_tag_is_shown_as_removed(self):
+        change = Change("[U:1:100]", "a", ("cheater",), (), kind="demote")
+        report = render_report(self.info([change]))
+        self.assertIn("| `cheater` | entry removed |", report)
+        self.assertIn("Entry is removed from the database for this SteamID: [U:1:100]", report)
 
     def test_no_changes_message(self):
         report = render_report(self.info())
@@ -1000,6 +1029,32 @@ class CliTests(unittest.TestCase):
         code, stdout, _ = self.run_cli("--source", str(self.source))
         self.assertEqual(code, 0)
         self.assertIn("No changes", stdout)
+
+    def test_demote_keeps_an_entry_that_still_has_another_tag(self):
+        """End-to-end: only the cheater tag goes, the player stays listed."""
+        self.database.write_text(
+            dumps(
+                {
+                    "$schema": "x",
+                    "file_info": {},
+                    "players": [
+                        player("[U:1:300]", ["cheater", "exploiter"], proof=["https://video.test/1"]),
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        snapshot = self.write_snapshot_fixture(hackerpolice_entry("[U:1:300]"))
+        report_path = self.root / "r.md"
+        code, _, _ = self.run_cli(
+            "--source", str(self.source), "--snapshot", str(snapshot), "--demote", "--report", str(report_path)
+        )
+        self.assertEqual(code, 0)
+        players = json.loads(self.database.read_text(encoding="utf-8"))["players"]
+        self.assertEqual([p["attributes"] for p in players], [["exploiter"]])
+        report = report_path.read_text(encoding="utf-8")
+        self.assertIn("`cheater`, `exploiter` | `exploiter` |", report)
+        self.assertNotIn("entry removed", report)
 
     def test_demote_only_ids_removed_from_snapshot(self):
         """End-to-end regression test for the reported bug.
@@ -1604,6 +1659,18 @@ class NormalizeSteamIdTests(unittest.TestCase):
         self.assertEqual(steam_profile_url("STEAM_0:1:865008"), "https://steamcommunity.com/profiles/76561197961995745")
         self.assertIsNone(steam_profile_url("nope"))
         self.assertIsNone(steam_profile_url(None))
+
+
+class IsUrlTests(unittest.TestCase):
+    """One predicate (sources.is_url) decides URL-vs-path everywhere."""
+
+    def test_http_and_https_are_urls_whatever_the_case(self):
+        for url in ("http://x/y", "https://x/y", "HTTPS://raw.githubusercontent.com/a/b"):
+            self.assertTrue(is_url(url), url)
+
+    def test_paths_are_not_urls(self):
+        for path in ("playerlist.json", "/opt/db/x.json", "snapshot/x.json", "httpdocs/x.json", "", "ftp://x/y"):
+            self.assertFalse(is_url(path), path)
 
 
 class PluralTests(unittest.TestCase):

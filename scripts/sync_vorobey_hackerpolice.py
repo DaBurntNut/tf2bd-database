@@ -2,7 +2,10 @@
 """Sync a TF2BD playerlist against the Vorobey hackerpolice cheater list.
 
 Promotes matching entries (suspicious/racist -> cheater) and, with
-``--demote``, removes cheater from entries that DISAPPEARED upstream.
+``--demote``, removes cheater from entries that DISAPPEARED upstream. An
+entry is only deleted when the cheater tag was the last thing it had to say
+about the player; any other attribute it carries (racist, exploiter, ...)
+survives the demotion.
 
 Demotion is snapshot-based, never "absent from the current list": an ID is
 only demoted if it is in the previous snapshot (``--snapshot``, default
@@ -25,7 +28,8 @@ Usage:
     python3 scripts/sync_vorobey_hackerpolice.py --report out.md
     python3 scripts/sync_vorobey_hackerpolice.py --demote --report out.md
 
-Exit codes: 0 = success, 2 = unusable database or Vorobey hackerpolice list.
+Exit codes: 0 = success, 2 = a user-facing failure (unusable database,
+snapshot or list, conflicting paths, an unwritable report), 130 = interrupted.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ from sources import (
     HackerpoliceIndex,
     SyncError,
     added_steamids,
+    is_url,
     load_first_available_raw,
     load_snapshot,
     removed_steamids,
@@ -101,8 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--demote",
         action="store_true",
-        help="remove cheater (or the whole entry) ONLY for SteamIDs that were in the previous snapshot "
-        "but are gone from the current hackerpolice list (off by default)",
+        help="remove cheater ONLY for SteamIDs that were in the previous snapshot but are gone from the "
+        "current hackerpolice list (the entry is deleted only when no other attribute is left; off by default)",
     )
     parser.add_argument(
         "--snapshot",
@@ -267,7 +272,7 @@ def _same_file(first: Path, second: Path) -> bool:
 
 def _local_sources(sources: Sequence[str]) -> list[Path]:
     """The sources that are local files (as opposed to HTTP(S) URLs)."""
-    return [Path(source) for source in sources if not source.startswith(("http://", "https://"))]
+    return [Path(source) for source in sources if not is_url(source)]
 
 
 def _check_input_paths(args: argparse.Namespace) -> None:
@@ -458,7 +463,6 @@ def run(args: argparse.Namespace) -> int:
     # report first, and only then write the database and the snapshot: if the
     # report cannot be written, nothing else has been modified yet.
     rendered = dumps(database)
-    modified = rendered != original
     snapshot_changed = plan.advance_snapshot and source_bytes != previous_bytes
 
     report = render_report(
@@ -489,7 +493,7 @@ def run(args: argparse.Namespace) -> int:
     # when demotion was skipped as unsafe (mass-demotion guard),
     # plan.advance_snapshot is False and the snapshot is left alone so the
     # same removals are re-evaluated next run.
-    write_database(database_path, rendered, original, dry_run=args.dry_run)
+    modified = write_database(database_path, rendered, original, dry_run=args.dry_run)
     _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
     if plan.advance_snapshot:
         write_snapshot(snapshot_path, source_bytes, previous_bytes, dry_run=args.dry_run)
