@@ -109,3 +109,20 @@ mypy scripts                               # type-check
 CI (`.github/workflows/ci.yml`) runs them for every pull request and for
 pushes to `master`, on Python 3.10 (the minimum) and 3.12 (what the bot runs).
 The sync workflow repeats them inline, so the bot never commits untested code.
+
+### Running the bot from a fork
+
+This checkout is a fork, so changes made here reach the published database
+through a pull request to the upstream repository. Two things follow from
+that and are deliberate:
+
+- Every `update_url` inside the data files points at the **canonical upstream
+  repository**, not at this fork. TF2BD installs poll that URL for updates;
+  rewriting it to a fork would cut every user off from new entries until the
+  change is merged upstream. Leave those files' `file_info` alone.
+- GitHub does not run scheduled workflows in forks. Enable Actions in the
+  fork's *Actions* tab and then either trigger **Sync Vorobey hackerpolice
+  list** by hand (`workflow_dispatch`, with the optional dry-run / mass-demotion
+  inputs) or keep the daily schedule alive — GitHub also disables a schedule
+  after 60 days without repository activity. The pull request, the report and
+  the commit work the same in a fork as upstream.
