@@ -217,6 +217,16 @@ def dumps(database: PlayerList) -> str:
     return json.dumps(database, indent="\t", sort_keys=True, ensure_ascii=True) + "\n"
 
 
+def _reject_nonstandard_constant(name: str) -> Any:
+    """Refuse ``NaN``/``Infinity``: Python parses them, JSON does not allow them.
+
+    They would be written straight back out by :func:`dumps`, producing a
+    playerlist that a strict JSON parser (TF2BD itself) cannot read -- and
+    this tool must never emit a file it could not load again.
+    """
+    raise ValueError(f"non-standard constant {name}")
+
+
 def load(path: Path, *, encoding: str = "utf-8-sig") -> tuple[PlayerList, str]:
     """Read a playerlist, returning the parsed document and its original text.
 
@@ -233,7 +243,7 @@ def load(path: Path, *, encoding: str = "utf-8-sig") -> tuple[PlayerList, str]:
         # any other unreadable file instead of crashing with a traceback.
         raise PlayerListError(f"cannot read {path}: {exc}") from exc
     try:
-        database = json.loads(original)
+        database = json.loads(original, parse_constant=_reject_nonstandard_constant)
     except (ValueError, RecursionError) as exc:
         # ValueError covers a JSON syntax error and a number with more digits
         # than Python's int-parsing limit -- invalid input, not a crash.

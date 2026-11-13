@@ -49,7 +49,7 @@ DEFAULT_SOURCES: tuple[str, ...] = (
 )
 
 # Single source of truth for the tool version (also used for --version).
-VERSION = "3.5"
+VERSION = "3.6"
 
 USER_AGENT = (
     f"Garou3299-tf2bd-database-vorobey-hackerpolice-sync/{VERSION} (+https://github.com/Garou3299/tf2bd-database)"
@@ -66,6 +66,7 @@ MAX_SOURCE_BYTES = 64 * 1024 * 1024
 __all__ = [
     "DEFAULT_SNAPSHOT",
     "DEFAULT_SOURCES",
+    "MAX_SOURCE_BYTES",
     "PROOF_MARKER",
     "SOURCE_REPO_URL",
     "VERSION",
@@ -183,14 +184,31 @@ def _http_get(url: str, timeout: int) -> bytes:
     if urllib.parse.urlparse(url).hostname == "api.github.com":
         headers["Accept"] = "application/vnd.github.raw"
     # The scheme is checked above, so urlopen can never be pointed at file:,
-    # data: or another local scheme (Bandit/ruff B310/S310 audit).
+    # data: or another local scheme (Bandit/ruff B310/S310 audit). urllib
+    # itself refuses a redirect to a non-HTTP scheme; what it *does* allow is
+    # a redirect from https to plaintext http, which would let anyone on the
+    # network rewrite the list we are about to snapshot. That downgrade is
+    # refused below, before a single body byte is trusted.
     request = urllib.request.Request(url, headers=headers)  # noqa: S310
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
         # urlopen is untyped (Any); the annotation keeps --strict honest.
+        final_url: str = response.geturl()
+        if final_url and _is_plaintext_downgrade(url, final_url):
+            raise SyncError(f"refusing to read {url}: it redirected to the insecure {final_url}")
         body: bytes = response.read(MAX_SOURCE_BYTES + 1)
     if len(body) > MAX_SOURCE_BYTES:
         raise SyncError(f"{url} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
     return body
+
+
+def _is_plaintext_downgrade(url: str, final_url: str) -> bool:
+    """True if an https request ended up at a non-https location.
+
+    The list is snapshotted and committed verbatim, so a redirect that drops
+    TLS must be treated as a hostile rewrite rather than as a transport
+    detail. The comparison is case-insensitive, like :func:`is_url`.
+    """
+    return url.lower().startswith("https://") and not final_url.lower().startswith("https://")
 
 
 def _is_transient(error: urllib.error.HTTPError) -> bool:
@@ -219,14 +237,19 @@ def _fetch_bytes(
             last_error = exc
             if not _is_transient(exc):
                 break  # permanent: don't waste attempts, fall back sooner
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
-            last_error = exc
-        except (ValueError, http.client.HTTPException) as exc:
-            # A malformed URL (bad IPv6 literal, control characters, ...)
+        except (http.client.InvalidURL, ValueError) as exc:
+            # A malformed URL (bad IPv6 literal, control character, ...)
             # fails identically on every attempt and every machine: report
-            # it as a fetch failure so the caller falls back / exits cleanly
-            # instead of crashing with a traceback.
+            # it as a fetch failure straight away so the caller falls back /
+            # exits cleanly instead of crashing with a traceback.
+            # InvalidURL is an HTTPException, not a ValueError, so it has to
+            # be named here to keep it out of the retrying branch below.
             raise SyncError(f"could not fetch {url}: {exc}") from exc
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+            # Transport trouble (refused, reset, a truncated body such as
+            # http.client.IncompleteRead, a bad status line): the next
+            # attempt may well succeed.
+            last_error = exc
         if attempt < attempts:
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
     raise SyncError(f"could not fetch {url}: {last_error}")
@@ -238,17 +261,20 @@ def _read_local_bytes(path: Path) -> bytes:
     Local files are operator-chosen (``--source``, ``--snapshot``), but
     "pointed it at a 5 GB file by accident" must be a clean error rather than
     an out-of-memory kill in the middle of a scheduled run. The cap is the
-    same one HTTP downloads use.
+    same one HTTP downloads use, and it is applied to the bytes actually
+    READ rather than to what ``stat()`` reports: a pipe, a device such as
+    ``/dev/zero`` or a file that grows while it is being read announces no
+    useful size, and stat-then-read could still exhaust memory (or read a
+    different file than the one that was measured).
     """
     try:
-        size = path.stat().st_size
-        if size > MAX_SOURCE_BYTES:
-            raise SyncError(
-                f"{path} is {size} bytes, larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit"
-            )
-        return path.read_bytes()
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_SOURCE_BYTES + 1)
     except OSError as exc:
         raise SyncError(f"cannot read {path}: {exc}") from exc
+    if len(raw) > MAX_SOURCE_BYTES:
+        raise SyncError(f"{path} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
+    return raw
 
 
 def _read_bytes(source: str) -> bytes:

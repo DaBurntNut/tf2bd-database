@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import copy
+import http.client
 import io
 import json
 import os
@@ -22,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 from email.message import Message
@@ -117,8 +119,14 @@ class HackerpoliceIndexTests(unittest.TestCase):
 # Source fetching (network layer, mocked)
 # --------------------------------------------------------------------------- #
 class _FakeResponse:
-    def __init__(self, body: bytes):
+    def __init__(self, body: bytes, url: str = ""):
         self._body = body
+        self._url = url
+
+    def geturl(self) -> str:
+        # The real HTTPResponse reports the URL the request ended up at (i.e.
+        # after redirects); "" keeps the existing fakes redirect-free.
+        return self._url
 
     def __enter__(self):
         return self
@@ -231,6 +239,30 @@ class SourceFetchTests(unittest.TestCase):
             load_first_available_raw([str(big)])
         self.assertIn("safety limit", str(caught.exception))
 
+    def test_a_local_source_that_reports_no_size_still_cannot_exceed_the_cap(self):
+        # A pipe or a device reports st_size == 0, so a stat-based check would
+        # let "--source /dev/zero" read until the machine runs out of memory.
+        # The cap must apply to the bytes actually read.
+        fifo = Path(tempfile.mkdtemp()) / "fifo.json"
+        self.addCleanup(shutil.rmtree, fifo.parent)
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("named pipes are not available here")
+        try:
+            os.mkfifo(fifo)
+        except (NotImplementedError, OSError):
+            self.skipTest("named pipes are not available here")
+        payload = b'{"players": []}' + b" " * 4096
+
+        def writer() -> None:
+            with contextlib.suppress(OSError), fifo.open("wb") as handle:  # the reader stops at the cap
+                handle.write(payload)
+
+        threading.Thread(target=writer, daemon=True).start()
+        self.assertEqual(fifo.stat().st_size, 0)  # stat knows nothing here
+        with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError) as caught:
+            load_first_available_raw([str(fifo)])
+        self.assertIn("safety limit", str(caught.exception))
+
     def test_oversized_snapshot_is_rejected(self):
         path = Path(tempfile.mkdtemp()) / "snap.json"
         self.addCleanup(shutil.rmtree, path.parent)
@@ -318,6 +350,54 @@ class SourceFetchTests(unittest.TestCase):
         (_, _, raw), calls = self.fetch([error, error, _FakeResponse(self.BODY)])
         self.assertEqual(raw, self.BODY)
         self.assertEqual(calls, 3)
+
+    def test_a_truncated_body_is_retried_instead_of_blaming_the_url(self):
+        # A truncated body (http.client.IncompleteRead) is a flaky connection,
+        # not a malformed URL: it must be retried, not reported as permanent.
+        truncated = http.client.IncompleteRead(b"partial", 100)
+        (_, _, raw), calls = self.fetch([truncated, truncated, _FakeResponse(self.BODY)])
+        self.assertEqual(raw, self.BODY)
+        self.assertEqual(calls, 3)
+
+    def test_a_malformed_url_is_not_retried(self):
+        # InvalidURL is an http.client.HTTPException (not a ValueError), so it
+        # needs its own branch: retrying a URL that cannot be parsed just
+        # wastes three attempts and six seconds before the same failure.
+        for error in (ValueError("invalid URL"), http.client.InvalidURL("control character")):
+            with (
+                mock.patch("sources._http_get", side_effect=error) as get,
+                mock.patch("sources.time.sleep"),
+                self.assertRaises(SyncError) as caught,
+            ):
+                sources._fetch_bytes(self.URL)
+            self.assertEqual(get.call_count, 1, type(error).__name__)
+            self.assertIn("could not fetch", str(caught.exception))
+
+    def test_a_redirect_that_drops_https_is_refused(self):
+        # The body becomes the committed snapshot, so a downgraded redirect
+        # (which anyone on the network can rewrite) must never be trusted.
+        downgraded = _FakeResponse(self.BODY, "http://example.invalid/list.json")
+        with (
+            mock.patch("sources.urllib.request.urlopen", return_value=downgraded),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError) as caught,
+        ):
+            load_first_available_raw([self.URL])
+        self.assertIn("insecure", str(caught.exception))
+        self.assertIn("http://example.invalid/list.json", str(caught.exception))
+
+    def test_an_https_redirect_is_followed_normally(self):
+        # Both real fallbacks redirect across GitHub hosts over TLS; that is
+        # ordinary and must keep working.
+        redirected = _FakeResponse(self.BODY, "https://raw.githubusercontent.com/Nocrex/Tom/main/list.json")
+        with (
+            mock.patch("sources.urllib.request.urlopen", return_value=redirected),
+            mock.patch("sources.time.sleep"),
+        ):
+            document, source, raw = load_first_available_raw([self.URL])
+        self.assertEqual(raw, self.BODY)
+        self.assertEqual(source, self.URL)
+        self.assertEqual(len(document["players"]), 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -957,6 +1037,28 @@ class ReportTests(unittest.TestCase):
         self.assertIn("https://x/%5C%5Ba%5D%28b%29%20", report)
         self.assertNotIn("](b)", report)
 
+    def test_link_targets_cannot_split_the_table_cell_or_open_a_title(self):
+        # A "|" ends the cell and a quote can start a Markdown link title, so
+        # both must be percent-encoded inside an untrusted proof link.
+        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ('https://example.invalid/a|b"c',))
+        report = render_report(self.info([change]))
+        row = next(line for line in report.splitlines() if line.startswith("| `[U:1:1]`"))
+        self.assertIn("https://example.invalid/a%7Cb%22c", row)
+        self.assertEqual(row.count("|"), 6)  # still exactly one 5-column row
+        self.assertNotIn('"c)', row)
+
+    def test_attribute_names_cannot_split_the_row_or_become_entities(self):
+        # Attributes come straight from the database, and a pipe ends a table
+        # cell even inside a code span; an ampersand must stay an ampersand
+        # (HTML escaping is wrong between backticks).
+        change = Change("[U:1:1]", "a", ("suspicious|evil",), ("cheater", "Tom & Jerry", "we\nird"))
+        report = render_report(self.info([change]))
+        row = next(line for line in report.splitlines() if "evil" in line)
+        self.assertIn("`suspicious\\|evil`", row)
+        self.assertIn("`Tom & Jerry`", row)
+        self.assertIn("`we ird`", row)
+        self.assertEqual(len(re.findall(r"(?<!\\)\|", row)), 6)  # one 5-column row
+
     def test_dry_run_and_include_proof_notes(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))
         report = render_report(self.info([change], dry_run=True, include_proof=True))
@@ -1375,6 +1477,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("duplicate steamid", stderr)
 
+    def test_each_validation_warning_is_printed_once(self):
+        # The database is validated before and after the sync; the second pass
+        # must not repeat the first pass's warnings.
+        self.write_snapshot_fixture(hackerpolice_entry("[U:1:100]"))
+        self.database.write_text(
+            dumps(
+                {
+                    "$schema": "x",
+                    "file_info": {},
+                    "players": [player("[U:1:100]", ["suspicious", "an-unknown-tag"])],
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, _, stderr = self.run_cli("--source", str(self.source), "--demote")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr.count("unknown attribute"), 1)
+
     def test_unknown_attributes_are_kept_and_only_warned_about(self):
         self.database.write_text(
             dumps({"$schema": "x", "file_info": {}, "players": [player("[U:1:999]", ["scammer"])]}),
@@ -1506,6 +1626,22 @@ class CliTests(unittest.TestCase):
         self.assertIn("| `[U:1:300]` | [profile](https://steamcommunity.com/profiles/76561197960266028) |", report)
         self.assertIn("| `[U:1:400]` | [profile](https://steamcommunity.com/profiles/76561197960266128) |", report)
         self.assertNotIn("demoted (in the previous snapshot", report)  # no demotion table
+
+    def test_a_run_without_demote_warns_that_it_is_dropping_the_candidates(self):
+        """The snapshot is an exact copy either way; the warning is about the lost signal.
+
+        Refreshing the baseline without demoting means the next run can no
+        longer prove those removals, so the one run that reports them must say
+        so instead of being silently incomplete.
+        """
+        snapshot_fixture = self.write_snapshot_fixture(hackerpolice_entry("[U:1:300]"))
+        code, stdout, stderr = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 0)
+        self.assertIn("**1 SteamID removed from the Vorobey list", stdout)
+        self.assertIn("Demotion is off (no --demote): 1 SteamID disappeared upstream", stderr)
+        self.assertIn("it can no longer be demoted automatically", stderr)
+        # ... and the snapshot is still an exact copy of the upstream file.
+        self.assertEqual(snapshot_fixture.read_bytes(), self.source.read_bytes())
 
     def test_demote_without_snapshot_demotes_nobody_and_creates_baseline(self):
         self.database.write_text(
@@ -2229,6 +2365,17 @@ class LoadTests(unittest.TestCase):
             self.assertEqual(database["players"], [])
             self.assertEqual(original, text)  # BOM stripped, not carried into the output
             self.assertEqual(dumps(database), original)
+
+    def test_nan_and_infinity_are_refused_instead_of_being_written_back(self):
+        # json.loads accepts these by default and dumps would emit them again,
+        # leaving a playerlist that TF2BD (a strict JSON parser) cannot read.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "list.json"
+            for literal in ("NaN", "Infinity", "-Infinity"):
+                path.write_text(f'{{"players": [], "file_info": {{"x": {literal}}}}}', encoding="utf-8")
+                with self.assertRaises(PlayerListError) as caught:
+                    load(path)
+                self.assertIn("is not valid JSON", str(caught.exception))
 
 
 class SerialisationTests(unittest.TestCase):

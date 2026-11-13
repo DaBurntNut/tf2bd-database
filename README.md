@@ -49,6 +49,11 @@ pull request is merged.**
 Players who were added to this database and were never on
 Vorobey's list are **never** demoted or removed by the bot.
 
+`--demote` is opt-in. A run without it still reports every removal, and still
+refreshes the snapshot to an exact copy of the new upstream list — so it also
+warns that those removals can no longer be proven (and therefore can no longer
+be demoted automatically) once that snapshot lands.
+
 ### Report who was removed from Vorobey's list
 
 Every pull request also lists the SteamIDs that disappeared from Vorobey's
@@ -84,8 +89,10 @@ writes a file it could not read back.
 | Path aliasing | `--report` and `--source` may not point at the database or the snapshot — sharing a path would overwrite an input file. |
 | Atomic writes | The database and the snapshot are written to a temp file and renamed into place, so a crash (or two runs at once) can never leave a half-written file behind. |
 | Symlink-safe writes | If the playerlist or the snapshot is a symbolic link — the usual way to point TF2BD's `cfg/playerlist.json` at this repository — the file it points at is updated. The link itself is never replaced. |
-| Clean failures | Bad JSON, a corrupt snapshot, a non-UTF-8 database or an unreachable source ends in exit code 2 with a readable message, never a traceback. |
-| Size limits | A fetched or local list over 64 MiB is refused instead of being read into memory, and the pull request body is always kept below GitHub's 65,536-character limit. |
+| Clean failures | Bad JSON, `NaN`/`Infinity`, a corrupt snapshot, a non-UTF-8 database or an unreachable source ends in exit code 2 with a readable message, never a traceback. |
+| Size limits | A fetched or local list over 64 MiB is refused instead of being read into memory. The limit is applied to the bytes actually read, so a pipe or a device (`--source /dev/zero`) that reports no size cannot slip past it. The pull request body is always kept below GitHub's 65,536-character limit. |
+| Encrypted transport | A source that redirects from `https` to a plaintext URL is refused rather than trusted: the response becomes the committed snapshot. A truncated response is retried like any other transport failure instead of being blamed on the URL. |
+| Strict JSON | A playerlist containing `NaN`/`Infinity` — which Python parses but JSON does not allow — is refused at load time, so the bot can never write a file that a strict parser (TF2BD itself) cannot read back. |
 | Untrusted text stays text | Proof strings and names coming from Vorobey's list are escaped, so they can never inject HTML (a phishing link) into this repository's pull request or a newline into the database. |
 | Visible skips | A run that skips demotion (no baseline yet, or the mass-demotion guard) changes no file, so it also emits a GitHub Actions warning annotation instead of ending as a silent green run. |
 

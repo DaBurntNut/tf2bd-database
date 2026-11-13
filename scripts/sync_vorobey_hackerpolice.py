@@ -149,9 +149,17 @@ def _write_github_outputs(**outputs: str | int | bool) -> None:
         handle.write("\n".join(lines) + "\n")
 
 
-def _log_validation(result: ValidationResult, context: str) -> None:
-    for warning in result.warnings:
-        LOGGER.warning("%s", warning)
+def _log_validation(result: ValidationResult, context: str, *, warnings: bool = True) -> None:
+    """Report what validation found; ``warnings=False`` keeps errors only.
+
+    The database is validated twice (before the sync, and again before it is
+    written). Warnings are about the entries themselves and were already
+    reported by the first pass, so repeating them would print every unknown
+    attribute twice for no new information.
+    """
+    if warnings:
+        for warning in result.warnings:
+            LOGGER.warning("%s", warning)
     for error in result.errors:
         LOGGER.error("%s: %s", context, error)
 
@@ -467,6 +475,20 @@ def run(args: argparse.Namespace) -> int:
     index, source, source_bytes = _load_upstream(args.source or DEFAULT_SOURCES)
 
     diff = _snapshot_diff(previous_index, index)
+    if not args.demote and diff.removed:
+        # Nothing is withheld here: the snapshot is an exact copy of the
+        # upstream file, so refreshing it is always correct. The consequence
+        # deserves a warning though -- the removals listed in this run's
+        # report are the last time they can be demoted, because the next
+        # snapshot no longer contains them.
+        removed_count = len(diff.removed)
+        LOGGER.warning(
+            "Demotion is off (no --demote): %d %s disappeared upstream and will not be demoted; "
+            "once the refreshed snapshot lands, %s can no longer be demoted automatically.",
+            removed_count,
+            plural(removed_count, "SteamID", "SteamIDs"),
+            plural(removed_count, "it", "they"),
+        )
     plan = _plan_demotion(args, diff, snapshot_path=snapshot_path)
     if plan.note:
         _github_warning(f"Demotion {plan.note}")
@@ -480,7 +502,7 @@ def run(args: argparse.Namespace) -> int:
     )
 
     result = validate(database)
-    _log_validation(result, "refusing to write an invalid database")
+    _log_validation(result, "refusing to write an invalid database", warnings=False)
     if result.errors:
         raise SyncError("the synced playerlist is invalid, nothing was written")
 

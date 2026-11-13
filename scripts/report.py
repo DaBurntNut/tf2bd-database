@@ -41,18 +41,21 @@ MAX_REMOVED_CHARS = 12_000
 # the tables (1600 IDs alone added ~17 KB to a body limited to 65536).
 MAX_CLOSING_STEAMIDS = 10
 
-# Characters that would break a Markdown link target -- or let an
-# untrusted proof string (the Vorobey list is outside our control) break out
-# of it and inject arbitrary Markdown. Percent-encoded rather than
-# backslash-escaped so the URL stays valid.
+# Characters that would break a Markdown link target, split the table cell
+# it sits in, or let an untrusted proof string (the Vorobey list is outside
+# our control) break out of it and inject arbitrary Markdown.
+# Percent-encoded rather than backslash-escaped so the URL stays valid:
+# a pipe must be escaped even inside a link when the link is in a table.
 _LINK_ESCAPES = str.maketrans(
     {
         "\\": "%5C",
+        '"': "%22",
         "(": "%28",
         ")": "%29",
         " ": "%20",
         "[": "%5B",
         "]": "%5D",
+        "|": "%7C",
         "<": "%3C",
         ">": "%3E",
         "\n": "%0A",
@@ -97,6 +100,22 @@ def _cell(value: str) -> str:
         .strip()
         or "-"
     )
+
+
+def _code_span(value: str) -> str:
+    """Render a value inside a Markdown code span in a table cell.
+
+    ``_cell`` is deliberately not used here: HTML entities stay literal
+    between backticks (``&amp;`` would be displayed as-is), but a pipe still
+    ends the table cell even inside a code span, so it must be escaped and a
+    line break flattened.
+    """
+    return "`" + value.replace("|", "\\|").replace("\n", " ").replace("\r", " ") + "`"
+
+
+def _attributes_cell(attributes: Sequence[str]) -> str:
+    """Attribute list cell: every name as its own code span."""
+    return ", ".join(_code_span(attribute) for attribute in attributes)
 
 
 def _name_cell(change: Change) -> str:
@@ -194,7 +213,7 @@ def _removed_section(removed: Sequence[str]) -> list[str]:
     rows = []
     for steamid in ordered:
         url = steam_profile_url(steamid)
-        rows.append(f"| `{_cell(steamid)}` | {_markdown_link(url, 'profile') if url else '-'} |")
+        rows.append(f"| {_code_span(steamid)} | {_markdown_link(url, 'profile') if url else '-'} |")
     shown, hidden = _take_rows(rows, MAX_REMOVED_CHARS)
     lines += shown
     lines.append("")
@@ -327,16 +346,11 @@ def _promotion_section(promotions: Sequence[Change]) -> list[str]:
         "| SteamID | Last known name | Before | After | Hackerpolice proof |",
         "| --- | --- | --- | --- | --- |",
     ]
-    rows = [
-        "| `{steamid}` | {name} | {before} | {after} | {evidence} |".format(
-            steamid=change.steamid,
-            name=_name_cell(change),
-            before=", ".join(f"`{attribute}`" for attribute in change.before),
-            after=", ".join(f"`{attribute}`" for attribute in change.after),
-            evidence=_evidence_cell(change.evidence),
-        )
-        for change in promotions
-    ]
+    rows = []
+    for change in promotions:
+        steamid, name = _code_span(change.steamid), _name_cell(change)
+        before, after = _attributes_cell(change.before), _attributes_cell(change.after)
+        rows.append(f"| {steamid} | {name} | {before} | {after} | {_evidence_cell(change.evidence)} |")
     shown, hidden = _take_rows(rows, MAX_PROMOTION_CHARS)
     lines += shown
     lines.append("")
@@ -354,15 +368,11 @@ def _demotion_section(demotions: Sequence[Change]) -> list[str]:
         "| SteamID | Last known name | Before | After |",
         "| --- | --- | --- | --- |",
     ]
-    rows = [
-        "| `{steamid}` | {name} | {before} | {after} |".format(
-            steamid=change.steamid,
-            name=_name_cell(change),
-            before=", ".join(f"`{attribute}`" for attribute in change.before),
-            after=", ".join(f"`{attribute}`" for attribute in change.after) or "entry removed",
-        )
-        for change in demotions
-    ]
+    rows = []
+    for change in demotions:
+        steamid, name = _code_span(change.steamid), _name_cell(change)
+        before, after = _attributes_cell(change.before), _attributes_cell(change.after) or "entry removed"
+        rows.append(f"| {steamid} | {name} | {before} | {after} |")
     shown, hidden = _take_rows(rows, MAX_DEMOTION_CHARS)
     lines += shown
     lines.append("")
