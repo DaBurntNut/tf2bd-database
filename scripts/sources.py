@@ -100,6 +100,16 @@ class HackerpoliceIndex:
     total: int
     skipped: int
 
+    @property
+    def duplicates(self) -> int:
+        """Entries that repeated a SteamID already seen upstream (first one wins).
+
+        Not "unusable": the entry is a valid SteamID, it just adds nothing.
+        Counted so the report's "N entries" can never silently disagree with
+        the unique-count snapshot diff below it.
+        """
+        return self.total - self.skipped - len(self.by_steamid)
+
     @classmethod
     def build(cls, document: dict[str, Any]) -> HackerpoliceIndex:
         entries = document.get("players")

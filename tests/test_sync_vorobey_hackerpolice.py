@@ -130,6 +130,21 @@ class _FakeResponse:
         return self._body if size is None or size < 0 else self._body[:size]
 
 
+class IndexDuplicateTests(unittest.TestCase):
+    def test_duplicate_upstream_entries_collapse_onto_the_first(self):
+        first = hackerpolice_entry("[U:1:100]", ["https://first.test/1"])
+        second = hackerpolice_entry("[U:1:100]", ["https://second.test/2"])
+        index = HackerpoliceIndex.build({"players": [first, second, hackerpolice_entry("not a steamid")]})
+        self.assertEqual(len(index.by_steamid), 1)
+        self.assertEqual(index.by_steamid["[U:1:100]"]["proof"], ["https://first.test/1"])
+        self.assertEqual(index.total, 3)
+        self.assertEqual(index.skipped, 1)  # the unusable one
+        self.assertEqual(index.duplicates, 1)  # the repeated one
+
+    def test_no_duplicates_in_a_clean_list(self):
+        self.assertEqual(HackerpoliceIndex.build({"players": [hackerpolice_entry("[U:1:1]")]}).duplicates, 0)
+
+
 class SourceFetchTests(unittest.TestCase):
     URL = "https://example.invalid/list.json"
     BODY = b'\xef\xbb\xbf{"players": [{"steamid": "[U:1:100]", "attributes": ["cheater"]}]}'
@@ -773,6 +788,33 @@ class ReportTests(unittest.TestCase):
         # The actual URL the bytes were fetched from stays visible for debugging.
         self.assertIn("- Fetched from: https://example.invalid/list.json", report)
 
+    def test_the_removed_table_ignores_the_order_the_ids_arrive_in(self):
+        # run() hands over tuple(frozenset), whose order varies with the
+        # process: the rendered table must not, or every PR body would churn.
+        ids = ["[U:1:300]", "[U:1:100]", "[U:1:42]", "[U:1:200]"]
+        with mock.patch("report.time.strftime", return_value="frozen"):
+            forward = render_report(self.info(removed_upstream=tuple(ids), removed_from_source=len(ids)))
+            backward = render_report(self.info(removed_upstream=tuple(reversed(ids)), removed_from_source=len(ids)))
+        self.assertEqual(forward, backward)
+        rows = [line for line in forward.splitlines() if line.startswith("| `[U:1:")]
+        self.assertEqual(
+            rows,
+            [
+                "| `[U:1:42]` | [profile](https://steamcommunity.com/profiles/76561197960265770) |",
+                "| `[U:1:100]` | [profile](https://steamcommunity.com/profiles/76561197960265828) |",
+                "| `[U:1:200]` | [profile](https://steamcommunity.com/profiles/76561197960265928) |",
+                "| `[U:1:300]` | [profile](https://steamcommunity.com/profiles/76561197960266028) |",
+            ],
+        )
+
+    def test_duplicate_upstream_entries_are_reported(self):
+        # "10 entries" next to a "8 -> 8 entries" diff would look like a bug.
+        report = render_report(self.info(source_duplicates=2))
+        self.assertIn("Vorobey hackerpolice list (10 entries, 2 duplicates)", report)
+
+    def test_a_single_duplicate_is_singular(self):
+        self.assertIn("1 duplicate", render_report(self.info(source_duplicates=1)))
+
     def test_unusable_upstream_entries_are_reported(self):
         report = render_report(self.info(source_skipped=3))
         self.assertIn("Vorobey hackerpolice list (10 entries, 3 unusable)", report)
@@ -1231,6 +1273,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), self.source.read_bytes())  # the baseline was created
 
     def test_a_write_failure_names_the_file_not_a_temp_file(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("running as root: permissions do not restrict writes")
         locked = self.root / "locked"
         locked.mkdir()
         database = locked / "list.json"
@@ -1363,6 +1407,21 @@ class CliTests(unittest.TestCase):
         code, stdout, _ = self.run_cli("--source", str(self.source))
         self.assertEqual(code, 0)
         self.assertIn("No changes", stdout)
+
+    def test_no_update_snapshot_demotes_but_leaves_the_baseline_alone(self):
+        """Documented trade-off: untouched baseline => the same IDs are re-reported."""
+        self.database.write_text(
+            dumps({"$schema": "x", "file_info": {}, "players": [player("[U:1:300]", ["cheater"])]}),
+            encoding="utf-8",
+        )
+        snapshot = self.write_snapshot_fixture(hackerpolice_entry("[U:1:300]"))
+        baseline = snapshot.read_bytes()
+        code, _, _ = self.run_cli(
+            "--source", str(self.source), "--snapshot", str(snapshot), "--demote", "--no-update-snapshot"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.database.read_text(encoding="utf-8"))["players"], [])  # demoted
+        self.assertEqual(snapshot.read_bytes(), baseline)  # baseline never advanced
 
     def test_demote_keeps_an_entry_that_still_has_another_tag(self):
         """End-to-end: only the cheater tag goes, the player stays listed."""

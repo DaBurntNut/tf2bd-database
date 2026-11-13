@@ -246,6 +246,9 @@ class RunInfo:
     dry_run: bool
     include_proof: bool = False
     changes: tuple[Change, ...] = ()
+    # Entries that repeated a SteamID already listed upstream: they collapse
+    # onto the first one, so source_total can exceed the unique-ID counts.
+    source_duplicates: int = 0
     # Demotion provenance: how many IDs disappeared upstream vs. the snapshot,
     # and (when demotion was skipped despite --demote) the reason why.
     previous_source_total: int | None = None
@@ -268,6 +271,8 @@ def _summary_lines(info: RunInfo) -> list[str]:
     source_note = f"{info.source_total} {plural(info.source_total, 'entry', 'entries')}"
     if info.source_skipped:
         source_note += f", {info.source_skipped} unusable"
+    if info.source_duplicates:
+        source_note += f", {info.source_duplicates} {plural(info.source_duplicates, 'duplicate', 'duplicates')}"
 
     lines = [
         "## Vorobey hackerpolice sync",

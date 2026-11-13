@@ -496,6 +496,7 @@ def run(args: argparse.Namespace) -> int:
             source=source,
             source_total=index.total,
             source_skipped=index.skipped,
+            source_duplicates=index.duplicates,
             dry_run=args.dry_run,
             include_proof=args.include_proof,
             changes=tuple(changes),
