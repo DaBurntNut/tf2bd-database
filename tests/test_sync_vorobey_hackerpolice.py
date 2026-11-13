@@ -29,8 +29,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import sources
+import sync_vorobey_hackerpolice as cli
 from playerlist import (
     PlayerListError,
+    ValidationResult,
     account_id,
     dumps,
     load,
@@ -218,6 +221,71 @@ class SourceFetchTests(unittest.TestCase):
         path.write_bytes(b'{"players": []}' + b" " * 5_000_000)
         with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError):
             load_snapshot(path)
+
+    def test_an_unparseable_source_is_a_clean_error(self):
+        with (
+            mock.patch("sources.urllib.request.urlopen", side_effect=[_FakeResponse(b"{not json")]),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError) as caught,
+        ):
+            load_first_available_raw([self.URL])
+        self.assertIn("is not valid JSON", str(caught.exception))
+
+    def test_a_source_that_is_not_an_object_is_a_clean_error(self):
+        with (
+            mock.patch("sources.urllib.request.urlopen", side_effect=[_FakeResponse(b"[1, 2, 3]")]),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError) as caught,
+        ):
+            load_first_available_raw([self.URL])
+        self.assertIn("does not contain a JSON object", str(caught.exception))
+
+    def test_an_envelope_that_unwraps_to_the_wrong_shape_is_a_clean_error(self):
+        envelope = json.dumps({"encoding": "base64", "content": base64.b64encode(b'{"not": "a playerlist"}').decode()})
+        with (
+            mock.patch("sources.urllib.request.urlopen", side_effect=[_FakeResponse(envelope.encode("utf-8"))]),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError) as caught,
+        ):
+            load_first_available_raw([self.URL])
+        self.assertIn("no 'players' array in response", str(caught.exception))
+
+    def test_the_github_api_request_asks_for_the_raw_media_type(self):
+        """Without this header the API answers with a JSON envelope, not the file."""
+        with (
+            mock.patch("sources.urllib.request.urlopen", return_value=_FakeResponse(self.BODY)) as urlopen,
+            mock.patch("sources.time.sleep"),
+        ):
+            load_first_available_raw(["https://api.github.com/repos/Nocrex/Tom/contents/list.json"])
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Accept"), "application/vnd.github.raw")
+
+    def test_http_get_refuses_anything_but_http(self):
+        # Defence in depth: even if a caller slips through, no other scheme
+        # (file:, data:, ftp:, ...) may ever reach urlopen.
+        for url in ("file:///etc/passwd", "data:text/plain,x", "ftp://example.invalid/x", "javascript:alert(1)"):
+            with self.assertRaises(SyncError):
+                sources._http_get(url, timeout=1)
+
+    def test_a_connection_failure_is_retried_then_reported_cleanly(self):
+        error = urllib.error.URLError("connection refused")
+        with (
+            mock.patch("sources.urllib.request.urlopen", side_effect=error) as urlopen,
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError) as caught,
+        ):
+            load_first_available_raw([self.URL])
+        self.assertEqual(urlopen.call_count, sources.FETCH_ATTEMPTS)
+        self.assertIn("could not fetch", str(caught.exception))
+
+    def test_a_malformed_base64_envelope_is_a_clean_error(self):
+        envelope = json.dumps({"encoding": "base64", "content": "AAAAA"}).encode("utf-8")
+        with (
+            mock.patch("sources.urllib.request.urlopen", side_effect=[_FakeResponse(envelope)]),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
 
     def test_permanent_http_error_is_not_retried(self):
         error = urllib.error.HTTPError(self.URL, 404, "not found", Message(), None)
@@ -592,18 +660,58 @@ class PolicyFuzzTests(unittest.TestCase):
                     self.assertEqual(got, before)  # untouched means byte-identical
 
 
+class PolicyRobustnessTests(unittest.TestCase):
+    """``promote``/``demote`` never trust their input: bad entries are skipped.
+
+    The CLI validates before calling them, so these branches only run if a
+    caller forgets to -- which must still not crash or corrupt anything.
+    """
+
+    def test_promote_skips_a_malformed_document(self):
+        self.assertEqual(promote({"players": None}, index_of()), [])
+        self.assertEqual(
+            promote(
+                {
+                    "players": [
+                        None,
+                        "not an entry",
+                        {"steamid": "[U:1:1]", "attributes": "cheater"},
+                        {"steamid": "[U:1:2]", "attributes": [1]},
+                        {"steamid": "not a steamid", "attributes": ["suspicious"]},
+                    ]
+                },
+                index_of(hackerpolice_entry("[U:1:1]"), hackerpolice_entry("[U:1:2]")),
+            ),
+            [],
+        )
+
+    def test_demote_skips_a_malformed_document(self):
+        self.assertEqual(demote({"players": None}, ["[U:1:1]"]), [])
+        database = {
+            "players": [
+                None,
+                {"steamid": "not a steamid", "attributes": ["cheater"]},
+                {"steamid": "[U:1:1]", "attributes": "cheater"},
+                {"steamid": "[U:1:2]", "attributes": [1]},
+                {"steamid": "[U:1:3]", "attributes": ["racist"]},
+            ]
+        }
+        self.assertEqual(demote(database, ["[U:1:1]", "[U:1:2]", "[U:1:3]"]), [])
+        self.assertEqual(len(database["players"]), 5)  # nothing was dropped
+        self.assertIsNone(database["players"][0])
+
+
 # --------------------------------------------------------------------------- #
 # Report rendering
 # --------------------------------------------------------------------------- #
 class ReportTests(unittest.TestCase):
     def info(self, changes=(), **kwargs):
+        defaults = {"source_total": 10, "source_skipped": 0, "dry_run": False}
         return RunInfo(
             database_path=Path("playerlist.garou3299.json"),
             source="https://example.invalid/list.json",
-            source_total=10,
-            source_skipped=0,
             changes=tuple(changes),
-            **{"dry_run": False, **kwargs},
+            **{**defaults, **kwargs},
         )
 
     def test_a_demoted_entry_that_keeps_another_tag_is_not_shown_as_removed(self):
@@ -637,6 +745,28 @@ class ReportTests(unittest.TestCase):
         )
         # The actual URL the bytes were fetched from stays visible for debugging.
         self.assertIn("- Fetched from: https://example.invalid/list.json", report)
+
+    def test_unusable_upstream_entries_are_reported(self):
+        report = render_report(self.info(source_skipped=3))
+        self.assertIn("Vorobey hackerpolice list (10 entries, 3 unusable)", report)
+
+    def test_blank_text_renders_as_a_dash_cell(self):
+        from report import _cell
+
+        self.assertEqual(_cell("   "), "-")
+        self.assertEqual(_cell("a|b"), "a\\|b")  # a pipe can never split the row
+        self.assertEqual(_cell("<b>x</b>"), "&lt;b&gt;x&lt;/b&gt;")
+
+    def test_sections_are_separated_by_exactly_one_blank_line(self):
+        changes = [
+            Change("[U:1:100]", "a", ("suspicious",), ("cheater",), ("https://p/1",)),
+            Change("[U:1:200]", "b", ("cheater", "racist"), ("racist",), kind="demote"),
+        ]
+        report = render_report(
+            self.info(changes, previous_source_total=10, removed_from_source=1, removed_upstream=("[U:1:200]",))
+        )
+        self.assertNotIn("\n\n\n", report)
+        self.assertIn("|\n\nAttributes are changed", report)
 
     def test_snapshot_diff_shows_added_removed_and_net(self):
         report = render_report(
@@ -1006,6 +1136,81 @@ class CliTests(unittest.TestCase):
         ):
             code = main(argv)
         return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_a_failed_write_leaves_no_temp_file_and_no_half_written_file(self):
+        original = self.database.read_text(encoding="utf-8")
+        with mock.patch("pathlib.Path.replace", side_effect=OSError("disk full")):
+            code, _, stderr = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 2)
+        self.assertIn("disk full", stderr)
+        self.assertEqual(self.database.read_text(encoding="utf-8"), original)  # untouched
+        self.assertEqual(list(self.root.glob(".*.tmp")), [])  # no debris left behind
+
+    def test_a_directory_that_cannot_be_fsynced_is_not_an_error(self):
+        # A missing/unfsyncable directory (Windows, some network mounts) must
+        # not fail the run: the rename itself is already atomic.
+        cli._fsync_directory(self.root / "does-not-exist")  # must not raise
+
+    def test_a_samefile_error_does_not_block_the_run(self):
+        with mock.patch("os.path.samefile", side_effect=OSError("no such device")):
+            code, _, _ = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 0)
+
+    def test_an_invalid_sync_result_is_never_written(self):
+        """Safety net behind the policy: an invalid result must not reach disk."""
+        original = self.database.read_text(encoding="utf-8")
+        broken = ValidationResult()
+        broken.errors.append("boom")
+        with mock.patch("sync_vorobey_hackerpolice.validate", side_effect=[ValidationResult(), broken]):
+            code, _, stderr = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 2)
+        self.assertIn("the synced playerlist is invalid", stderr)
+        self.assertEqual(self.database.read_text(encoding="utf-8"), original)
+
+    def test_the_entry_point_runs_as_a_command(self):
+        """Exactly how the workflow calls it: ``python3 scripts/<tool>.py``."""
+        script = Path(__file__).resolve().parents[1] / "scripts" / "sync_vorobey_hackerpolice.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "--version"], capture_output=True, text=True, timeout=60, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sync_vorobey_hackerpolice.py", result.stdout)
+
+    def test_snapshot_must_not_be_the_database(self):
+        code, _, stderr = self.run_cli("--source", str(self.source), "--snapshot", str(self.database))
+        self.assertEqual(code, 2)
+        self.assertIn("must be different files", stderr)
+
+    def test_quiet_keeps_the_progress_log_off_the_console(self):
+        code, stdout, stderr = self.run_cli("--source", str(self.source), "-q")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr.strip(), "")  # no "Indexed ..."/"Updated ..." noise
+        self.assertIn("Vorobey hackerpolice sync", stdout)  # the report is still printed
+
+    def test_an_interrupted_run_exits_130(self):
+        with mock.patch("sync_vorobey_hackerpolice.run", side_effect=KeyboardInterrupt):
+            code, _, stderr = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", stderr)
+
+    def test_an_invalid_database_is_refused_with_the_reason(self):
+        self.database.write_text(
+            dumps({"$schema": "x", "file_info": {}, "players": [player("[U:1:100]", ["cheater"])] * 2}),
+            encoding="utf-8",
+        )
+        code, _, stderr = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 2)
+        self.assertIn("duplicate steamid", stderr)
+
+    def test_unknown_attributes_are_kept_and_only_warned_about(self):
+        self.database.write_text(
+            dumps({"$schema": "x", "file_info": {}, "players": [player("[U:1:999]", ["scammer"])]}),
+            encoding="utf-8",
+        )
+        code, _, stderr = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 0)  # a warning must not block the run
+        self.assertIn("unknown attribute 'scammer'", stderr)
+        self.assertEqual(json.loads(self.database.read_text(encoding="utf-8"))["players"][0]["attributes"], ["scammer"])
 
     def test_dry_run_does_not_write(self):
         original = self.database.read_text(encoding="utf-8")
@@ -1762,6 +1967,36 @@ class SerialisationTests(unittest.TestCase):
 
             with self.assertRaises(PlayerListError):
                 load(Path(tmp) / "missing.json")
+
+
+class PlayerlistEdgeCaseTests(unittest.TestCase):
+    def test_a_json_array_is_not_a_playerlist(self):
+        path = Path(tempfile.mkdtemp()) / "list.json"
+        self.addCleanup(shutil.rmtree, path.parent)
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+        with self.assertRaises(PlayerListError) as caught:
+            load(path)
+        self.assertIn("does not contain a JSON object", str(caught.exception))
+
+    def test_a_non_object_player_is_an_error(self):
+        result = validate({"players": [1, "x", None]})
+        self.assertEqual(len(result.errors), 3)
+        self.assertIn("players[0] is not an object", result.errors[0])
+        self.assertFalse(result)  # errors make the result falsy
+
+    def test_a_clean_result_is_truthy(self):
+        self.assertTrue(validate({"players": [player("[U:1:100]", ["cheater"])]}))
+
+    def test_a_bare_integer_is_an_account_id_or_a_steamid64(self):
+        self.assertEqual(account_id(1730017), 1730017)
+        self.assertEqual(account_id(76561198229593388), 269327660)
+        self.assertIsNone(account_id(True))
+
+    def test_a_player_without_last_seen_has_no_name(self):
+        from playerlist import player_name
+
+        self.assertEqual(player_name({"steamid": "[U:1:100]"}), "")
+        self.assertEqual(player_name({"last_seen": {"player_name": "a"}}), "a")
 
 
 class ValidateTests(unittest.TestCase):

@@ -83,6 +83,15 @@ class SyncError(Exception):
     """A user-facing failure (bad input, unreachable source) rather than a bug."""
 
 
+def is_url(source: str) -> bool:
+    """True for an ``http(s)`` URL, False for a local path.
+
+    The scheme is case-insensitive (``HTTPS://…`` is a URL, not a filename),
+    and the ``://`` keeps a path like ``httpdocs/list.json`` a path.
+    """
+    return source.lower().startswith(("http://", "https://"))
+
+
 @dataclass(frozen=True)
 class HackerpoliceIndex:
     """Vorobey entries keyed by canonical SteamID."""
@@ -155,7 +164,7 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
 
 def _http_get(url: str, timeout: int) -> bytes:
     """One GET, returning the body bytes VERBATIM (no decoding, no newline fixes)."""
-    if not url.startswith(("https://", "http://")):
+    if not is_url(url):
         raise SyncError(f"refusing to fetch non-HTTP(S) URL: {url}")
     headers = {"User-Agent": USER_AGENT}
     # Hostname comparison, not a substring match: a look-alike URL such as
@@ -230,15 +239,6 @@ def _read_local_bytes(path: Path) -> bytes:
         return path.read_bytes()
     except OSError as exc:
         raise SyncError(f"cannot read {path}: {exc}") from exc
-
-
-def is_url(source: str) -> bool:
-    """True for an ``http(s)`` URL, False for a local path.
-
-    The scheme is case-insensitive (``HTTPS://…`` is a URL, not a filename),
-    and the ``://`` keeps a path like ``httpdocs/list.json`` a path.
-    """
-    return source.lower().startswith(("http://", "https://"))
 
 
 def _read_bytes(source: str) -> bytes:

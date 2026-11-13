@@ -412,11 +412,7 @@ def render_report(info: RunInfo) -> str:
     # describe the Vorobey list rather than this database's changes.
     if removed_lines:
         lines += removed_lines
-    # Every section ends with a blank line; keep exactly one before the
-    # closing sentence rather than stacking them.
-    if lines and lines[-1] != "":
-        lines.append("")
-    while len(lines) > 1 and lines[-1] == "" and lines[-2] == "":
-        lines.pop()
+    # Every section above ends with exactly one blank line, so the closing
+    # sentence and its notes follow directly.
     lines += _footnotes(info, promotions)
     return _safe("\n".join(lines))
