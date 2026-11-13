@@ -14,6 +14,12 @@ replica, never decoded/re-serialised) in the same working tree,
 so the workflow commits both files in one pull request and the baseline
 only advances when that PR is merged.
 
+The report also lists every SteamID that disappeared from the upstream
+list since the previous snapshot in a ``SteamID | Profile Link`` table.
+That diff describes the Vorobey list itself, so it is shown whether or not
+``--demote`` is enabled -- and, because the Vorobey list stores no player
+names, the profile permalink is the only human-readable identifier there.
+
 Usage:
     python3 scripts/sync_vorobey_hackerpolice.py --dry-run
     python3 scripts/sync_vorobey_hackerpolice.py --report out.md
@@ -268,13 +274,19 @@ def run(args: argparse.Namespace) -> int:
     previous_index, previous_bytes = snapshot if snapshot is not None else (None, None)
     removed: set[str] = set()
     removed_count = 0
+    # Every SteamID the current list no longer contains, compared to the
+    # previous snapshot. Reported in the PR as a table (with profile links)
+    # whether or not --demote is used: it describes the upstream list, not
+    # what this database did, and the Vorobey list stores no names.
+    removed_from_source: set[str] = set()
     # Snapshot diff vs. the previous snapshot, independent of --demote: how
     # many IDs the refreshed snapshot gains/loses. With no snapshot yet,
     # every current ID counts as newly added (initial snapshot).
     added_count = len(index.by_steamid)
     if previous_index is not None:
         added_count = len(added_steamids(previous_index, index))
-        removed_count = len(removed_steamids(previous_index, index))
+        removed_from_source = removed_steamids(previous_index, index)
+        removed_count = len(removed_from_source)
         LOGGER.info(
             "Snapshot diff vs. previous snapshot: %d SteamIDs added, %d removed (%d -> %d entries).",
             added_count,
@@ -291,7 +303,7 @@ def run(args: argparse.Namespace) -> int:
             demotion_note = f"skipped - no snapshot at {snapshot_path} yet, so no removal can be proven"
             LOGGER.warning("Demotion %s.", demotion_note)
         else:
-            removed = removed_steamids(previous_index, index)
+            removed = removed_from_source
             removed_count = len(removed)
             LOGGER.info(
                 "%d SteamIDs removed upstream since the snapshot (%d entries).",
@@ -337,6 +349,7 @@ def run(args: argparse.Namespace) -> int:
             previous_source_total=len(previous_index.by_steamid) if previous_index is not None else None,
             added_to_source=added_count,
             removed_from_source=removed_count,
+            removed_upstream=tuple(removed_from_source),
             demotion_note=demotion_note,
             snapshot_changed=snapshot_changed,
         )

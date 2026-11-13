@@ -10,6 +10,10 @@ name: Sync Vorobey hackerpolice
 # and have since been removed from the hackerpolice list:
 #   * "cheater" + "racist"     -> only "cheater" is removed ("racist" kept)
 #   * "cheater" alone          -> whole entry is removed
+# The pull request body also lists every SteamID that disappeared from the
+# hackerpolice list since the previous snapshot, as a | SteamID | Profile Link |
+# table (the Vorobey list stores no names, so the Steam profile is the only
+# identifier available), whether or not a database entry was affected.
 # Cheaters that were never on the hackerpolice list (added manually) are
 # never demoted. Everything else is never touched, and the hackerpolice proof
 # links are shown in the pull request only - they are never written into

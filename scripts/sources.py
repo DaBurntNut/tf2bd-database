@@ -41,7 +41,7 @@ DEFAULT_SOURCES: tuple[str, ...] = (
 )
 
 # Single source of truth for the tool version (also used for --version).
-VERSION = "3.3"
+VERSION = "3.4"
 
 USER_AGENT = (
     f"Garou3299-tf2bd-database-vorobey-hackerpolice-sync/{VERSION} (+https://github.com/Garou3299/tf2bd-database)"

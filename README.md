@@ -48,6 +48,22 @@ pull request is merged.**
 Players who were added to this database and were never on
 Vorobey's list are **never** demoted or removed by the bot.
 
+### Report who was removed from Vorobey's list
+
+Every pull request also lists the SteamIDs that disappeared from Vorobey's
+list since the previous snapshot. Vorobey's list stores no player names, so
+the table only has the SteamID and a link to the Steam profile:
+
+| SteamID | Profile Link |
+| --- | --- |
+| `[U:1:269327660]` | [profile](https://steamcommunity.com/profiles/76561198229593388) |
+
+This is the raw snapshot diff: it is shown whether or not `--demote` is
+enabled, and it includes IDs this database never contained (those produce no
+database change, they were simply dropped upstream). Very large diffs are
+truncated after 200 rows to keep the pull request readable — the snapshot
+file's own diff still shows every removed SteamID.
+
 ### Update the Vorobey database copy
 
 | File | What the bot does |

@@ -11,11 +11,19 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from playerlist import steam_profile_url
+from playerlist import account_id, steam_profile_url
 from policy import Change
 from sources import SOURCE_REPO_URL
 
-__all__ = ["RunInfo", "plural", "render_closing", "render_report"]
+__all__ = ["MAX_REMOVED_ROWS", "RunInfo", "plural", "render_closing", "render_report"]
+
+# Cap on the "removed from the Vorobey list" table. A normal run removes a
+# handful of IDs, but a mass upstream change (or a forced
+# --allow-mass-demotion run) can remove thousands: the table would then blow
+# past GitHub's ~64k pull request body limit. The snapshot file committed in
+# the same pull request still shows every removal in its own diff, so the
+# table is truncated with a pointer there instead of breaking the body.
+MAX_REMOVED_ROWS = 200
 
 # Characters that would break a Markdown link target.
 _LINK_ESCAPES = str.maketrans({"(": "%28", ")": "%29", " ": "%20", "<": "%3C", ">": "%3E", "\n": "%0A", "\r": "%0D"})
@@ -82,6 +90,56 @@ def plural(count: int, singular: str, plural_form: str) -> str:
     return singular if count == 1 else plural_form
 
 
+def _sorted_steamids(steamids: Sequence[str]) -> list[str]:
+    """Canonical SteamIDs in numeric order, unusable ones last and stable.
+
+    Plain string sorting would order ``[U:1:100]`` before ``[U:1:99]``.
+    """
+
+    def key(steamid: str) -> tuple[bool, int]:
+        account = account_id(steamid)
+        return (account is None, account or 0)
+
+    return sorted(steamids, key=key)
+
+
+def _removed_section(removed: Sequence[str]) -> list[str]:
+    """Table of SteamIDs the Vorobey list dropped since the previous snapshot.
+
+    The Vorobey list stores no player names (only ``steamid``/``proof``/
+    ``last_seen``), so a SteamID cannot be labelled with a name -- the Steam
+    profile permalink is the only human-readable identifier available. This
+    is the raw snapshot diff, independent of ``--demote``: every ID listed
+    here disappeared upstream, whether or not this database contained it.
+    """
+    if not removed:
+        return []
+    ordered = _sorted_steamids(removed)
+    count = len(ordered)
+    shown = ordered[:MAX_REMOVED_ROWS]
+    lines = [
+        f"**{count} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey list "
+        "since the previous snapshot.**",
+        "",
+        "The Vorobey list records no player names, so these are SteamIDs only.",
+        "",
+        "| SteamID | Profile Link |",
+        "| --- | --- |",
+    ]
+    for steamid in shown:
+        url = steam_profile_url(steamid)
+        link = f"[profile]({url.translate(_LINK_ESCAPES)})" if url else "-"
+        lines.append(f"| `{_cell(steamid)}` | {link} |")
+    lines.append("")
+    if count > len(shown):
+        lines += [
+            f"…and {count - len(shown)} more {plural(count - len(shown), 'SteamID', 'SteamIDs')} "
+            "(the snapshot diff in this pull request lists every one).",
+            "",
+        ]
+    return lines
+
+
 def render_closing(changes: Sequence[Change]) -> str:
     """Build the present-tense closing sentence describing what changed.
 
@@ -122,6 +180,9 @@ class RunInfo:
     previous_source_total: int | None = None
     added_to_source: int = 0
     removed_from_source: int = 0
+    # The SteamIDs behind removed_from_source, listed in a table so reviewers
+    # can open the profile of every player Vorobey dropped.
+    removed_upstream: tuple[str, ...] = ()
     demotion_note: str | None = None
     # True when the snapshot file itself was refreshed this run, so a
     # snapshot-only PR does not misleadingly report "No changes."
@@ -177,12 +238,16 @@ def render_report(info: RunInfo) -> str:
 
     promotions = [c for c in info.changes if c.kind == "promote"]
     demotions = [c for c in info.changes if c.kind == "demote"]
+    removed_lines = _removed_section(info.removed_upstream)
 
     if not promotions and not demotions:
         if info.snapshot_changed:
             lines += ["**No database changes** (snapshot refresh only).", ""]
         else:
             lines += ["**No changes.**", ""]
+        # Still worth reporting: removals upstream that this database never
+        # listed produce no demotion but are part of the snapshot diff.
+        lines += removed_lines
         return _safe("\n".join(lines))
 
     if promotions:
@@ -227,7 +292,11 @@ def render_report(info: RunInfo) -> str:
 
     closing = render_closing(info.changes)
 
-    lines += ["", closing]
+    if removed_lines:
+        lines += removed_lines  # the last change table already ended with a blank line
+        lines.append(closing)
+    else:
+        lines += ["", closing]
     if promotions:
         total_links = sum(len(change.evidence) for change in promotions)
         if total_links == 1:

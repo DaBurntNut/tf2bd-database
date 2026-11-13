@@ -41,7 +41,7 @@ from playerlist import (
     validate,
 )
 from policy import Change, demote, promote, sync
-from report import RunInfo, plural, render_closing, render_report
+from report import MAX_REMOVED_ROWS, RunInfo, plural, render_closing, render_report
 from sources import (
     PROOF_MARKER,
     HackerpoliceIndex,
@@ -653,6 +653,50 @@ class ReportTests(unittest.TestCase):
         self.assertIn("**dry run**", report)
         self.assertIn("`--include-proof` was enabled", report)
 
+    def test_removed_steamids_are_tabulated_with_profile_links(self):
+        # The Vorobey list stores no names, so the table only has the SteamID
+        # and a link to the profile permalink -- sorted numerically, not
+        # lexicographically ([U:1:99] must come before [U:1:100]).
+        report = render_report(self.info(removed_upstream=("[U:1:100]", "[U:1:269327660]", "[U:1:99]")))
+        self.assertIn("**3 SteamIDs removed from the Vorobey list since the previous snapshot.**", report)
+        self.assertIn("records no player names", report)
+        self.assertIn(
+            "| SteamID | Profile Link |\n| --- | --- |\n"
+            "| `[U:1:99]` | [profile](https://steamcommunity.com/profiles/76561197960265827) |\n"
+            "| `[U:1:100]` | [profile](https://steamcommunity.com/profiles/76561197960265828) |\n"
+            "| `[U:1:269327660]` | [profile](https://steamcommunity.com/profiles/76561198229593388) |\n",
+            report,
+        )
+        self.assertNotIn("Last known name", report)
+
+    def test_removed_steamid_singular_and_absent_when_empty(self):
+        self.assertIn(
+            "**1 SteamID removed from the Vorobey list since the previous snapshot.**",
+            render_report(self.info(removed_upstream=("[U:1:1]",))),
+        )
+        # Nothing removed -> no table at all (not an empty one).
+        for kwargs in ({}, {"previous_source_total": 100, "removed_from_source": 0}):
+            self.assertNotIn("Profile Link", render_report(self.info(**kwargs)))
+
+    def test_removed_steamids_are_reported_even_without_database_changes(self):
+        # Removals of IDs this database never listed cause no demotion, but
+        # they are still part of the snapshot diff and must be visible.
+        report = render_report(
+            self.info(
+                previous_source_total=100, removed_from_source=1, removed_upstream=("[U:1:7]",), snapshot_changed=True
+            )
+        )
+        self.assertIn("**No database changes** (snapshot refresh only).", report)
+        self.assertIn("| `[U:1:7]` | [profile](https://steamcommunity.com/profiles/76561197960265735) |", report)
+
+    def test_removed_table_is_capped_so_the_pr_body_cannot_explode(self):
+        removed = tuple(f"[U:1:{account}]" for account in range(1, MAX_REMOVED_ROWS + 6))
+        report = render_report(
+            self.info(previous_source_total=10000, removed_from_source=len(removed), removed_upstream=removed)
+        )
+        self.assertEqual(report.count("| [profile]("), MAX_REMOVED_ROWS)
+        self.assertIn("…and 5 more SteamIDs (the snapshot diff in this pull request lists every one).", report)
+
 
 # --------------------------------------------------------------------------- #
 # Closing message rendering
@@ -840,6 +884,24 @@ class CliTests(unittest.TestCase):
             "- Snapshot diff: **2 new SteamIDs added**, **2 SteamIDs removed** (2 → 2 entries; net +0)",
             stdout,
         )
+
+    def test_removed_ids_are_tabulated_in_the_report_even_without_demote(self):
+        """The PR must show WHO Vorobey dropped, not just how many.
+
+        The Vorobey list has no names, so each removed SteamID is listed with
+        a profile link. This is the snapshot diff and is shown whether or not
+        --demote was requested (here it was not).
+        """
+        self.write_snapshot_fixture(hackerpolice_entry("[U:1:300]"), hackerpolice_entry("[U:1:400]"))
+        report_file = self.root / "r.md"
+        code, stdout, _ = self.run_cli("--source", str(self.source), "--report", str(report_file))
+        self.assertEqual(code, 0)
+        report = report_file.read_text(encoding="utf-8")
+        self.assertIn("removed from the Vorobey list", stdout)  # job summary gets it too
+        self.assertIn("**2 SteamIDs removed from the Vorobey list since the previous snapshot.**", report)
+        self.assertIn("| `[U:1:300]` | [profile](https://steamcommunity.com/profiles/76561197960266028) |", report)
+        self.assertIn("| `[U:1:400]` | [profile](https://steamcommunity.com/profiles/76561197960266128) |", report)
+        self.assertNotIn("demoted", report)
 
     def test_demote_without_snapshot_demotes_nobody_and_creates_baseline(self):
         self.database.write_text(
