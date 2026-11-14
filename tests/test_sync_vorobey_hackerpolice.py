@@ -28,6 +28,7 @@ import urllib.error
 import urllib.request
 from email.message import Message
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -481,6 +482,98 @@ class SourceFetchTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Promotion policy
 # --------------------------------------------------------------------------- #
+class MassDemotionGuardTests(unittest.TestCase):
+    """The two thresholds that stop a broken upstream list from un-banning everyone.
+
+    Both operands matter: the absolute floor (more than 50 IDs) and the
+    fraction (more than 20% of the snapshot). An inverted comparison in either
+    one would either let a mass unban through or block every ordinary removal.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def quiet():
+        """Silence the policy's logging; these tests assert on what it returns."""
+        with mock.patch.object(sync_module.LOGGER, "info"), mock.patch.object(sync_module.LOGGER, "warning"):
+            yield
+
+    def plan(self, removed_count, snapshot_entries, *, demote=True, allow=False, no_update=False):
+        args = SimpleNamespace(demote=demote, allow_mass_demotion=allow, no_update_snapshot=no_update)
+        previous = index_of(*[hackerpolice_entry(f"[U:1:{1000 + n}]") for n in range(snapshot_entries)])
+        removed = {f"[U:1:{1000 + n}]" for n in range(removed_count)}
+        with self.quiet():
+            return sync_module._plan_demotion(args, previous, removed, Path("snapshot.json"))
+
+    def test_exactly_fifty_removals_are_not_a_mass_removal(self):
+        # 50 of 100 is 50% of the snapshot, but the floor is "more than 50".
+        removed, update_snapshot, note, _ = self.plan(50, 100)
+        self.assertEqual(len(removed), 50)
+        self.assertTrue(update_snapshot)
+        self.assertIsNone(note)
+
+    def test_fifty_one_removals_trip_the_guard(self):
+        removed, update_snapshot, note, snapshot_note = self.plan(51, 100)
+        self.assertEqual(removed, set())
+        self.assertFalse(update_snapshot)
+        self.assertIn("disappeared upstream at once", note)
+        self.assertIn("not refreshed", snapshot_note)
+
+    def test_many_removals_from_a_large_snapshot_are_normal(self):
+        # 100 IDs is above the floor, but only 10% of 1000: real drift, not a break.
+        removed, update_snapshot, note, _ = self.plan(100, 1000)
+        self.assertEqual(len(removed), 100)
+        self.assertTrue(update_snapshot)
+        self.assertIsNone(note)
+
+    def test_the_fraction_threshold_alone_can_trip_the_guard(self):
+        # 201 of 1000 is just over 20%.
+        removed, update_snapshot, note, _ = self.plan(201, 1000)
+        self.assertEqual(removed, set())
+        self.assertFalse(update_snapshot)
+        self.assertIn("disappeared upstream at once", note)
+
+    def test_exactly_twenty_percent_does_not_trip_the_guard(self):
+        removed, update_snapshot, _, note = self.plan(200, 1000)
+        self.assertEqual(len(removed), 200)
+        self.assertTrue(update_snapshot)
+        self.assertIsNone(note)
+
+    def test_the_override_forces_a_mass_removal_through(self):
+        removed, update_snapshot, note, _ = self.plan(51, 100, allow=True)
+        self.assertEqual(len(removed), 51)
+        self.assertTrue(update_snapshot)
+        self.assertIsNone(note)
+
+    def test_demotion_without_a_snapshot_cannot_prove_anything(self):
+        args = SimpleNamespace(demote=True, allow_mass_demotion=False, no_update_snapshot=False)
+        with self.quiet():
+            removed, update_snapshot, note, _ = sync_module._plan_demotion(
+                args, None, {"[U:1:1]"}, Path("snapshot.json")
+            )
+        self.assertEqual(removed, set())
+        self.assertTrue(update_snapshot)
+        self.assertIn("no snapshot at snapshot.json", note)
+
+    def test_demotion_disabled_keeps_the_baseline(self):
+        removed, update_snapshot, note, snapshot_note = self.plan(3, 10, demote=False)
+        self.assertEqual(removed, set())
+        self.assertFalse(update_snapshot)
+        self.assertIsNone(note)
+        self.assertIn("demotion is disabled", snapshot_note)
+
+    def test_no_update_snapshot_is_reported(self):
+        _, update_snapshot, _, snapshot_note = self.plan(0, 10, demote=False, no_update=True)
+        self.assertFalse(update_snapshot)
+        self.assertIn("--no-update-snapshot", snapshot_note)
+
+    def test_pending_removals_are_the_more_useful_reason_to_show(self):
+        # With both --no-update-snapshot and unapplied removals, the report
+        # names the removals: that is the information the reviewer needs.
+        _, update_snapshot, _, snapshot_note = self.plan(1, 10, demote=False, no_update=True)
+        self.assertFalse(update_snapshot)
+        self.assertIn("could not be applied", snapshot_note)
+
+
 class WriteSnapshotTests(unittest.TestCase):
     """write_snapshot()'s return value becomes the workflow's step output."""
 

@@ -254,18 +254,19 @@ def _same_file(first: Path, second: Path) -> bool:
         return False
 
 
-def run(args: argparse.Namespace) -> int:
-    """Do the work; returns the process exit code."""
+def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    """Refuse any arrangement where the tool would overwrite its own inputs.
+
+    All three checks exist because each one is a real way to lose the
+    database: the report is written before the database, so an aliased report
+    path would destroy it, and a --source pointing at the database would
+    compare the file with itself and then rewrite it.
+    """
     database_path = Path(args.database)
     snapshot_path = Path(args.snapshot)
     if _same_file(snapshot_path, database_path):
         raise SyncError("--snapshot and --database must be different files")
     if args.report:
-        # The report is written BEFORE the database/snapshot, so a report
-        # path aliasing one of them would destroy it: when nothing else
-        # changes, nothing would ever rewrite the real content back (and a
-        # dry run would corrupt the database while claiming to write
-        # nothing). Refuse aliased paths outright.
         report_path = Path(args.report)
         protected = [database_path, snapshot_path]
         protected += [Path(source) for source in args.source or [] if not source.startswith(("http://", "https://"))]
@@ -273,11 +274,12 @@ def run(args: argparse.Namespace) -> int:
             raise SyncError("--report must not be the same file as --database, --snapshot, or a local --source")
     for source in args.source or []:
         if not source.startswith(("http://", "https://")) and _same_file(Path(source), database_path):
-            # Reading the database as its own "upstream" would compare a file
-            # with itself and then rewrite it: refuse the mistake outright.
             raise SyncError("--source must not be the same file as --database")
-    database, original = load_database(database_path)
+    return database_path, snapshot_path
 
+
+def _load_index(args: argparse.Namespace) -> tuple[HackerpoliceIndex, str, bytes]:
+    """Fetch the upstream list and index it, refusing an empty result."""
     source_document, source, source_bytes = load_first_available_raw(args.source or DEFAULT_SOURCES)
     index = HackerpoliceIndex.build(source_document)
     LOGGER.info("Indexed %d Vorobey hackerpolice SteamIDs (%d unusable).", len(index.by_steamid), index.skipped)
@@ -285,37 +287,28 @@ def run(args: argparse.Namespace) -> int:
         # An empty/unusable upstream list is a broken fetch, not a mass
         # unban: never promote, demote, or overwrite the snapshot from it.
         raise SyncError("the Vorobey hackerpolice list contains no usable SteamIDs, nothing was written")
+    return index, source, source_bytes
 
-    # --- Demotion baseline: previous snapshot vs. current list --------------
-    snapshot = load_snapshot(snapshot_path)
-    previous_index, previous_bytes = snapshot if snapshot is not None else (None, None)
-    removed: set[str] = set()
-    # The same information, kept even when the mass-demotion guard vetoes
-    # demotion: the report shows every ID that really did disappear upstream.
-    removed_upstream: set[str] = set()
-    removed_count = 0
-    # Snapshot diff vs. the previous snapshot, independent of --demote: how
-    # many IDs the refreshed snapshot gains/loses. With no snapshot yet,
-    # every current ID counts as newly added (initial snapshot).
-    added_count = len(index.by_steamid)
-    if previous_index is not None:
-        added_count = len(added_steamids(previous_index, index))
-        removed_upstream = removed_steamids(previous_index, index)
-        removed_count = len(removed_upstream)
-        LOGGER.info(
-            "Snapshot diff vs. previous snapshot: %d SteamIDs added, %d removed (%d -> %d entries).",
-            added_count,
-            removed_count,
-            len(previous_index.by_steamid),
-            len(index.by_steamid),
-        )
+
+def _plan_demotion(
+    args: argparse.Namespace,
+    previous_index: HackerpoliceIndex | None,
+    removed_upstream: set[str],
+    snapshot_path: Path,
+) -> tuple[set[str], bool, str | None, str | None]:
+    """Decide what may be demoted, and whether the baseline may advance.
+
+    Returns ``(removed, update_snapshot, demotion_note, snapshot_note)``. The
+    snapshot is held back whenever removals could not be applied, so a
+    skipped removal is never silently forgotten.
+    """
     demotion_note: str | None = None
     # Set to False when demotion was skipped as unsafe: the snapshot must
     # NOT advance then, or the skipped removals would be lost forever.
     update_snapshot = not args.no_update_snapshot
-    snapshot_note: str | None = None
-    if args.no_update_snapshot:
-        snapshot_note = "**not refreshed** (`--no-update-snapshot`)"
+    snapshot_note: str | None = "**not refreshed** (`--no-update-snapshot`)" if args.no_update_snapshot else None
+    removed: set[str] = set()
+
     if args.demote:
         if previous_index is None:
             demotion_note = f"skipped - no snapshot at {snapshot_path} yet, so no removal can be proven"
@@ -356,6 +349,39 @@ def run(args: argparse.Namespace) -> int:
             "Snapshot left alone: demotion is disabled and %d upstream removals are pending.", len(removed_upstream)
         )
 
+    return removed, update_snapshot, demotion_note, snapshot_note
+
+
+def run(args: argparse.Namespace) -> int:
+    """Do the work; returns the process exit code."""
+    database_path, snapshot_path = _guard_paths(args)
+    database, original = load_database(database_path)
+    index, source, source_bytes = _load_index(args)
+
+    # --- Demotion baseline: previous snapshot vs. current list --------------
+    snapshot = load_snapshot(snapshot_path)
+    previous_index, previous_bytes = snapshot if snapshot is not None else (None, None)
+    # Snapshot diff vs. the previous snapshot, independent of --demote: how
+    # many IDs the refreshed snapshot gains/loses. With no snapshot yet,
+    # every current ID counts as newly added (initial snapshot).
+    added_count = len(index.by_steamid)
+    removed_upstream: set[str] = set()
+    removed_count = 0
+    if previous_index is not None:
+        added_count = len(added_steamids(previous_index, index))
+        removed_upstream = removed_steamids(previous_index, index)
+        removed_count = len(removed_upstream)
+        LOGGER.info(
+            "Snapshot diff vs. previous snapshot: %d SteamIDs added, %d removed (%d -> %d entries).",
+            added_count,
+            removed_count,
+            len(previous_index.by_steamid),
+            len(index.by_steamid),
+        )
+
+    removed, update_snapshot, demotion_note, snapshot_note = _plan_demotion(
+        args, previous_index, removed_upstream, snapshot_path
+    )
     changes = sync(database, index, include_proof=args.include_proof, enable_demote=args.demote, removed_ids=removed)
 
     result = validate(database)
@@ -401,12 +427,12 @@ def run(args: argparse.Namespace) -> int:
     # merges the changes it produced. The order matters: if the process dies
     # between the two writes, a stale snapshot only makes the next run
     # re-evaluate removals that are already applied (a no-op), whereas a
-    # fresh snapshot with an unwritten database would lose them forever. The snapshot refresh happens on every
-    # run, even if the Garou database itself did not change, so a run whose
-    # only change is the snapshot still opens a snapshot-only PR. Exception:
-    # when demotion was skipped as unsafe (mass-demotion guard),
-    # update_snapshot is False and the snapshot is left alone so the same
-    # removals are re-evaluated next run.
+    # fresh snapshot with an unwritten database would lose them forever. The
+    # snapshot refresh happens on every run, even if the Garou database
+    # itself did not change, so a run whose only change is the snapshot still
+    # opens a snapshot-only PR. Exception: when demotion was skipped as unsafe
+    # (mass-demotion guard), update_snapshot is False and the snapshot is left
+    # alone so the same removals are re-evaluated next run.
     write_database(database_path, rendered, original, dry_run=args.dry_run)
     _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
     if update_snapshot:
