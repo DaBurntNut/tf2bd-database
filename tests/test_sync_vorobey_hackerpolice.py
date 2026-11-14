@@ -1677,7 +1677,7 @@ class ReportTests(unittest.TestCase):
             "| `[U:1:1]` | [cheater \\| with pipe](https://steamcommunity.com/profiles/76561197960265729) |",
             report,
         )
-        self.assertIn(f"[link]({HACKERPOLICE_PROOF})", report)
+        self.assertIn(f"[proof]({HACKERPOLICE_PROOF})", report)
         self.assertIn("Proof link comes from the Vorobey hackerpolice list", report)
 
     def test_name_links_to_the_steam_profile_permalink(self):
@@ -1723,7 +1723,7 @@ class ReportTests(unittest.TestCase):
         with_links = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://x/1", "https://x/2"))
         without_links = Change("[U:1:2]", "b", ("suspicious",), ("cheater",))
         report = render_report(self.info([with_links, without_links]))
-        self.assertIn("[link 1](https://x/1), [link 2](https://x/2)", report)
+        self.assertIn("[proof 1](https://x/1), [proof 2](https://x/2)", report)
         self.assertIn("**2 entries promoted to `cheater`.**", report)
 
     def test_report_never_emits_raw_html(self):
@@ -1738,7 +1738,7 @@ class ReportTests(unittest.TestCase):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("seen spinbotting",))
         report = render_report(self.info([change]))
         self.assertIn("| seen spinbotting |", report)
-        self.assertNotIn("[link](seen spinbotting)", report)
+        self.assertNotIn("[proof](seen spinbotting)", report)
 
     def test_link_targets_are_escaped(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://example.invalid/a (b)",))
