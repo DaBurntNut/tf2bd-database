@@ -33,7 +33,7 @@ from sources import SOURCE_REPO_URL, redact_url
 __all__ = [
     "MAX_CHANGE_TABLE_ROWS",
     "MAX_REMOVED_TABLE_ROWS",
-    "MAX_REPORT_CHARS",
+    "MAX_REPORT_BYTES",
     "RunInfo",
     "plural",
     "render_closing",
@@ -47,7 +47,11 @@ __all__ = [
 # size -- however big a single run turns out to be.
 MAX_CHANGE_TABLE_ROWS = 150
 MAX_REMOVED_TABLE_ROWS = 100
-MAX_REPORT_CHARS = 60_000
+# GitHub rejects a pull request body over 65,536 BYTES, and the body doubles
+# as the job summary, so the budget is measured in bytes with room to spare.
+# Characters would be the wrong unit: 30,000 Cyrillic player names are half the
+# character budget and twice the byte budget.
+MAX_REPORT_BYTES = 60_000
 
 # Characters that would break a Markdown link target.
 # "|" is percent-encoded too: a raw pipe inside a table cell ends the cell, so a
@@ -245,9 +249,12 @@ def render_removed_table(steamids: Sequence[str]) -> list[str]:
     count = len(ordered)
     rows = [f"| {_steamid_cell(steamid)} | {_profile_cell(steamid)} |" for steamid in ordered]
     rows, overflow = _capped(rows, MAX_REMOVED_TABLE_ROWS, "SteamID", "SteamIDs")
-    return [
+    headline = (
         f"**{_count(count)} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey hackerpolice list "
-        "since the previous snapshot.**",
+        "since the previous snapshot.**"
+    )
+    return [
+        headline,
         "",
         *_table(REMOVED_HEADER, rows, overflow),
         "",
@@ -433,28 +440,50 @@ def _demotion_lines(demotions: Sequence[Change]) -> list[str]:
     ]
     rows, overflow = _capped(rows, MAX_CHANGE_TABLE_ROWS, "entry", "entries")
     count = len(demotions)
-    return [
+    headline = (
         f"**{_count(count)} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
-        "removed from the hackerpolice list since).**",
+        "removed from the hackerpolice list since).**"
+    )
+    return [
+        headline,
         "",
         *_table(DEMOTION_HEADER, rows, overflow),
         "",
     ]
 
 
+def _utf8_len(text: str) -> int:
+    """UTF-8 length of the text, counting (never raising on) lone surrogates.
+
+    ``_fit_body`` runs before ``_safe`` replaces lone surrogates, so the
+    measurement must not choke on them; "surrogatepass" gives each one the 3
+    bytes it will occupy once replaced by U+FFFD.
+    """
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def _truncate_to_bytes(text: str, limit: int) -> str:
+    """Longest prefix of ``text`` whose UTF-8 encoding fits in ``limit`` bytes."""
+    if limit <= 0:
+        return ""
+    return text.encode("utf-8", "surrogatepass")[:limit].decode("utf-8", "ignore")  # never a half character
+
+
 def _fit_body(text: str) -> str:
     """Hard-limit the body so publishing the pull request can never fail.
 
     The tables are already capped; this is the last-resort guard for a run
-    with pathological input (very long names/proofs). It cuts on a line
+    with pathological input (very long names/proofs). The budget is measured
+    in BYTES because that is what GitHub enforces -- measuring characters
+    would let a body of non-Latin names overflow the limit. It cuts on a line
     boundary and says so, instead of silently losing the tail.
     """
-    if len(text) <= MAX_REPORT_CHARS:
+    if _utf8_len(text) <= MAX_REPORT_BYTES:
         return text
     note = "\n\n… report truncated to fit the pull request body limit."
-    keep = MAX_REPORT_CHARS - len(note)
-    cut = text.rfind("\n", 0, keep)
-    return text[: cut if cut > 0 else keep] + note
+    keep = _truncate_to_bytes(text, MAX_REPORT_BYTES - _utf8_len(note))
+    cut = keep.rfind("\n")
+    return (keep[:cut] if cut > 0 else keep) + note
 
 
 def render_report(info: RunInfo) -> str:

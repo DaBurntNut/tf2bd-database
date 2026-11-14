@@ -136,7 +136,7 @@ def _write_github_outputs(**outputs: str | int | bool) -> None:
     if not path:
         return
     lines = [f"{key}={str(value).lower() if isinstance(value, bool) else value}" for key, value in outputs.items()]
-    with open(path, "a", encoding="utf-8") as handle:
+    with Path(path).open("a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
 
 

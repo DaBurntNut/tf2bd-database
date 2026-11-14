@@ -160,9 +160,9 @@ def _parse_document(raw: bytes, source: str) -> dict[str, Any]:
         document = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValueError) as exc:
         # ValueError: e.g. a JSON number beyond Python's int-parsing limit.
-        raise SyncError(f"{source} is not valid JSON: {exc}") from exc
+        raise SyncError(f"{redact_url(source)} is not valid JSON: {exc}") from exc
     if not isinstance(document, dict):
-        raise SyncError(f"{source} does not contain a JSON object")
+        raise SyncError(f"{redact_url(source)} does not contain a JSON object")
     return document
 
 
@@ -273,19 +273,24 @@ def _fetch_bytes(
 
 
 def _read_bytes(source: str) -> bytes:
-    """Return the raw bytes of an HTTP(S) URL or a local path, raising SyncError."""
+    """Return the raw bytes of an HTTP(S) URL or a local path, raising SyncError.
+
+    The size limit is enforced on the bytes ACTUALLY READ, not on the size the
+    filesystem reports: a file can grow between the two calls, and a special
+    file (a device, a fifo) reports 0 while yielding endless data. Reading at
+    most ``MAX_SOURCE_BYTES + 1`` bytes makes the local path obey exactly the
+    same budget as a download.
+    """
     if source.startswith(("http://", "https://")):
         return _fetch_bytes(source)
     try:
-        declared = Path(source).stat().st_size
+        with Path(source).open("rb") as handle:
+            raw = handle.read(MAX_SOURCE_BYTES + 1)
     except OSError as exc:
-        raise SyncError(f"cannot read {source}: {exc}") from exc
-    if declared > MAX_SOURCE_BYTES:
+        raise SyncError(f"cannot read {redact_url(source)}: {exc}") from exc
+    if len(raw) > MAX_SOURCE_BYTES:
         raise _too_large(source)
-    try:
-        return Path(source).read_bytes()
-    except OSError as exc:
-        raise SyncError(f"cannot read {source}: {exc}") from exc
+    return raw
 
 
 def _unwrap_github_contents_envelope(document: dict[str, Any]) -> bytes | None:
@@ -400,8 +405,8 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
             resolved = _resolve_indirect_document(document, source)
             if resolved is None:
                 failures.append(
-                    f"{source}: no 'players' array, and neither inline content, a usable HTTPS download_url "
-                    "nor a Git blob could be resolved"
+                    f"{redact_url(source)}: no 'players' array, and neither inline content, a usable HTTPS "
+                    "download_url nor a Git blob could be resolved"
                 )
                 continue
             document, raw = resolved

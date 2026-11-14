@@ -54,7 +54,7 @@ from policy import Change, demote, is_racist_proof, promote, sync
 from report import (
     MAX_CHANGE_TABLE_ROWS,
     MAX_REMOVED_TABLE_ROWS,
-    MAX_REPORT_CHARS,
+    MAX_REPORT_BYTES,
     RunInfo,
     plural,
     render_closing,
@@ -191,6 +191,25 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(sources.redact_url("https://u:secret@h.example/x?y=1"), "https://h.example/x?y=1")
         self.assertEqual(sources.redact_url("https://h.example:8443/x"), "https://h.example:8443/x")
         self.assertEqual(sources.redact_url("playerlist.garou3299.json"), "playerlist.garou3299.json")
+
+    def test_parse_errors_redact_credentials(self):
+        """A --source may carry a token; a bad document must not print it."""
+        url = "https://bot:ghp_secret@example.invalid/list.json"
+        with (
+            mock.patch("sources._OPENER.open", return_value=_FakeResponse(b"<html>")),
+            self.assertRaises(SyncError) as raised,
+        ):
+            load_first_available_raw([url])
+        self.assertNotIn("ghp_secret", str(raised.exception))
+        self.assertIn("https://example.invalid/list.json", str(raised.exception))
+
+        # Same for a document that parses but is not a JSON object.
+        with (
+            mock.patch("sources._OPENER.open", return_value=_FakeResponse(b"[]")),
+            self.assertRaises(SyncError) as raised,
+        ):
+            load_first_available_raw([url])
+        self.assertNotIn("ghp_secret", str(raised.exception))
 
     def test_fetch_errors_redact_credentials(self):
         """Failures are printed to a public Actions log: no tokens there."""
@@ -333,6 +352,13 @@ class SourceFetchTests(unittest.TestCase):
             path.write_bytes(b"x" * 4096)
             with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError):
                 load_first_available_raw([str(path)])
+
+    @unittest.skipUnless(Path("/dev/zero").exists(), "needs a zero-size endless file")
+    def test_special_file_reporting_zero_size_is_still_capped(self):
+        """/dev/zero reports st_size 0 but never ends: the cap must apply to bytes READ."""
+        with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError) as raised:
+            load_first_available_raw(["/dev/zero"])
+        self.assertIn("larger than the", str(raised.exception))
 
     def test_malformed_urls_are_clean_errors_not_crashes(self):
         # Bad IPv6 literals / control characters make urllib raise
@@ -1601,7 +1627,7 @@ class ReportTests(unittest.TestCase):
         """Pathological input (very long names) can never break PR creation."""
         changes = [Change(f"[U:1:{1000 + n}]", "x" * 900, ("suspicious",), ("cheater",)) for n in range(200)]
         report = render_report(self.info(changes, removed_upstream=tuple(f"[U:1:{5000 + n}]" for n in range(100))))
-        self.assertLessEqual(len(report), MAX_REPORT_CHARS)
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
         self.assertIn("report truncated to fit the pull request body limit", report)
         report.encode("utf-8")
 
@@ -1860,14 +1886,42 @@ class ReportBoundaryTests(unittest.TestCase):
         one_more = (*changes, Change(steamid="[U:1:999999]", name="x", before=("suspicious",), after=("cheater",)))
         self.assertIn("1 more entry not shown", render_report(self._info(changes=one_more)))
 
-    def test_body_exactly_at_the_character_limit_is_untouched(self):
-        text = "a" * MAX_REPORT_CHARS
+    def test_body_exactly_at_the_byte_limit_is_untouched(self):
+        text = "a" * MAX_REPORT_BYTES
         self.assertEqual(report_module._fit_body(text), text)
 
-    def test_truncation_keeps_content_when_the_cut_lands_on_the_first_newline(self):
-        text = "\n" + "b" * (MAX_REPORT_CHARS + 100)
+    def test_multi_byte_names_cannot_overflow_the_byte_budget(self):
+        """GitHub's limit is bytes: 30,000 Cyrillic characters are 60,000 bytes.
+
+        Measuring characters (the old behaviour) would have shipped a body
+        twice the allowed size for any database full of non-Latin names.
+        """
+        text = "\u044b" * (MAX_REPORT_BYTES + 1)
         fitted = report_module._fit_body(text)
-        self.assertLessEqual(len(fitted), MAX_REPORT_CHARS)
+        self.assertLessEqual(len(fitted.encode("utf-8")), MAX_REPORT_BYTES)
+        self.assertIn("report truncated to fit the pull request body limit", fitted)
+        # Exactly at the budget in bytes stays untouched.
+        exact = "\u044b" * (MAX_REPORT_BYTES // 2)
+        self.assertEqual(report_module._fit_body(exact), exact)
+
+    def test_truncation_helper_handles_a_zero_or_negative_budget(self):
+        self.assertEqual(report_module._truncate_to_bytes("abc", 0), "")
+        self.assertEqual(report_module._truncate_to_bytes("abc", -5), "")
+        # A negative limit must mean "nothing", not "drop that many bytes from the end".
+        self.assertEqual(report_module._truncate_to_bytes("abcdefghij", -1), "")
+        self.assertEqual(report_module._truncate_to_bytes("abc", 3), "abc")
+        self.assertEqual(report_module._truncate_to_bytes("\u044b\u044b", 1), "")  # cannot split a character
+
+    def test_truncation_survives_lone_surrogates(self):
+        """Measured before the surrogates are replaced, so it must not encode and crash."""
+        text = ("\ud800" + "a" * 50) * 2_000
+        fitted = report_module._fit_body(text)
+        self.assertLessEqual(len(fitted.encode("utf-8", "surrogatepass")), MAX_REPORT_BYTES)
+
+    def test_truncation_keeps_content_when_the_cut_lands_on_the_first_newline(self):
+        text = "\n" + "b" * (MAX_REPORT_BYTES + 100)
+        fitted = report_module._fit_body(text)
+        self.assertLessEqual(len(fitted.encode("utf-8")), MAX_REPORT_BYTES)
         self.assertTrue(fitted.lstrip("\n").startswith("b"), fitted[:20])
 
     def test_promotions_and_demotions_land_in_their_own_tables(self):
