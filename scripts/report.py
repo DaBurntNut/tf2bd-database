@@ -310,6 +310,8 @@ def render_report(info: RunInfo) -> str:
 
     closing = render_closing(info.changes)
 
+    while lines and not lines[-1].strip():
+        lines.pop()  # exactly one blank line before the closing sentence
     lines += ["", closing]
     if promotions:
         total_links = sum(len(change.evidence) for change in promotions)
