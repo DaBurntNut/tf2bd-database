@@ -1423,6 +1423,55 @@ class ReportTests(unittest.TestCase):
             **{"source_skipped": 0, "dry_run": False, **kwargs},
         )
 
+    def test_ansi_escapes_cannot_repaint_the_job_log(self):
+        """The workflow `cat`s this report into the job log: ESC must not survive."""
+        change = Change("[U:1:100]", "\x1b[31mRED\x1b[0m", ("suspicious",), ("cheater",))
+        report = render_report(self.info([change]))
+        self.assertNotIn("\x1b", report)
+        self.assertIn("RED", report)  # the name itself is still readable
+
+    def test_bidi_overrides_cannot_reverse_the_rest_of_the_line(self):
+        """U+202E would display "abcDEF" as "abcFED" and flip the next column."""
+        change = Change("[U:1:100]", "abc\u202eDEF", ("suspicious",), ("cheater",))
+        report = render_report(self.info([change]))
+        for character in ("\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069"):
+            self.assertNotIn(character, report)
+        self.assertIn("\ufffd", report)
+
+    def test_bell_and_backspace_cannot_hide_what_was_written(self):
+        change = Change("[U:1:100]", "good\x07\x08BAD", ("suspicious",), ("cheater",))
+        report = render_report(self.info([change]))
+        self.assertNotIn("\x07", report)
+        self.assertNotIn("\x08", report)
+
+    def test_legitimate_unicode_is_left_alone(self):
+        """Hardening must not mangle real names: Cyrillic, emoji, ZWJ sequences."""
+        names = ["Игрок", "名前", "\U0001f468\u200d\U0001f469\u200d\U0001f467", "Ünïcode"]
+        changes = [Change(f"[U:1:{200 + n}]", name, ("suspicious",), ("cheater",)) for n, name in enumerate(names)]
+        report = render_report(self.info(changes))
+        for name in names:
+            self.assertIn(name, report)
+            self.assertNotIn("\ufffd", name)
+
+    def test_control_and_bidi_characters_in_a_proof_link_are_percent_encoded(self):
+        change = Change(
+            "[U:1:100]",
+            "p",
+            ("suspicious",),
+            ("cheater",),
+            evidence=("https://example.invalid/\x1b[31mx", "https://example.invalid/a\u202eb"),
+        )
+        report = render_report(self.info([change]))
+        self.assertNotIn("\x1b", report)
+        self.assertNotIn("\u202e", report)
+        self.assertIn("%1B", report)  # ESC
+        self.assertIn("%E2%80%AE", report)  # U+202E, as UTF-8 bytes
+
+    def test_attributes_cannot_carry_control_characters_into_the_report(self):
+        change = Change("[U:1:100]", "p", ("suspicious\x1b",), ("cheater",))
+        report = render_report(self.info([change]))
+        self.assertNotIn("\x1b", report)
+
     def test_no_changes_message(self):
         report = render_report(self.info())
         self.assertIn("**No changes.**", report)

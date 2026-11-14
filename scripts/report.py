@@ -94,6 +94,24 @@ REMOVED_HEADER = ("SteamID", "Profile Link")
 DEFAULT_SNAPSHOT_LABEL = "snapshot/playerlist.vorobey-hackerpolice.json"
 
 
+# Control characters (including newlines) in anything that reaches the page or
+# the job log. The fetch URL can be an upstream-supplied download_url, so a
+# newline in it would otherwise start a new Markdown line (e.g. an extra bullet
+# in the report header), and an ESC would repaint the terminal that `cat`s it.
+_TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f]")
+
+# Bidirectional overrides flip how the rest of the line is displayed, so a name
+# like "abc\u202eDEF" shows as "abcFED" and can make the NEXT table cell read
+# as something else. They have no legitimate use in a player name; a zero-width
+# joiner does (emoji, Indic scripts), so only the bidi controls are replaced.
+_BIDI_CONTROLS = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _neutralise(value: str) -> str:
+    """Make a value safe to put in front of a human or a terminal."""
+    return _BIDI_CONTROLS.sub("\ufffd", _TEXT_CONTROLS.sub(" ", value))
+
+
 def _safe(text: str) -> str:
     """Replace lone surrogates so the report is always UTF-8 encodable."""
     return _SURROGATES_RE.sub("\ufffd", text)
@@ -101,13 +119,7 @@ def _safe(text: str) -> str:
 
 def _cell(value: str) -> str:
     """Make a string safe inside a Markdown table cell."""
-    return value.translate(_CELL_ESCAPES).strip() or "-"
-
-
-# Control characters (including newlines) inside running text. The fetch URL
-# can be an upstream-supplied download_url, so a newline in it would otherwise
-# start a new Markdown line -- e.g. an extra bullet in the report header.
-_TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f]")
+    return _neutralise(value).translate(_CELL_ESCAPES).strip() or "-"
 
 
 def _text(value: str) -> str:
@@ -116,12 +128,12 @@ def _text(value: str) -> str:
     ``<``/``>`` become entities, so they render identically but cannot open a
     tag; control characters become spaces, so they cannot start a new line.
     """
-    return _TEXT_CONTROLS.sub(" ", value).replace("<", "&lt;").replace(">", "&gt;")
+    return _neutralise(value).replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _code(value: str) -> str:
     """Make a string safe inside an inline code span (``…``)."""
-    return value.translate(_CODE_ESCAPES)
+    return _neutralise(value).translate(_CODE_ESCAPES)
 
 
 def _attributes_cell(attributes: Sequence[str]) -> str:
@@ -157,8 +169,17 @@ def _is_url(text: str) -> bool:
 
 
 def _markdown_link(url: str, label: str) -> str:
-    """Render a link, escaping the characters that would end the target early."""
-    return f"[{label}]({url.translate(_LINK_ESCAPES)})"
+    """Render a link, escaping the characters that would end the target early.
+
+    Control and bidi characters cannot appear in a URL, so they are
+    percent-encoded rather than dropped: the link stays faithful and nothing
+    lands raw in a terminal (an ESC would repaint it, a bidi override would
+    reverse the rest of the line).
+    """
+    encoded = url.translate(_LINK_ESCAPES)
+    for pattern in (_TEXT_CONTROLS, _BIDI_CONTROLS):
+        encoded = pattern.sub(lambda match: "".join(f"%{byte:02X}" for byte in match.group().encode("utf-8")), encoded)
+    return f"[{label}]({encoded})"
 
 
 def _evidence_cell(links: Sequence[str]) -> str:

@@ -28,7 +28,8 @@ Usage:
     python3 scripts/sync_vorobey_hackerpolice.py --report out.md
     python3 scripts/sync_vorobey_hackerpolice.py --demote --report out.md
 
-Exit codes: 0 = success, 2 = unusable database or Vorobey hackerpolice list.
+Exit codes: 0 = success, 2 = refused or failed -- an unusable database or
+upstream list, paths that alias each other, or output that cannot be written.
 """
 
 from __future__ import annotations
