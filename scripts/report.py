@@ -172,27 +172,37 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
     """Build the present-tense closing sentence describing what changed.
 
     Uses singular/plural-aware phrasing per attribute or entry, followed by
-    "; nothing else is modified." When ``database`` is given the sentence
-    names the file the changes land in, e.g.
-    "Attribute is changed in `playerlist.garou3299.json` for this SteamID: ...",
-    so the pull request never leaves the reader guessing which list changed.
+    "; nothing else is modified." When ``database`` is given, the sentence
+    names the file the changes land in -- exactly once, on the first clause,
+    e.g. "Attributes are changed in `playerlist.garou3299.json` for these
+    SteamIDs: ...; Entry is removed for this SteamID: ...; nothing else is
+    modified." Repeating the file name on every clause just makes the line
+    harder to read.
     """
     changed_steamids = [change.steamid for change in changes if (change.kind == "promote") or change.after]
     removed_steamids = [change.steamid for change in changes if (change.kind == "demote") and not change.after]
-    where = f" in `{database}`" if database else ""
-    removal_target = f" from `{database}`" if database else " from the database"
 
     parts: list[str] = []
+    named_database = False  # the file is named at most once
+
     if changed_steamids:
-        if len(changed_steamids) == 1:
-            parts.append(f"Attribute is changed{where} for this SteamID: " + changed_steamids[0])
-        else:
-            parts.append(f"Attributes are changed{where} for these SteamIDs: " + ", ".join(changed_steamids))
+        head = "Attribute is changed" if len(changed_steamids) == 1 else "Attributes are changed"
+        target = "this SteamID" if len(changed_steamids) == 1 else "these SteamIDs"
+        where = f" in `{database}`" if database else ""
+        named_database = bool(database)
+        parts.append(f"{head}{where} for {target}: " + ", ".join(changed_steamids))
+
     if removed_steamids:
-        if len(removed_steamids) == 1:
-            parts.append(f"Entry is removed{removal_target} for this SteamID: " + removed_steamids[0])
+        head = "Entry is removed" if len(removed_steamids) == 1 else "Entries are removed"
+        target = "this SteamID" if len(removed_steamids) == 1 else "these SteamIDs"
+        if database and not named_database:
+            # No attribute clause above: the removal clause names the file.
+            where = f" from `{database}`"
+        elif database:
+            where = ""  # already named by the attribute clause above
         else:
-            parts.append(f"Entries are removed{removal_target} for these SteamIDs: " + ", ".join(removed_steamids))
+            where = " from the database"
+        parts.append(f"{head}{where} for {target}: " + ", ".join(removed_steamids))
 
     return "; ".join(parts) + "; nothing else is modified."
 

@@ -753,7 +753,10 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         removed_entry = Change("[U:1:500]", "b", ("cheater",), (), kind="demote")
         report = render_report(self.info(changes=(change, other, removed_entry)))
         self.assertIn("Attributes are changed in `playerlist.garou3299.json` for these SteamIDs", report)
-        self.assertIn("Entry is removed from `playerlist.garou3299.json` for this SteamID", report)
+        self.assertIn("Entry is removed for this SteamID", report)
+        # ... and only that once (the header bullet is a separate line):
+        closing = next(line for line in report.splitlines() if "nothing else is modified" in line)
+        self.assertEqual(closing.count("`playerlist.garou3299.json`"), 1)
         # Only the file name -- never an absolute/temporary path.
         self.assertNotIn(str(Path("playerlist.garou3299.json").resolve()), report)
 
@@ -841,11 +844,17 @@ class ClosingMessageTests(unittest.TestCase):
             render_closing([demote_change], database="playerlist.garou3299.json"),
             "Entry is removed from `playerlist.garou3299.json` for this SteamID: [U:1:300]; nothing else is modified.",
         )
+        # The file is named exactly once, on the first clause.
         self.assertEqual(
             render_closing([promote_change, demote_change], database="playerlist.garou3299.json"),
             "Attribute is changed in `playerlist.garou3299.json` for this SteamID: [U:1:400]; "
-            "Entry is removed from `playerlist.garou3299.json` for this SteamID: [U:1:300]; "
-            "nothing else is modified.",
+            "Entry is removed for this SteamID: [U:1:300]; nothing else is modified.",
+        )
+        self.assertEqual(
+            render_closing([promote_change, demote_change], database="playerlist.garou3299.json").count(
+                "playerlist.garou3299.json"
+            ),
+            1,
         )
 
     def test_database_name_is_the_file_name_only(self):
