@@ -48,6 +48,22 @@ pull request is merged.**
 Players who were added to this database and were never on
 Vorobey's list are **never** demoted or removed by the bot.
 
+### Removed from Vorobey's list
+
+Every SteamID that was in the previous snapshot but is gone from the current
+Vorobey list is listed in the pull request, whether or not it was demoted
+above:
+
+| SteamID | Profile Link |
+| --- | --- |
+| `[U:1:1582772205]` | [Profile](https://steamcommunity.com/profiles/76561199543037933) |
+
+Vorobey's list stores no player names, so this table only shows the SteamID
+and the Steam profile permalink (the SteamID64 URL), which keeps working even
+after a player renames themselves. Very long lists are capped in the pull
+request body with the number of remaining SteamIDs stated, so the body always
+fits GitHub's size limit.
+
 ### Update the Vorobey database copy
 
 | File | What the bot does |

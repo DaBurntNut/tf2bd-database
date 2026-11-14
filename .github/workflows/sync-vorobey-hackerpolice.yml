@@ -13,7 +13,10 @@ name: Sync Vorobey hackerpolice
 # Cheaters that were never on the hackerpolice list (added manually) are
 # never demoted. Everything else is never touched, and the hackerpolice proof
 # links are shown in the pull request only - they are never written into
-# playerlist.garou3299.json. The snapshot is refreshed to the current list in the SAME
+# playerlist.garou3299.json.
+# The pull request also lists EVERY SteamID removed from the hackerpolice list
+# since the previous snapshot (| SteamID | Profile Link | with the Steam
+# profile permalink), because that list stores no player names. The snapshot is refreshed to the current list in the SAME
 # pull request, so the baseline only advances when the PR is merged - no
 # separate snapshot bot/PR is needed (a separate weekly snapshot PR would
 # race this workflow: merging it first would erase the very removals this

@@ -14,6 +14,11 @@ replica, never decoded/re-serialised) in the same working tree,
 so the workflow commits both files in one pull request and the baseline
 only advances when that PR is merged.
 
+The report (pull request body / job summary) lists every SteamID that
+disappeared from the upstream list since the previous snapshot, as a
+``| SteamID | Profile Link |`` table -- the upstream list stores no player
+names, so each ID is shown with its Steam profile permalink.
+
 Usage:
     python3 scripts/sync_vorobey_hackerpolice.py --dry-run
     python3 scripts/sync_vorobey_hackerpolice.py --report out.md
@@ -267,6 +272,9 @@ def run(args: argparse.Namespace) -> int:
     snapshot = load_snapshot(snapshot_path)
     previous_index, previous_bytes = snapshot if snapshot is not None else (None, None)
     removed: set[str] = set()
+    # The same information, kept even when the mass-demotion guard vetoes
+    # demotion: the report shows every ID that really did disappear upstream.
+    removed_upstream: set[str] = set()
     removed_count = 0
     # Snapshot diff vs. the previous snapshot, independent of --demote: how
     # many IDs the refreshed snapshot gains/loses. With no snapshot yet,
@@ -274,7 +282,8 @@ def run(args: argparse.Namespace) -> int:
     added_count = len(index.by_steamid)
     if previous_index is not None:
         added_count = len(added_steamids(previous_index, index))
-        removed_count = len(removed_steamids(previous_index, index))
+        removed_upstream = removed_steamids(previous_index, index)
+        removed_count = len(removed_upstream)
         LOGGER.info(
             "Snapshot diff vs. previous snapshot: %d SteamIDs added, %d removed (%d -> %d entries).",
             added_count,
@@ -291,8 +300,7 @@ def run(args: argparse.Namespace) -> int:
             demotion_note = f"skipped - no snapshot at {snapshot_path} yet, so no removal can be proven"
             LOGGER.warning("Demotion %s.", demotion_note)
         else:
-            removed = removed_steamids(previous_index, index)
-            removed_count = len(removed)
+            removed = set(removed_upstream)
             LOGGER.info(
                 "%d SteamIDs removed upstream since the snapshot (%d entries).",
                 len(removed),
@@ -337,6 +345,7 @@ def run(args: argparse.Namespace) -> int:
             previous_source_total=len(previous_index.by_steamid) if previous_index is not None else None,
             added_to_source=added_count,
             removed_from_source=removed_count,
+            removed_upstream=tuple(removed_upstream),
             demotion_note=demotion_note,
             snapshot_changed=snapshot_changed,
         )

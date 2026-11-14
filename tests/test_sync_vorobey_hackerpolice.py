@@ -41,7 +41,7 @@ from playerlist import (
     validate,
 )
 from policy import Change, demote, promote, sync
-from report import RunInfo, plural, render_closing, render_report
+from report import MAX_REMOVED_TABLE_ROWS, RunInfo, plural, render_closing, render_report
 from sources import (
     PROOF_MARKER,
     HackerpoliceIndex,
@@ -655,6 +655,96 @@ class ReportTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# "Removed from the Vorobey list" table
+# --------------------------------------------------------------------------- #
+class RemovedFromVorobeyTableTests(unittest.TestCase):
+    """The PR body lists EVERY SteamID that disappeared from the Vorobey list.
+
+    The Vorobey list stores no player names, so the table is exactly
+    ``| SteamID | Profile Link |`` and every link is the Steam profile
+    permalink (SteamID64 URL), never a vanity URL or a last-seen name.
+    """
+
+    def info(self, **kwargs):
+        return RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://example.invalid/list.json",
+            source_total=10,
+            source_skipped=0,
+            **{"dry_run": False, **kwargs},
+        )
+
+    def test_table_lists_the_steamid_and_its_permalink(self):
+        report = render_report(self.info(removed_upstream=("[U:1:269327660]",)))
+        self.assertIn(
+            "**1 SteamID removed from the Vorobey hackerpolice list since the previous snapshot.**",
+            report,
+        )
+        self.assertIn("| SteamID | Profile Link |", report)
+        self.assertIn("| --- | --- |", report)
+        self.assertIn(
+            "| `[U:1:269327660]` | [Profile](https://steamcommunity.com/profiles/76561198229593388) |",
+            report,
+        )
+
+    def test_no_names_are_used_because_vorobey_stores_none(self):
+        report = render_report(self.info(removed_upstream=("[U:1:2]",)))
+        self.assertNotIn("Last known name", report)
+        self.assertNotIn("UNKNOWN", report)
+
+    def test_plural_count_and_numeric_order(self):
+        report = render_report(self.info(removed_upstream=("[U:1:20]", "[U:1:3]")))
+        self.assertIn("**2 SteamIDs removed from the Vorobey hackerpolice list", report)
+        rows = [line for line in report.splitlines() if line.startswith("| `[U:1:")]
+        self.assertEqual(
+            rows,
+            [
+                "| `[U:1:3]` | [Profile](https://steamcommunity.com/profiles/76561197960265731) |",
+                "| `[U:1:20]` | [Profile](https://steamcommunity.com/profiles/76561197960265748) |",
+            ],
+        )
+
+    def test_table_is_shown_even_when_the_database_changed_nothing(self):
+        # Snapshot-only PR (e.g. none of the removed IDs was a cheater here).
+        report = render_report(self.info(snapshot_changed=True, removed_upstream=("[U:1:5]",)))
+        self.assertIn("snapshot refresh only", report)
+        self.assertIn("| `[U:1:5]` | [Profile](", report)
+
+    def test_table_is_shown_after_the_change_tables(self):
+        change = Change("[U:1:400]", "a", ("suspicious",), ("cheater",))
+        report = render_report(self.info(changes=(change,), removed_upstream=("[U:1:5]",)))
+        self.assertLess(
+            report.index("promoted to `cheater`"), report.index("removed from the Vorobey hackerpolice list")
+        )
+
+    def test_no_table_without_removals(self):
+        for kwargs in ({}, {"previous_source_total": 100, "added_to_source": 2, "removed_from_source": 0}):
+            report = render_report(self.info(**kwargs))
+            self.assertNotIn("Profile Link", report)
+            self.assertNotIn("| SteamID |", report)
+
+    def test_long_lists_are_capped_but_the_overflow_is_counted(self):
+        steamids = [f"[U:1:{1000 + n}]" for n in range(MAX_REMOVED_TABLE_ROWS + 25)]
+        report = render_report(self.info(removed_upstream=tuple(steamids)))
+        rows = [line for line in report.splitlines() if line.startswith("| `[U:1:")]
+        self.assertEqual(len(rows), MAX_REMOVED_TABLE_ROWS)
+        self.assertIn("… and 25 more SteamIDs not shown here", report)
+
+    def test_cap_message_is_singular_for_one_left_over(self):
+        steamids = [f"[U:1:{1000 + n}]" for n in range(MAX_REMOVED_TABLE_ROWS + 1)]
+        report = render_report(self.info(removed_upstream=tuple(steamids)))
+        self.assertIn("… and 1 more SteamID not shown here", report)
+
+    def test_an_unusable_steamid_never_crashes_the_table(self):
+        report = render_report(self.info(removed_upstream=("nonsense",)))
+        self.assertIn("| `nonsense` | - |", report)
+
+    def test_report_stays_utf8_encodable(self):
+        report = render_report(self.info(removed_upstream=("[U:1:1]",), previous_source_total=10))
+        report.encode("utf-8")
+
+
+# --------------------------------------------------------------------------- #
 # Closing message rendering
 # --------------------------------------------------------------------------- #
 class ClosingMessageTests(unittest.TestCase):
@@ -839,6 +929,63 @@ class CliTests(unittest.TestCase):
         self.assertIn(
             "- Snapshot diff: **2 new SteamIDs added**, **2 SteamIDs removed** (2 → 2 entries; net +0)",
             stdout,
+        )
+
+    def test_report_lists_every_removed_steamid_with_its_permalink(self):
+        """Every ID gone from the list since the snapshot appears in the
+        ``| SteamID | Profile Link |`` table -- including ones that were not
+        demoted because they were never cheaters here, and ones that were
+        never in this database at all."""
+        self.database.write_text(
+            dumps(
+                {
+                    "$schema": "x",
+                    "file_info": {},
+                    "players": [
+                        player("[U:1:400]", ["cheater"]),  # removed upstream -> demoted
+                        player("[U:1:300]", ["suspicious"]),  # removed upstream, not a cheater
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.write_snapshot_fixture(
+            hackerpolice_entry("[U:1:300]"),
+            hackerpolice_entry("[U:1:400]"),
+            hackerpolice_entry("[U:1:500]"),  # not in this database at all
+        )
+        report_file = self.root / "report.md"
+        code, stdout, _ = self.run_cli("--source", str(self.source), "--demote", "--report", str(report_file))
+        self.assertEqual(code, 0)
+        report = report_file.read_text(encoding="utf-8")
+        self.assertEqual(report, stdout)
+        self.assertIn("**3 SteamIDs removed from the Vorobey hackerpolice list since the previous snapshot.**", report)
+        self.assertIn("| SteamID | Profile Link |", report)
+        for account in (300, 400, 500):
+            steamid64 = 76561197960265728 + account
+            self.assertIn(
+                f"| `[U:1:{account}]` | [Profile](https://steamcommunity.com/profiles/{steamid64}) |",
+                report,
+            )
+        # The still-current upstream IDs are not "removed".
+        for account in (100, 200):
+            self.assertNotIn(f"| `[U:1:{account}]` | [Profile]", report)
+
+    def test_removed_table_is_absent_when_nothing_was_removed(self):
+        code, stdout, _ = self.run_cli("--source", str(self.source), "--demote")
+        self.assertEqual(code, 0)
+        self.assertNotIn("Profile Link", stdout)
+
+    def test_mass_disappearance_still_reports_the_removals(self):
+        snapshot_fixture = self.write_snapshot_fixture(*[hackerpolice_entry(f"[U:1:{n}]") for n in range(400, 461)])
+        code, stdout, _ = self.run_cli("--source", str(self.source), "--demote")
+        self.assertEqual(code, 0)
+        self.assertIn("looks like an upstream problem", stdout)
+        self.assertIn("**61 SteamIDs removed from the Vorobey hackerpolice list", stdout)
+        # ... while demotion was skipped, so the baseline did not advance.
+        self.assertEqual(
+            {p["steamid"] for p in json.loads(snapshot_fixture.read_text(encoding="utf-8"))["players"]},
+            {f"[U:1:{n}]" for n in range(400, 461)},
         )
 
     def test_demote_without_snapshot_demotes_nobody_and_creates_baseline(self):
