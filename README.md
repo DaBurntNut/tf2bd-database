@@ -43,7 +43,8 @@ pull request is merged.**
 | Tags before | Tags after |
 | --- | --- |
 | `cheater` | entry removed from the database |
-| `cheater` + `racist` | `racist` (`cheater` and its proofs are removed, the racist proofs stay) |
+| `cheater` + `racist` | `racist` (`cheater` and every proof that is not an `[auto] automatically marked: Racist \| reason: …` line are removed; those racist lines stay) |
+| `cheater` + any other tag | entry removed (the entry as a whole was a false positive) |
 
 Players who were added to this database and were never on
 Vorobey's list are **never** demoted or removed by the bot.
@@ -63,6 +64,29 @@ and the Steam profile permalink (the SteamID64 URL), which keeps working even
 after a player renames themselves. Very long lists are capped in the pull
 request body with the number of remaining SteamIDs stated, so the body always
 fits GitHub's size limit.
+
+### Safety rails
+
+| Rail | What it guarantees |
+| --- | --- |
+| Snapshot-only demotion | An entry is only demoted when its SteamID was in the previous snapshot *and* is gone from today's list — never merely "absent from Vorobey". Manually added cheaters are untouched. |
+| Mass-removal guard | If an implausibly large share of the snapshot disappears at once (more than 50 IDs and more than 20 %), demotion is skipped and the baseline is kept, so an upstream outage cannot wipe entries. A human can force it with `--allow-mass-demotion`. |
+| Frozen baseline | If a run finds removals it cannot apply (demotion disabled, or vetoed by the guard), the snapshot is **not** advanced — otherwise those removals would be forgotten forever. |
+| Exact snapshot | The snapshot is written from the fetched **bytes**, never re-encoded, and `.gitattributes` keeps Git from touching line endings. |
+| Bounded fetch | HTTPS only (a redirect downgrade to plain HTTP is refused), 64 MiB maximum, 30 s timeout, 3 attempts, then the next fallback URL. |
+| Bounded PR body | Tables are row-capped and the body is hard-truncated below GitHub's 65,536-character limit, so opening the pull request can never fail on size. |
+| Escaped output | Player names and proofs are escaped for Markdown: no broken tables, no forged links, no injected HTML, no `@` mentions. |
+
+### Run it yourself
+
+```
+python3 scripts/sync_vorobey_hackerpolice.py --dry-run      # report only
+python3 scripts/sync_vorobey_hackerpolice.py --demote --report out.md
+python3 -m unittest discover -s tests                        # run the test suite
+```
+
+Exit code `0` means success, `2` means the database or the Vorobey list was
+unusable (nothing is written in that case).
 
 ### Update the Vorobey database copy
 

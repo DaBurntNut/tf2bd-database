@@ -1,11 +1,21 @@
 """Markdown report rendering for sync results.
 
-Produces the pull request body and job summary from a :class:`RunInfo`.
+Produces the pull request body / job summary from a :class:`RunInfo`.
 
-Besides the Garou database changes, the report lists every SteamID that
-disappeared from the Vorobey hackerpolice list since the previous snapshot.
-The Vorobey list stores no player names, so that table has just two columns:
-the SteamID and its Steam Community profile permalink.
+The report is the bot's only human-facing output, so it is treated as
+untrusted-output as well as untrusted-input territory:
+
+* every value that comes from the database or from the upstream Vorobey
+  list (names, proofs, SteamIDs) is escaped for a Markdown table cell --
+  pipes and newlines cannot break the table, brackets cannot forge a link,
+  angle brackets cannot inject HTML, and ``@`` cannot trigger a mention;
+* every table is row-capped, and the whole body has a hard length guard,
+  because GitHub rejects pull request bodies over 65,536 characters;
+* the closing sentence names the database that changed exactly once.
+
+Order of the body: header bullets, promotions, demotions, the SteamIDs
+removed from the upstream list (``| SteamID | Profile Link |``), and
+finally the closing sentence + proof note.
 """
 
 from __future__ import annotations
@@ -21,7 +31,9 @@ from policy import Change
 from sources import SOURCE_REPO_URL
 
 __all__ = [
+    "MAX_CHANGE_TABLE_ROWS",
     "MAX_REMOVED_TABLE_ROWS",
+    "MAX_REPORT_CHARS",
     "RunInfo",
     "plural",
     "render_closing",
@@ -29,14 +41,34 @@ __all__ = [
     "render_report",
 ]
 
-# Upper bound on rows in the "removed from Vorobey" table. A single run can
-# legitimately see hundreds of removals, and GitHub rejects pull request
-# bodies over 65,536 characters: cap the table so the report always fits,
-# and say how many rows were left out instead of silently dropping them.
+# GitHub rejects a pull request body longer than 65,536 characters. Change
+# tables are capped, the removed table is capped, and the finished body is
+# hard-truncated as a last resort, so publishing the PR can never fail on
+# size -- however big a single run turns out to be.
+MAX_CHANGE_TABLE_ROWS = 150
 MAX_REMOVED_TABLE_ROWS = 100
+MAX_REPORT_CHARS = 60_000
 
 # Characters that would break a Markdown link target.
 _LINK_ESCAPES = str.maketrans({"(": "%28", ")": "%29", " ": "%20", "<": "%3C", ">": "%3E", "\n": "%0A", "\r": "%0D"})
+
+# Characters that would break out of a Markdown table cell.
+_CELL_ESCAPES = str.maketrans(
+    {
+        "\\": "\\\\",
+        "|": "\\|",
+        "[": "\\[",
+        "]": "\\]",
+        "<": "&lt;",
+        ">": "&gt;",
+        "@": "&#64;",  # renders as "@" but cannot ping a user/team
+        "\n": " ",
+        "\r": " ",
+    }
+)
+
+# Characters that would break out of an inline code span.
+_CODE_ESCAPES = str.maketrans({"\\": "\\\\", "|": "\\|", "`": "\\`"})
 
 # Lone UTF-16 surrogates: legal in JSON input (e.g. "\ud800" in a player
 # name) and loadable by Python, but impossible to encode as UTF-8 -- one in
@@ -44,6 +76,10 @@ _LINK_ESCAPES = str.maketrans({"(": "%28", ")": "%29", " ": "%20", "<": "%3C", "
 # as the replacement character instead; the database itself is unaffected
 # (it is serialised with ensure_ascii, which re-escapes them losslessly).
 _SURROGATES_RE = re.compile(r"[\ud800-\udfff]")
+
+PROMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "Hackerpolice proof")
+DEMOTION_HEADER = ("SteamID", "Last known name", "Before", "After")
+REMOVED_HEADER = ("SteamID", "Profile Link")
 
 
 def _safe(text: str) -> str:
@@ -53,7 +89,22 @@ def _safe(text: str) -> str:
 
 def _cell(value: str) -> str:
     """Make a string safe inside a Markdown table cell."""
-    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ").strip() or "-"
+    return value.translate(_CELL_ESCAPES).strip() or "-"
+
+
+def _code(value: str) -> str:
+    """Make a string safe inside an inline code span (``…``)."""
+    return value.translate(_CODE_ESCAPES)
+
+
+def _attributes_cell(attributes: Sequence[str]) -> str:
+    """Render an attribute list as code spans: ``cheater``, ``racist``."""
+    return ", ".join(f"`{_code(attribute)}`" for attribute in attributes)
+
+
+def _steamid_cell(steamid: str) -> str:
+    """Render a SteamID as a code span (canonical IDs need no escaping)."""
+    return f"`{_code(steamid)}`"
 
 
 def _name_cell(change: Change) -> str:
@@ -62,17 +113,16 @@ def _name_cell(change: Change) -> str:
     Clicking the name in the pull request opens the profile directly.
     A player with no recorded name shows as ``UNKNOWN`` -- still linked,
     since the SteamID (and therefore the profile) is known even when the
-    name is not. Brackets in the name are escaped so they cannot break
-    the link text; only an unusable SteamID renders as plain text.
+    name is not; only an unusable SteamID renders as plain text.
     """
     # UNKNOWN only when there is genuinely no recorded name; a player
-    # actually named "-" (or similar) keeps their name.
+    # actually named "-" (or similar) keeps their name. _cell() escapes the
+    # brackets that would otherwise break the link text.
     label = "UNKNOWN" if not change.name.strip() else _cell(change.name)
-    label = label.replace("[", "\\[").replace("]", "\\]")
     url = steam_profile_url(change.steamid)
     if url is None:
         return label
-    return f"[{label}]({url})"
+    return _markdown_link(url, label)
 
 
 def _is_url(text: str) -> bool:
@@ -109,6 +159,30 @@ def _count(value: int) -> str:
     return f"{value:,}"
 
 
+def _capped(rows: Sequence[str], limit: int, singular: str, plural_form: str) -> tuple[list[str], str | None]:
+    """Trim a table body to ``limit`` rows, returning an overflow note if needed."""
+    if len(rows) <= limit:
+        return list(rows), None
+    hidden = len(rows) - limit
+    note = (
+        f"… and {_count(hidden)} more {plural(hidden, singular, plural_form)} not shown here "
+        "(the table would make the pull request body too long)."
+    )
+    return list(rows[:limit]), note
+
+
+def _table(header: Sequence[str], rows: Sequence[str], overflow_note: str | None = None) -> list[str]:
+    """Render a Markdown table, plus an optional overflow note underneath."""
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+        *rows,
+    ]
+    if overflow_note:
+        lines += ["", overflow_note]
+    return lines
+
+
 def _sorted_steamids(steamids: Sequence[str]) -> list[str]:
     """Order SteamIDs numerically (unusable ones last, stably) for a stable diff."""
     return sorted(steamids, key=lambda steamid: (account_id(steamid) is None, account_id(steamid) or 0))
@@ -129,33 +203,21 @@ def render_removed_table(steamids: Sequence[str]) -> list[str]:
     ``| SteamID | Profile Link |``: the SteamID in canonical ``[U:1:x]``
     form and the Steam Community profile *permalink* (the SteamID64 URL),
     which keeps working even when the player renames themselves.
-
-    Rows are capped at :data:`MAX_REMOVED_TABLE_ROWS` so the report always
-    fits in a pull request body; the overflow is counted, never hidden.
     """
     if not steamids:
         return []
 
     ordered = _sorted_steamids(steamids)
     count = len(ordered)
-    shown = ordered[:MAX_REMOVED_TABLE_ROWS]
-    lines = [
+    rows = [f"| {_steamid_cell(steamid)} | {_profile_cell(steamid)} |" for steamid in ordered]
+    rows, overflow = _capped(rows, MAX_REMOVED_TABLE_ROWS, "SteamID", "SteamIDs")
+    return [
         f"**{_count(count)} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey hackerpolice list "
         "since the previous snapshot.**",
         "",
-        "| SteamID | Profile Link |",
-        "| --- | --- |",
+        *_table(REMOVED_HEADER, rows, overflow),
+        "",
     ]
-    lines += [f"| `{steamid}` | {_profile_cell(steamid)} |" for steamid in shown]
-    if len(ordered) > len(shown):
-        lines += [
-            "",
-            f"… and {_count(len(ordered) - len(shown))} more "
-            f"{plural(len(ordered) - len(shown), 'SteamID', 'SteamIDs')} "
-            "not shown here (the list is too long for a pull request body).",
-        ]
-    lines.append("")
-    return lines
 
 
 def _with_removed_table(lines: list[str], steamids: Sequence[str]) -> list[str]:
@@ -236,6 +298,9 @@ class RunInfo:
     # pull request exists to communicate.
     removed_upstream: tuple[str, ...] = ()
     demotion_note: str | None = None
+    # Why the snapshot was left alone (--no-update-snapshot, or a run that
+    # could not apply the removals it found).
+    snapshot_note: str | None = None
     # True when the snapshot file itself was refreshed this run, so a
     # snapshot-only PR does not misleadingly report "No changes."
     snapshot_changed: bool = False
@@ -250,11 +315,11 @@ class RunInfo:
         return Path(self.database_path).name
 
 
-def render_report(info: RunInfo) -> str:
-    """Render the PR body / job summary as Markdown."""
+def _header_lines(info: RunInfo) -> list[str]:
+    """The ``- Key: value`` bullet block at the top of the report."""
     source_note = f"{_count(info.source_total)} entries"
     if info.source_skipped:
-        source_note += f", {info.source_skipped} unusable"
+        source_note += f", {_count(info.source_skipped)} unusable"
 
     lines = [
         "## Vorobey hackerpolice sync",
@@ -289,63 +354,86 @@ def render_report(info: RunInfo) -> str:
         )
     if info.demotion_note:
         lines.append(f"- Demotion: **{info.demotion_note}**")
-    if info.snapshot_changed:
+    if info.snapshot_note:
+        lines.append(f"- Snapshot: {info.snapshot_note}")
+    elif info.snapshot_changed:
         verb = "would be updated" if info.dry_run else "updated"
         lines.append(
             f"- Snapshot: `snapshot/playerlist.vorobey-hackerpolice.json` {verb} "
             "to an exact copy of the current upstream file"
         )
     lines.append("")
+    return lines
 
-    promotions = [c for c in info.changes if c.kind == "promote"]
-    demotions = [c for c in info.changes if c.kind == "demote"]
+
+def _promotion_lines(promotions: Sequence[Change]) -> list[str]:
+    """Render the "promoted to cheater" table block."""
+    rows = [
+        f"| {_steamid_cell(change.steamid)} | {_name_cell(change)} | {_attributes_cell(change.before)} "
+        f"| {_attributes_cell(change.after)} | {_evidence_cell(change.evidence)} |"
+        for change in promotions
+    ]
+    rows, overflow = _capped(rows, MAX_CHANGE_TABLE_ROWS, "entry", "entries")
+    count = len(promotions)
+    return [
+        f"**{_count(count)} {plural(count, 'entry', 'entries')} promoted to `cheater`.**",
+        "",
+        *_table(PROMOTION_HEADER, rows, overflow),
+        "",
+    ]
+
+
+def _demotion_lines(demotions: Sequence[Change]) -> list[str]:
+    """Render the "demoted" table block."""
+    rows = [
+        f"| {_steamid_cell(change.steamid)} | {_name_cell(change)} | {_attributes_cell(change.before)} "
+        f"| {_attributes_cell(change.after) or 'entry removed'} |"
+        for change in demotions
+    ]
+    rows, overflow = _capped(rows, MAX_CHANGE_TABLE_ROWS, "entry", "entries")
+    count = len(demotions)
+    return [
+        f"**{_count(count)} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
+        "removed from the hackerpolice list since).**",
+        "",
+        *_table(DEMOTION_HEADER, rows, overflow),
+        "",
+    ]
+
+
+def _fit_body(text: str) -> str:
+    """Hard-limit the body so publishing the pull request can never fail.
+
+    The tables are already capped; this is the last-resort guard for a run
+    with pathological input (very long names/proofs). It cuts on a line
+    boundary and says so, instead of silently losing the tail.
+    """
+    if len(text) <= MAX_REPORT_CHARS:
+        return text
+    note = "\n\n… report truncated to fit the pull request body limit."
+    keep = MAX_REPORT_CHARS - len(note)
+    cut = text.rfind("\n", 0, keep)
+    return text[: cut if cut > 0 else keep] + note
+
+
+def render_report(info: RunInfo) -> str:
+    """Render the PR body / job summary as Markdown."""
+    lines = _header_lines(info)
+
+    promotions = [change for change in info.changes if change.kind == "promote"]
+    demotions = [change for change in info.changes if change.kind == "demote"]
 
     if not promotions and not demotions:
         if info.snapshot_changed:
             lines += ["**No database changes** (snapshot refresh only).", ""]
         else:
             lines += ["**No changes.**", ""]
-        return _safe("\n".join(_with_removed_table(lines, info.removed_upstream)))
+        return _safe(_fit_body("\n".join(_with_removed_table(lines, info.removed_upstream))))
 
     if promotions:
-        count = len(promotions)
-        lines += [
-            f"**{_count(count)} {plural(count, 'entry', 'entries')} promoted to `cheater`.**",
-            "",
-            "| SteamID | Last known name | Before | After | Hackerpolice proof |",
-            "| --- | --- | --- | --- | --- |",
-        ]
-        lines += [
-            "| `{steamid}` | {name} | {before} | {after} | {evidence} |".format(
-                steamid=change.steamid,
-                name=_name_cell(change),
-                before=", ".join(f"`{attribute}`" for attribute in change.before),
-                after=", ".join(f"`{attribute}`" for attribute in change.after),
-                evidence=_evidence_cell(change.evidence),
-            )
-            for change in promotions
-        ]
-        lines.append("")
-
+        lines += _promotion_lines(promotions)
     if demotions:
-        count = len(demotions)
-        lines += [
-            f"**{_count(count)} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
-            "removed from the hackerpolice list since).**",
-            "",
-            "| SteamID | Last known name | Before | After |",
-            "| --- | --- | --- | --- |",
-        ]
-        lines += [
-            "| `{steamid}` | {name} | {before} | {after} |".format(
-                steamid=change.steamid,
-                name=_name_cell(change),
-                before=", ".join(f"`{attribute}`" for attribute in change.before),
-                after=", ".join(f"`{attribute}`" for attribute in change.after) or "entry removed",
-            )
-            for change in demotions
-        ]
-        lines.append("")
+        lines += _demotion_lines(demotions)
 
     # Upstream removals first: the closing sentence and the proof note that
     # follow are always the last thing in the report.
@@ -356,19 +444,20 @@ def render_report(info: RunInfo) -> str:
     while lines and not lines[-1].strip():
         lines.pop()  # exactly one blank line before the closing sentence
     lines += ["", closing]
-    if promotions:
-        total_links = sum(len(change.evidence) for change in promotions)
-        if total_links == 1:
-            lines.append("Proof link comes from the Vorobey hackerpolice list and is shown for review only.")
-        else:
-            lines.append("Proof links come from the Vorobey hackerpolice list and are shown for review only.")
-        lines.append("")
-    else:
-        lines.append("")
+
+    total_links = sum(len(change.evidence) for change in promotions)
+    if total_links:
+        note = (
+            "Proof link comes from the Vorobey hackerpolice list and is shown for review only."
+            if total_links == 1
+            else "Proof links come from the Vorobey hackerpolice list and are shown for review only."
+        )
+        lines.append(note)
     if info.include_proof:
         lines += [
+            "",
             "**Note:** `--include-proof` was enabled, so an `[auto]` proof line citing the",
             "hackerpolice list was also written into each entry above.",
-            "",
         ]
-    return _safe("\n".join(lines))
+    lines.append("")
+    return _safe(_fit_body("\n".join(lines)))

@@ -14,6 +14,10 @@ replica, never decoded/re-serialised) in the same working tree,
 so the workflow commits both files in one pull request and the baseline
 only advances when that PR is merged.
 
+The snapshot is deliberately NOT advanced when the removals it found could
+not be applied -- demotion disabled (``--demote`` missing) or vetoed by the
+mass-demotion guard -- because advancing it would forget those removals.
+
 The report (pull request body / job summary) lists every SteamID that
 disappeared from the upstream list since the previous snapshot, as a
 ``| SteamID | Profile Link |`` table -- the upstream list stores no player
@@ -97,7 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--demote",
         action="store_true",
         help="remove cheater (or the whole entry) ONLY for SteamIDs that were in the previous snapshot "
-        "but are gone from the current hackerpolice list (off by default)",
+        "but are gone from the current hackerpolice list (off by default); while it is off, a run that "
+        "finds removals leaves the snapshot untouched so they stay demotion candidates",
     )
     parser.add_argument(
         "--snapshot",
@@ -198,9 +203,12 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def write_database(path: Path, database: PlayerList, original: str, *, dry_run: bool) -> bool:
-    """Write the playerlist if it changed; returns whether it changed."""
-    rendered = dumps(database)
+def write_database(path: Path, rendered: str, original: str, *, dry_run: bool) -> bool:
+    """Write the rendered playerlist if it changed; returns whether it changed.
+
+    Takes the already rendered text (the caller serialised the database once
+    to decide what changed) so the file is never serialised twice.
+    """
     modified = rendered != original
     if modified and not dry_run:
         _atomic_write_bytes(path, rendered.encode("utf-8"))
@@ -295,6 +303,9 @@ def run(args: argparse.Namespace) -> int:
     # Set to False when demotion was skipped as unsafe: the snapshot must
     # NOT advance then, or the skipped removals would be lost forever.
     update_snapshot = not args.no_update_snapshot
+    snapshot_note: str | None = None
+    if args.no_update_snapshot:
+        snapshot_note = "**not refreshed** (`--no-update-snapshot`)"
     if args.demote:
         if previous_index is None:
             demotion_note = f"skipped - no snapshot at {snapshot_path} yet, so no removal can be proven"
@@ -319,6 +330,21 @@ def run(args: argparse.Namespace) -> int:
                 LOGGER.warning("Demotion %s.", demotion_note)
                 removed = set()
                 update_snapshot = False
+                snapshot_note = "**not refreshed** - demotion was skipped, so these removals stay demotion candidates"
+
+    if not args.demote and removed_upstream:
+        # Demotion is off, so these removals cannot be applied. Advancing the
+        # baseline anyway would silently forget them forever (the next run
+        # would see "previous == current"). Keep the old snapshot instead.
+        update_snapshot = False
+        snapshot_note = (
+            f"**not refreshed** - demotion is disabled (`--demote`) so the "
+            f"{len(removed_upstream):,} upstream {plural(len(removed_upstream), 'removal', 'removals')} "
+            "could not be applied; the baseline is kept so they stay demotion candidates"
+        )
+        LOGGER.warning(
+            "Snapshot left alone: demotion is disabled and %d upstream removals are pending.", len(removed_upstream)
+        )
 
     changes = sync(database, index, include_proof=args.include_proof, enable_demote=args.demote, removed_ids=removed)
 
@@ -330,7 +356,8 @@ def run(args: argparse.Namespace) -> int:
     # Decide what WOULD change before touching any file, render and write
     # the report first, and only then write the database and the snapshot:
     # if the report cannot be written, nothing else has been modified yet.
-    modified = dumps(database) != original
+    rendered = dumps(database)
+    modified = rendered != original
     snapshot_changed = update_snapshot and source_bytes != previous_bytes
 
     report = render_report(
@@ -347,6 +374,7 @@ def run(args: argparse.Namespace) -> int:
             removed_from_source=removed_count,
             removed_upstream=tuple(removed_upstream),
             demotion_note=demotion_note,
+            snapshot_note=snapshot_note,
             snapshot_changed=snapshot_changed,
         )
     )
@@ -365,7 +393,7 @@ def run(args: argparse.Namespace) -> int:
     # when demotion was skipped as unsafe (mass-demotion guard),
     # update_snapshot is False and the snapshot is left alone so the same
     # removals are re-evaluated next run.
-    write_database(database_path, database, original, dry_run=args.dry_run)
+    write_database(database_path, rendered, original, dry_run=args.dry_run)
     _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
     if update_snapshot:
         write_snapshot(snapshot_path, source_bytes, previous_bytes, dry_run=args.dry_run)

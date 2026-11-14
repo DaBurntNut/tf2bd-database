@@ -33,6 +33,7 @@ __all__ = [
     "RACIST_PROOF_PREFIX",
     "Change",
     "demote",
+    "is_racist_proof",
     "promote",
     "sync",
 ]
@@ -45,20 +46,32 @@ __all__ = [
 RACIST_PROOF_PREFIX = "[auto] automatically marked: Racist | reason:"
 
 
+def is_racist_proof(proof: str) -> bool:
+    """True if a proof line is one of the automatic ``Racist`` chat-log lines.
+
+    Matching is forgiving on purpose: leading/trailing whitespace and letter
+    case are ignored, so a future tool that writes ``[AUTO] Automatically
+    marked: RACIST`` still protects the line. Anything else -- a video link,
+    "Silent Aim & ESP", a hand-written "Racist behavior..." note -- is NOT a
+    racist proof and is dropped when the cheater tag goes away.
+    """
+    return proof.strip().casefold().startswith(RACIST_PROOF_PREFIX.casefold())
+
+
 def _filter_racist_proofs(proofs: Any) -> list[str]:
     """Keep only the ``[auto] ... Racist`` proof lines, dropping all others.
 
     When demoting ``cheater`` + ``racist`` -> ``racist``, the cheater tag was
     a false positive, so its evidence (video links, "Silent Aim & ESP", a
     hand-written "Racist behavior..." note, anything) is removed too. Only
-    proofs starting with :data:`RACIST_PROOF_PREFIX` -- the automatically
-    recorded chat-log lines that justify ``racist`` -- are kept, in order.
+    proofs that :func:`is_racist_proof` accepts -- the automatically recorded
+    chat-log lines that justify ``racist`` -- are kept, in order.
     A malformed (non-list) proof yields an empty list: it cannot contain a
     valid racist line, so nothing of it may survive the demotion either.
     """
     if not isinstance(proofs, list):
         return []
-    return [p for p in proofs if isinstance(p, str) and p.startswith(RACIST_PROOF_PREFIX)]
+    return [p for p in proofs if isinstance(p, str) and is_racist_proof(p)]
 
 
 @dataclass(frozen=True)
@@ -86,10 +99,21 @@ def _evidence_links(entry: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(links))
 
 
+def _proofs(player: Player) -> list[str]:
+    """The entry's proof list, tolerating a malformed value.
+
+    ``validate()`` rejects a non-list proof before anything is written, so
+    this only has to keep the policy itself crash-free while it runs.
+    """
+    proof = player.get("proof")
+    if isinstance(proof, list):
+        return list(proof)
+    return [] if proof is None else [str(proof)]
+
+
 def _write_proof(player: Player, evidence: tuple[str, ...]) -> None:
     """Write the ``[auto]`` proof line into a player entry (idempotent)."""
-    proof = player.get("proof")
-    proof = list(proof) if isinstance(proof, list) else ([] if proof is None else [str(proof)])
+    proof = _proofs(player)
     if not any(isinstance(item, str) and PROOF_MARKER in item for item in proof):
         line = f"{PROOF_MARKER} ({SOURCE_REPO_URL})"
         if evidence:

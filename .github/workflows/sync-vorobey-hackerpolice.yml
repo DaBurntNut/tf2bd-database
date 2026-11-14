@@ -16,7 +16,10 @@ name: Sync Vorobey hackerpolice
 # playerlist.garou3299.json.
 # The pull request also lists EVERY SteamID removed from the hackerpolice list
 # since the previous snapshot (| SteamID | Profile Link | with the Steam
-# profile permalink), because that list stores no player names. The snapshot is refreshed to the current list in the SAME
+# profile permalink), because that list stores no player names.
+# The snapshot is only advanced when the removals it found were applied: a run
+# without --demote, or one vetoed by the mass-demotion guard, keeps the old
+# baseline so those removals stay demotion candidates. The snapshot is refreshed to the current list in the SAME
 # pull request, so the baseline only advances when the PR is merged - no
 # separate snapshot bot/PR is needed (a separate weekly snapshot PR would
 # race this workflow: merging it first would erase the very removals this
@@ -88,8 +91,8 @@ jobs:
       - name: Lint (ruff)
         run: |
           python3 -m pip install --quiet --disable-pip-version-check ruff==0.17.4
-          ruff check scripts tests
-          ruff format --check scripts tests
+          python3 -m ruff check scripts tests
+          python3 -m ruff format --check scripts tests
 
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -v

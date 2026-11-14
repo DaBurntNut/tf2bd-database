@@ -23,12 +23,14 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.request
 from email.message import Message
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import sources
 from playerlist import (
     PlayerListError,
     account_id,
@@ -40,8 +42,16 @@ from playerlist import (
     steam_profile_url,
     validate,
 )
-from policy import Change, demote, promote, sync
-from report import MAX_REMOVED_TABLE_ROWS, RunInfo, plural, render_closing, render_report
+from policy import Change, demote, is_racist_proof, promote, sync
+from report import (
+    MAX_CHANGE_TABLE_ROWS,
+    MAX_REMOVED_TABLE_ROWS,
+    MAX_REPORT_CHARS,
+    RunInfo,
+    plural,
+    render_closing,
+    render_report,
+)
 from sources import (
     PROOF_MARKER,
     HackerpoliceIndex,
@@ -102,8 +112,10 @@ class HackerpoliceIndexTests(unittest.TestCase):
 # Source fetching (network layer, mocked)
 # --------------------------------------------------------------------------- #
 class _FakeResponse:
-    def __init__(self, body: bytes):
+    def __init__(self, body: bytes, headers: dict[str, str] | None = None):
         self._body = body
+        self.headers = headers or {}
+        self.read_count = 0
 
     def __enter__(self):
         return self
@@ -112,6 +124,7 @@ class _FakeResponse:
         return False
 
     def read(self, size=-1):
+        self.read_count += 1
         return self._body if size is None or size < 0 else self._body[:size]
 
 
@@ -121,7 +134,7 @@ class SourceFetchTests(unittest.TestCase):
 
     def fetch(self, side_effect):
         with (
-            mock.patch("sources.urllib.request.urlopen", side_effect=side_effect) as urlopen,
+            mock.patch("sources._OPENER.open", side_effect=side_effect) as urlopen,
             mock.patch("sources.time.sleep"),
         ):
             result = load_first_available_raw([self.URL])
@@ -148,7 +161,7 @@ class SourceFetchTests(unittest.TestCase):
         for bad_url in ("http://example.invalid/raw.json", "/etc/passwd"):
             envelope = json.dumps({"encoding": "none", "content": "", "download_url": bad_url}).encode("utf-8")
             with (
-                mock.patch("sources.urllib.request.urlopen", side_effect=[_FakeResponse(envelope)]) as urlopen,
+                mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(envelope)]) as urlopen,
                 mock.patch("sources.time.sleep"),
                 self.assertRaises(SyncError),
             ):
@@ -174,7 +187,7 @@ class SourceFetchTests(unittest.TestCase):
 
     def test_oversized_response_is_rejected(self):
         with (
-            mock.patch("sources.urllib.request.urlopen", return_value=_FakeResponse(self.BODY)),
+            mock.patch("sources._OPENER.open", return_value=_FakeResponse(self.BODY)),
             mock.patch("sources.MAX_SOURCE_BYTES", 10),
             mock.patch("sources.time.sleep"),
             self.assertRaises(SyncError),
@@ -184,12 +197,33 @@ class SourceFetchTests(unittest.TestCase):
     def test_permanent_http_error_is_not_retried(self):
         error = urllib.error.HTTPError(self.URL, 404, "not found", Message(), None)
         with (
-            mock.patch("sources.urllib.request.urlopen", side_effect=[error]) as urlopen,
+            mock.patch("sources._OPENER.open", side_effect=[error]) as urlopen,
             mock.patch("sources.time.sleep"),
             self.assertRaises(SyncError),
         ):
             load_first_available_raw([self.URL])
         self.assertEqual(urlopen.call_count, 1)
+
+    def test_https_downgrade_redirect_is_refused(self):
+        """A redirect from HTTPS to plain HTTP must never be followed: the
+        fetched bytes become the snapshot and drive promotions."""
+        handler = sources._HttpsOnlyRedirectHandler()
+        request = urllib.request.Request("https://example.invalid/list.json")
+        with self.assertRaises(SyncError):
+            handler.redirect_request(request, None, 302, "Found", Message(), "http://example.invalid/list.json")
+        upgraded = handler.redirect_request(request, None, 302, "Found", Message(), "https://cdn.invalid/list.json")
+        self.assertEqual(upgraded.full_url, "https://cdn.invalid/list.json")
+
+    def test_oversized_declared_length_is_rejected_without_downloading(self):
+        response = _FakeResponse(self.BODY, {"Content-Length": str(10 * 1024 * 1024)})
+        with (
+            mock.patch("sources._OPENER.open", return_value=response),
+            mock.patch("sources.MAX_SOURCE_BYTES", 1024),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
+        self.assertEqual(response.read_count, 0)  # never downloaded the body
 
     def test_transient_http_error_is_retried_until_success(self):
         error = urllib.error.HTTPError(self.URL, 503, "unavailable", Message(), None)
@@ -403,6 +437,25 @@ class DemoteTests(unittest.TestCase):
             ]
         )
         self.assertEqual(database["players"][0]["proof"], kept)
+
+    def test_racist_proof_matching_ignores_case_and_padding(self):
+        """A future tool writing "[AUTO] Automatically marked: RACIST ..."
+        must not lose the line that justifies the surviving racist tag."""
+        kept = '  [AUTO] Automatically marked: RACIST | reason: "slur"  '
+        database, _ = self.demote([player("[U:1:200]", ["cheater", "racist"], proof=[kept, "Silent Aim & ESP"])])
+        self.assertEqual(database["players"][0]["proof"], [kept])
+
+    def test_is_racist_proof(self):
+        self.assertTrue(is_racist_proof('[auto] automatically marked: Racist | reason: "x"'))
+        self.assertTrue(is_racist_proof("  [AUTO] automatically marked: RACIST | reason:"))
+        for value in (
+            '[auto] automatically marked: Cheater | reason: "aimbot"',
+            "https://youtu.be/x",
+            "Racist behavior in voice chat",
+            "[auto] automatically marked: Racist",
+            "",
+        ):
+            self.assertFalse(is_racist_proof(value), value)
 
     def test_cheater_and_racist_with_non_list_proof_drops_the_proof(self):
         database, _ = self.demote([player("[U:1:200]", ["cheater", "racist"], proof="Silent Aim & ESP")])
@@ -662,6 +715,44 @@ class ReportTests(unittest.TestCase):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://example.invalid/a (b)",))
         report = render_report(self.info([change]))
         self.assertIn("https://example.invalid/a%20%28b%29", report)
+
+    def test_no_proof_note_without_evidence_links(self):
+        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))  # no evidence links
+        report = render_report(self.info([change]))
+        self.assertNotIn("Proof links come from", report)
+
+    def test_name_and_proof_cells_cannot_inject_html_or_mentions(self):
+        change = Change(
+            "[U:1:1]",
+            "<img src=x>@here",
+            ("suspicious",),
+            ("cheater",),
+            ("@everyone see <b>this</b>",),
+        )
+        report = render_report(self.info([change]))
+        self.assertNotIn("<img", report)
+        self.assertNotIn("@here", report)
+        self.assertNotIn("@everyone", report)
+        self.assertNotIn("<b>", report)
+        self.assertIn("&lt;b&gt;this&lt;/b&gt;", report)  # rendered literally, not as HTML
+
+    def test_change_tables_are_capped(self):
+        changes = [
+            Change(f"[U:1:{1000 + n}]", f"n{n}", ("suspicious",), ("cheater",))
+            for n in range(MAX_CHANGE_TABLE_ROWS + 3)
+        ]
+        report = render_report(self.info(changes))
+        rows = [line for line in report.splitlines() if line.startswith("| `[U:1:")]
+        self.assertEqual(len(rows), MAX_CHANGE_TABLE_ROWS)
+        self.assertIn("… and 3 more entries not shown here", report)
+
+    def test_report_body_is_hard_capped(self):
+        """Pathological input (very long names) can never break PR creation."""
+        changes = [Change(f"[U:1:{1000 + n}]", "x" * 900, ("suspicious",), ("cheater",)) for n in range(200)]
+        report = render_report(self.info(changes, removed_upstream=tuple(f"[U:1:{5000 + n}]" for n in range(100))))
+        self.assertLessEqual(len(report), MAX_REPORT_CHARS)
+        self.assertIn("report truncated to fit the pull request body limit", report)
+        report.encode("utf-8")
 
     def test_dry_run_and_include_proof_notes(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))
@@ -1073,11 +1164,43 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("looks like an upstream problem", stdout)
         self.assertIn("**61 SteamIDs removed from the Vorobey hackerpolice list", stdout)
+        self.assertIn("**not refreshed**", stdout)
         # ... while demotion was skipped, so the baseline did not advance.
         self.assertEqual(
             {p["steamid"] for p in json.loads(snapshot_fixture.read_text(encoding="utf-8"))["players"]},
             {f"[U:1:{n}]" for n in range(400, 461)},
         )
+
+    def test_snapshot_is_frozen_when_demotion_is_disabled(self):
+        """A run without --demote must not advance the baseline past removals
+        it could not apply -- that would forget them forever."""
+        self.database.write_text(
+            dumps({"$schema": "x", "file_info": {}, "players": [player("[U:1:400]", ["cheater"])]}),
+            encoding="utf-8",
+        )
+        snapshot_fixture = self.write_snapshot_fixture(hackerpolice_entry("[U:1:300]"), hackerpolice_entry("[U:1:400]"))
+        before = snapshot_fixture.read_bytes()
+
+        code, stdout, _ = self.run_cli("--source", str(self.source))  # no --demote
+        self.assertEqual(code, 0)
+        self.assertEqual(snapshot_fixture.read_bytes(), before)  # baseline held back
+        self.assertIn("**not refreshed**", stdout)
+        self.assertIn("demotion is disabled", stdout)
+
+        # ... and the very same removals are applied once --demote is passed.
+        code, stdout, _ = self.run_cli("--source", str(self.source), "--demote")
+        self.assertEqual(code, 0)
+        players = json.loads(self.database.read_text(encoding="utf-8"))["players"]
+        self.assertEqual(players, [])
+        self.assertEqual(snapshot_fixture.read_bytes(), self.source.read_bytes())
+
+    def test_no_update_snapshot_is_reported(self):
+        self.write_snapshot_fixture(hackerpolice_entry("[U:1:100]"))
+        before = (self.root / "snapshot.json").read_bytes()
+        code, stdout, _ = self.run_cli("--source", str(self.source), "--demote", "--no-update-snapshot")
+        self.assertEqual(code, 0)
+        self.assertIn("`--no-update-snapshot`", stdout)
+        self.assertEqual((self.root / "snapshot.json").read_bytes(), before)
 
     def test_demote_without_snapshot_demotes_nobody_and_creates_baseline(self):
         self.database.write_text(

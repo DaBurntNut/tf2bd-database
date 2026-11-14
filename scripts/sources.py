@@ -41,7 +41,7 @@ DEFAULT_SOURCES: tuple[str, ...] = (
 )
 
 # Single source of truth for the tool version (also used for --version).
-VERSION = "3.3"
+VERSION = "4.0"
 
 USER_AGENT = (
     f"Garou3299-tf2bd-database-vorobey-hackerpolice-sync/{VERSION} (+https://github.com/Garou3299/tf2bd-database)"
@@ -51,8 +51,8 @@ FETCH_TIMEOUT_SECONDS = 30
 FETCH_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 2
 
-# Sanity cap on a fetched list (currently ~2 MB): a misbehaving or hostile
-# endpoint must not be able to exhaust memory by streaming forever.
+# Sanity cap on a fetched list (the real one is ~1.9 MB): a misbehaving or
+# hostile endpoint must not be able to exhaust memory by streaming forever.
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 
 __all__ = [
@@ -71,6 +71,34 @@ __all__ = [
 
 class SyncError(Exception):
     """A user-facing failure (bad input, unreachable source) rather than a bug."""
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but never downgrade an HTTPS fetch to plain HTTP.
+
+    ``urllib`` happily follows an ``https://`` -> ``http://`` redirect, which
+    would let anything on the network path swap the list we are about to
+    snapshot (and act on: promotions come from this file). Refusing the
+    downgrade keeps every fetched byte HTTPS-protected end to end.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlparse(new.full_url).scheme != "https":
+            raise SyncError(f"refusing to follow a non-HTTPS redirect to {newurl}")
+        return new
+
+
+# One opener for the whole process: it holds no per-request state, and it is
+# what enforces the HTTPS-only redirect rule above.
+_OPENER = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
+
+
+def _declared_length(response: object) -> int | None:
+    """Usable ``Content-Length`` of a response, or ``None`` when absent/invalid."""
+    response_headers = getattr(response, "headers", None)
+    declared = response_headers.get("Content-Length") if response_headers is not None else None
+    return int(declared) if isinstance(declared, str) and declared.isdigit() else None
 
 
 @dataclass(frozen=True)
@@ -168,8 +196,14 @@ def _fetch_bytes(
             if urllib.parse.urlparse(url).hostname == "api.github.com":
                 headers["Accept"] = "application/vnd.github.raw"
             request = urllib.request.Request(url, headers=headers)
-            # Scheme is restricted to HTTP(S) above (Bandit B310).
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+            # Scheme is restricted to HTTP(S) above (Bandit B310); the opener
+            # only adds the HTTPS-downgrade guard.
+            with _OPENER.open(request, timeout=timeout) as response:  # nosec B310
+                # Reject an oversized body before downloading it when the
+                # server says how big it is.
+                declared = _declared_length(response)
+                if declared is not None and declared > MAX_SOURCE_BYTES:
+                    raise SyncError(f"{url} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
                 body = response.read(MAX_SOURCE_BYTES + 1)
             if len(body) > MAX_SOURCE_BYTES:
                 raise SyncError(f"{url} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
