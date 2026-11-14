@@ -65,7 +65,7 @@ from sources import (
     load_snapshot,
     removed_steamids,
 )
-from sync_vorobey_hackerpolice import DEFAULT_SNAPSHOT, build_parser, main
+from sync_vorobey_hackerpolice import DEFAULT_SNAPSHOT, build_parser, main, write_database
 
 HACKERPOLICE_PROOF = "https://discord.com/channels/1/2"
 
@@ -1526,6 +1526,24 @@ class ClosingOrderTests(unittest.TestCase):
         )
         closing = render_closing(changes, database="db.json")
         self.assertIn("these SteamIDs: [U:1:100], [U:1:900];", closing)
+
+
+class WriteDatabaseCompatibilityTests(unittest.TestCase):
+    def test_accepts_the_pre_4_0_parsed_playerlist(self):
+        """The signature used to take the parsed document, not the text."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "list.json"
+            database = {"players": [player("[U:1:1]", ["cheater"])]}
+            original = dumps(database)
+            path.write_text(original, encoding="utf-8")
+            self.assertFalse(write_database(path, database, original, dry_run=False))
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            database["players"].append(player("[U:1:2]", ["cheater"]))
+            self.assertTrue(write_database(path, database, original, dry_run=False))
+            self.assertEqual(path.read_text(encoding="utf-8"), dumps(database))
+            # a dry run still refuses to write, whichever form is passed
+            self.assertTrue(write_database(path, {"players": []}, original, dry_run=True))
+            self.assertEqual(path.read_text(encoding="utf-8"), dumps(database))
 
 
 class CliTests(unittest.TestCase):

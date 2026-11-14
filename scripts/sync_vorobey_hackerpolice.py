@@ -203,12 +203,17 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def write_database(path: Path, rendered: str, original: str, *, dry_run: bool) -> bool:
+def write_database(path: Path, rendered: str | PlayerList, original: str, *, dry_run: bool) -> bool:
     """Write the rendered playerlist if it changed; returns whether it changed.
 
-    Takes the already rendered text (the caller serialised the database once
-    to decide what changed) so the file is never serialised twice.
+    ``rendered`` is normally the serialised text: the caller already
+    serialised the database once to decide what changed, so it is never
+    serialised twice. A parsed playerlist is accepted too -- that was the
+    signature before 4.0 -- and serialised here, so older callers keep
+    working instead of silently writing a `repr()` of the document.
     """
+    if not isinstance(rendered, str):
+        rendered = dumps(rendered)
     modified = rendered != original
     if modified and not dry_run:
         _atomic_write_bytes(path, rendered.encode("utf-8"))
