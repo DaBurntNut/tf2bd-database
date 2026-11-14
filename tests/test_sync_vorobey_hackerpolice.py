@@ -1723,8 +1723,16 @@ class ReportTests(unittest.TestCase):
         with_links = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://x/1", "https://x/2"))
         without_links = Change("[U:1:2]", "b", ("suspicious",), ("cheater",))
         report = render_report(self.info([with_links, without_links]))
-        self.assertIn("[1](https://x/1)<br>[2](https://x/2)", report)
+        self.assertIn("[link 1](https://x/1), [link 2](https://x/2)", report)
         self.assertIn("**2 entries promoted to `cheater`.**", report)
+
+    def test_report_never_emits_raw_html(self):
+        """Markdown previews that escape HTML would show the tag as literal text."""
+        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://x/1", "https://x/2"))
+        report = render_report(self.info([change], removed_upstream=("[U:1:2]",)))
+        self.assertNotIn("<br>", report)
+        self.assertNotIn("<br/>", report)
+        self.assertNotIn("<br />", report)
 
     def test_prose_evidence_is_not_turned_into_a_link(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("seen spinbotting",))

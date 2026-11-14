@@ -183,14 +183,21 @@ def _markdown_link(url: str, label: str) -> str:
 
 
 def _evidence_cell(links: Sequence[str]) -> str:
-    """Proof column: real links where possible, escaped text otherwise."""
+    """Proof column: real links where possible, escaped text otherwise.
+
+    Several proofs are listed side by side ("link 1", "link 2") rather than
+    separated by an HTML ``<br>``: the report never emits raw HTML, so a cell
+    renders the same in a pull request, in a job summary and in any plain
+    Markdown preview, where a tag would show up as literal text.
+    """
     if not links:
         return "-"
+    single = len(links) == 1
     rendered = [
-        _markdown_link(link, "link" if len(links) == 1 else str(position)) if _is_url(link) else _cell(link)
+        _markdown_link(link, "link" if single else f"link {position}") if _is_url(link) else _cell(link)
         for position, link in enumerate(links, start=1)
     ]
-    return "<br>".join(rendered)
+    return ", ".join(rendered)
 
 
 def plural(count: int, singular: str, plural_form: str) -> str:
