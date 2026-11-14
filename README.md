@@ -19,9 +19,6 @@ I’m currently using [this](https://github.com/surepy/tf2_bot_detector), which 
 
 ---
 
-
----
-
 ## What does the Bot do?
 
 Every day at **05:23 UTC**, a bot compares `playerlist.garou3299.json` with the
@@ -32,6 +29,11 @@ pull request is merged.**
 Any pull request that touches the scripts or the tests also runs a read-only
 **Lint and test** job, so broken code cannot be merged unreviewed.
 
+The same workflow can be started by hand — **Actions → Sync Vorobey hackerpolice
+→ Run workflow** — with a choice of what to do when entries need updating: open a
+pull request (the default) or commit straight to the default branch. A manual run
+can also be a dry run, or force demotion past the mass-removal guard.
+
 ### Promote (player is also on Vorobey's list)
 
 | Tags before | Tags after |
@@ -40,6 +42,12 @@ Any pull request that touches the scripts or the tests also runs a read-only
 | `racist` | `cheater` + `racist` |
 | `suspicious` + `racist` | `cheater` + `racist` |
 | `cheater` (already) | unchanged |
+
+The evidence link from Vorobey's list appears in the pull request, not in the
+database: `playerlist.garou3299.json` never gains a proof line from this bot.
+(Running the script yourself with `--include-proof` does write one
+`[auto] cheater: matched …` line into each promoted entry; the scheduled
+workflow never turns it on.)
 
 ### Demote (player was on Vorobey's list before, but has been removed from it)
 
