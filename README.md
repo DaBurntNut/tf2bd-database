@@ -1,112 +1,74 @@
 ![social-preview](https://raw.githubusercontent.com/Garou3299/tf2bd-database/refs/heads/master/public/social-preview.png)
 # TF2BD Database
-My Database of Cheaters and Suspicious Players in Team Fortress 2.
 
----
-I’m currently using [this](https://github.com/surepy/tf2_bot_detector), which is a fork of [PazerOP's TF2BD](https://github.com/PazerOP/tf2_bot_detector).
+My database of cheaters and suspicious players in Team Fortress 2, kept in sync
+with the [Vorobey hackerpolice list](https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json).
 
-**Q:** *How can I use your TF2 Cheaters Database?*
+## Use it
 
-**A:**
+Download `playerlist.garou3299.json`
+([direct link](https://github.com/Garou3299/tf2bd-database/blob/master/playerlist.garou3299.json),
+or `Code → Download ZIP`) and drop it into TF2BD's `cfg` folder. Built for
+[this fork](https://github.com/surepy/tf2_bot_detector) of
+[TF2BD](https://github.com/PazerOP/tf2_bot_detector).
 
-**Option A:** Download the ZIP file of this repository by clicking the `Code` button, then selecting `Download ZIP`. After extracting it, all you need is the `playerlist.garou3299.json` file then simply paste this file inside the `cfg` folder.
+## Contribute
 
-**Option B:** Go [here](https://github.com/Garou3299/tf2bd-database/blob/master/playerlist.garou3299.json), click the `More file actions` button in the top-right corner, and download the `playerlist.garou3299.json` file directly or just click the `Download raw file` button then simply paste this file inside the `cfg` folder.
+Send a permanent Steam profile link or ID **with video evidence** to
+[Discussions](https://github.com/Garou3299/tf2bd-database/discussions/1).
 
-**Q:** *How I can contribute to your Database?*
+## What the bot does
 
-**A:** If you have a cheater’s permanent Steam profile link or ID along with video evidence proving the behavior, please submit it [here](https://github.com/Garou3299/tf2bd-database/discussions/1).
+Every day at **05:23 UTC** it compares this database with Vorobey's list and
+opens a pull request. **Nothing changes until you merge it.** It can also be run
+by hand (**Actions → Run workflow**) as a pull request, a direct commit or a dry
+run.
 
----
-
-## What does the Bot do?
-
-Every day at **05:23 UTC**, a bot compares `playerlist.garou3299.json` with the
-[Vorobey hackerpolice cheater list](https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json)
-and opens a pull request with its proposals. **Nothing changes until the
-pull request is merged.**
-
-Any pull request that touches the scripts or the tests also runs a read-only
-**Lint and test** job, so broken code cannot be merged unreviewed.
-
-The same workflow can be started by hand — **Actions → Sync Vorobey hackerpolice
-→ Run workflow** — with a choice of what to do when entries need updating: open a
-pull request (the default) or commit straight to the default branch. A manual run
-can also be a dry run, or force demotion past the mass-removal guard.
-
-### Promote (player is also on Vorobey's list)
-
-| Tags before | Tags after |
+| On Vorobey's list | Result |
 | --- | --- |
 | `suspicious` | `cheater` |
 | `racist` | `cheater` + `racist` |
 | `suspicious` + `racist` | `cheater` + `racist` |
-| `cheater` (already) | unchanged |
+| `cheater` already | unchanged |
 
-The evidence link from Vorobey's list appears in the pull request, not in the
-database: `playerlist.garou3299.json` never gains a proof line from this bot.
-(Running the script yourself with `--include-proof` does write one
-`[auto] cheater: matched …` line into each promoted entry; the scheduled
-workflow never turns it on.)
-
-### Demote (player was on Vorobey's list before, but has been removed from it)
-
-| Tags before | Tags after |
+| Gone from Vorobey's list | Result |
 | --- | --- |
-| `cheater` | entry removed from the database |
-| `cheater` + `racist` | `racist` (`cheater` and every proof that is not an `[auto] automatically marked: Racist \| reason: …` line are removed; those racist lines stay) |
-| `cheater` + any other tag | entry removed (the entry as a whole was a false positive) |
+| `cheater`, and it was in the previous snapshot | entry removed |
+| `cheater` + `racist` | `racist` kept; `cheater` and its proofs removed |
+| `cheater` + any other tag | entry removed |
 
-Players who were added to this database and were never on
-Vorobey's list are **never** demoted or removed by the bot.
+Only players who were in the previous snapshot and are gone now are demoted, so
+**cheaters added by hand are never touched**. Every removed SteamID is listed in
+the pull request with its profile link. `snapshot/playerlist.vorobey-hackerpolice.json`
+is yesterday's copy of Vorobey's list — the bot compares against it to know who
+was removed, and updates it in the same pull request. Evidence links stay in the
+pull request; they reach the database only if you run the script yourself with
+`--include-proof`.
 
-### Removed from Vorobey's list
+## Safety rails
 
-Every SteamID that was in the previous snapshot but is gone from the current
-Vorobey list is listed in the pull request, whether or not it was demoted
-above:
+- **Frozen baseline** — if the removals it found cannot be applied (demotion off,
+  or vetoed by the guard), the snapshot is not advanced, so they are not forgotten.
+- **Mass-removal guard** — more than 50 IDs *and* more than 20 % gone at once means
+  demotion is skipped; `--allow-mass-demotion` forces it through.
+- **Strict JSON** — `NaN`, `Infinity` and duplicate keys are refused, never
+  rewritten, so the bot cannot publish a file TF2BD itself cannot load.
+- **Bounded fetch** — HTTPS only (a redirect downgrade is refused), 64 MiB, 30 s,
+  3 attempts, then the next fallback; credentials in a URL are redacted.
+- **Atomic writes** — every file is replaced in one step, so a crash or a full disk
+  leaves the previous file intact.
+- **Checked changes** — a pull request touching `scripts/`, `tests/`,
+  `pyproject.toml`, `.gitattributes` or the workflow runs ruff, `mypy --strict` and
+  the tests, read-only.
 
-| SteamID | Profile Link |
-| --- | --- |
-| `[U:1:1582772205]` | [Profile](https://steamcommunity.com/profiles/76561199543037933) |
-
-Vorobey's list stores no player names, so this table only shows the SteamID
-and the Steam profile permalink (the SteamID64 URL), which keeps working even
-after a player renames themselves. Very long lists are capped in the pull
-request body with the number of remaining SteamIDs stated, so the body always
-fits GitHub's size limit.
-
-### Safety rails
-
-| Rail | What it guarantees |
-| --- | --- |
-| Snapshot-only demotion | An entry is only demoted when its SteamID was in the previous snapshot *and* is gone from today's list — never merely "absent from Vorobey", and never while upstream still lists it. Manually added cheaters are untouched. |
-| Mass-removal guard | If an implausibly large share of the snapshot disappears at once (more than 50 IDs and more than 20 %), demotion is skipped and the baseline is kept, so an upstream outage cannot wipe entries. A human can force it with `--allow-mass-demotion`. |
-| Strict JSON | A file that Python accepts but JSON does not is refused, never rewritten: `NaN`/`Infinity` (which would publish a playerlist TF2BD itself cannot load) and duplicated keys (which would silently discard half of an entry). The bot also never writes a non-finite number. |
-| Frozen baseline | If a run finds removals it cannot apply (demotion disabled, or vetoed by the guard), the snapshot is **not** advanced — otherwise those removals would be forgotten forever. |
-| Exact snapshot | The snapshot is written from the fetched **bytes**, never re-encoded, and `.gitattributes` keeps Git from touching line endings. |
-| Bounded fetch | HTTPS only (a redirect downgrade to plain HTTP is refused), 64 MiB maximum for downloaded *and* local sources, 30 s timeout, 3 attempts, then the next fallback URL. When `raw.githubusercontent.com` is unreachable the file is fetched through the GitHub **blob API** by its sha, so the run survives an outage of the raw host. Credentials in a `--source` URL are redacted from the pull request body. |
-| Bounded PR body | Tables are row-capped and the body is hard-truncated below GitHub's 65,536-**byte** limit (bytes, not characters: non-Latin player names are several bytes each, which is what GitHub counts), so opening the pull request can never fail on size. |
-| Checked changes | A pull request that touches `scripts/`, `tests/`, `pyproject.toml`, `.gitattributes` or the workflow runs `ruff`, `mypy --strict` and the full test suite with read-only permissions — it never reads or writes the database. |
-| Escaped output | Player names and proofs are escaped for Markdown: no broken tables, no forged links, no injected HTML, no `@` mentions, and no invisible control characters — an `ESC` in a name cannot repaint the job log and a bidi override cannot reverse the rest of the line. |
-
-### Run it yourself
+## Run it yourself
 
 ```
-python3 scripts/sync_vorobey_hackerpolice.py --dry-run      # report only
+python3 scripts/sync_vorobey_hackerpolice.py --dry-run
 python3 scripts/sync_vorobey_hackerpolice.py --demote --report out.md
-python3 -m unittest discover -s tests                        # run the test suite
-python3 -m mypy scripts                                     # strict type check
+python3 -m unittest discover -s tests
 ```
 
-Exit code `0` means success. `2` means the run refused or failed: the database
-or the Vorobey list was unusable, two paths pointed at the same file, the source
-was not HTTPS, or an output could not be written. Nothing is written when a
-refusal happens before the first write; a failure *while* writing leaves the
-previous file intact (each one is replaced atomically, never edited in place).
-
-### Update the Vorobey database copy
-
-| File | What the bot does |
-| --- | --- |
-| `snapshot/playerlist.vorobey-hackerpolice.json` | Updated in the same pull request to an exact, byte-for-byte copy of the current `playerlist.vorobey-hackerpolice.json` list. By comparing the previous copy against the new list, the bot knows exactly who was removed from the Vorobey hackerpolice list and it never touches players who were added manually to this database. |
+Exit `0` means success. Exit `2` means the run refused or failed — bad input,
+two paths pointing at the same file, a source that is not HTTPS, or an output
+that cannot be written — and no partial file is left behind.
