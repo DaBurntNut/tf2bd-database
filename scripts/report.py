@@ -158,26 +158,31 @@ def _with_removed_table(lines: list[str], steamids: Sequence[str]) -> list[str]:
     return [*lines, "", *table]
 
 
-def render_closing(changes: Sequence[Change]) -> str:
+def render_closing(changes: Sequence[Change], database: str | None = None) -> str:
     """Build the present-tense closing sentence describing what changed.
 
     Uses singular/plural-aware phrasing per attribute or entry, followed by
-    "; nothing else is modified."
+    "; nothing else is modified." When ``database`` is given the sentence
+    names the file the changes land in, e.g.
+    "Attribute is changed in `playerlist.garou3299.json` for this SteamID: ...",
+    so the pull request never leaves the reader guessing which list changed.
     """
     changed_steamids = [change.steamid for change in changes if (change.kind == "promote") or change.after]
     removed_steamids = [change.steamid for change in changes if (change.kind == "demote") and not change.after]
+    where = f" in `{database}`" if database else ""
+    removal_target = f" from `{database}`" if database else " from the database"
 
     parts: list[str] = []
     if changed_steamids:
         if len(changed_steamids) == 1:
-            parts.append("Attribute is changed for this SteamID: " + changed_steamids[0])
+            parts.append(f"Attribute is changed{where} for this SteamID: " + changed_steamids[0])
         else:
-            parts.append("Attributes are changed for these SteamIDs: " + ", ".join(changed_steamids))
+            parts.append(f"Attributes are changed{where} for these SteamIDs: " + ", ".join(changed_steamids))
     if removed_steamids:
         if len(removed_steamids) == 1:
-            parts.append("Entry is removed from the database for this SteamID: " + removed_steamids[0])
+            parts.append(f"Entry is removed{removal_target} for this SteamID: " + removed_steamids[0])
         else:
-            parts.append("Entries are removed from the database for these SteamIDs: " + ", ".join(removed_steamids))
+            parts.append(f"Entries are removed{removal_target} for these SteamIDs: " + ", ".join(removed_steamids))
 
     return "; ".join(parts) + "; nothing else is modified."
 
@@ -207,6 +212,15 @@ class RunInfo:
     # True when the snapshot file itself was refreshed this run, so a
     # snapshot-only PR does not misleadingly report "No changes."
     snapshot_changed: bool = False
+
+    @property
+    def database_name(self) -> str:
+        """File name of the database the changes are written to.
+
+        Only the file name, never the full (possibly temporary) path, so the
+        closing sentence reads the same on every machine.
+        """
+        return Path(self.database_path).name
 
 
 def render_report(info: RunInfo) -> str:
@@ -306,7 +320,11 @@ def render_report(info: RunInfo) -> str:
         ]
         lines.append("")
 
-    closing = render_closing(info.changes)
+    # Upstream removals first: the closing sentence and the proof note that
+    # follow are always the last thing in the report.
+    lines = _with_removed_table(lines, info.removed_upstream)
+
+    closing = render_closing(info.changes, database=info.database_name)
 
     while lines and not lines[-1].strip():
         lines.pop()  # exactly one blank line before the closing sentence
@@ -326,5 +344,4 @@ def render_report(info: RunInfo) -> str:
             "hackerpolice list was also written into each entry above.",
             "",
         ]
-    # Always last: the raw upstream removals, whatever the database did with them.
-    return _safe("\n".join(_with_removed_table(lines, info.removed_upstream)))
+    return _safe("\n".join(lines))

@@ -722,6 +722,25 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
             report.index("promoted to `cheater`"), report.index("removed from the Vorobey hackerpolice list")
         )
 
+    def test_closing_sentence_and_proof_note_are_always_last(self):
+        change = Change("[U:1:400]", "a", ("suspicious",), ("cheater",), ("https://x/1",))
+        report = render_report(self.info(changes=(change,), removed_upstream=("[U:1:5]",)))
+        lines = [line for line in report.splitlines() if line.strip()]
+        self.assertIn("Proof link", lines[-1])
+        self.assertIn("nothing else is modified.", lines[-2])
+        # The removed table sits above the closing sentence, not below it.
+        self.assertLess(report.index("| Profile Link |"), report.index("nothing else is modified."))
+
+    def test_closing_sentence_names_the_database_that_changed(self):
+        change = Change("[U:1:400]", "a", ("suspicious",), ("cheater",))
+        other = Change("[U:1:401]", "c", ("suspicious",), ("cheater",))
+        removed_entry = Change("[U:1:500]", "b", ("cheater",), (), kind="demote")
+        report = render_report(self.info(changes=(change, other, removed_entry)))
+        self.assertIn("Attributes are changed in `playerlist.garou3299.json` for these SteamIDs", report)
+        self.assertIn("Entry is removed from `playerlist.garou3299.json` for this SteamID", report)
+        # Only the file name -- never an absolute/temporary path.
+        self.assertNotIn(str(Path("playerlist.garou3299.json").resolve()), report)
+
     def test_no_table_without_removals(self):
         for kwargs in ({}, {"previous_source_total": 100, "added_to_source": 2, "removed_from_source": 0}):
             report = render_report(self.info(**kwargs))
@@ -793,6 +812,35 @@ class ClosingMessageTests(unittest.TestCase):
             render_closing([change]),
             "Attribute is changed for this SteamID: [U:1:200]; nothing else is modified.",
         )
+
+    def test_database_name_is_included_when_given(self):
+        promote_change = Change("[U:1:400]", "a", ("suspicious",), ("cheater",), kind="promote")
+        demote_change = Change("[U:1:300]", "b", ("cheater",), (), kind="demote")
+        self.assertEqual(
+            render_closing([promote_change], database="playerlist.garou3299.json"),
+            "Attribute is changed in `playerlist.garou3299.json` for this SteamID: [U:1:400]; "
+            "nothing else is modified.",
+        )
+        self.assertEqual(
+            render_closing([demote_change], database="playerlist.garou3299.json"),
+            "Entry is removed from `playerlist.garou3299.json` for this SteamID: [U:1:300]; nothing else is modified.",
+        )
+        self.assertEqual(
+            render_closing([promote_change, demote_change], database="playerlist.garou3299.json"),
+            "Attribute is changed in `playerlist.garou3299.json` for this SteamID: [U:1:400]; "
+            "Entry is removed from `playerlist.garou3299.json` for this SteamID: [U:1:300]; "
+            "nothing else is modified.",
+        )
+
+    def test_database_name_is_the_file_name_only(self):
+        info = RunInfo(
+            database_path=Path("/tmp/some/dir/playerlist.garou3299.json"),
+            source="https://example.invalid/list.json",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+        )
+        self.assertEqual(info.database_name, "playerlist.garou3299.json")
 
     def test_combined_promote_and_demote(self):
         changes = [
