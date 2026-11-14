@@ -50,7 +50,11 @@ MAX_REMOVED_TABLE_ROWS = 100
 MAX_REPORT_CHARS = 60_000
 
 # Characters that would break a Markdown link target.
-_LINK_ESCAPES = str.maketrans({"(": "%28", ")": "%29", " ": "%20", "<": "%3C", ">": "%3E", "\n": "%0A", "\r": "%0D"})
+# "|" is percent-encoded too: a raw pipe inside a table cell ends the cell, so a
+# proof URL like .../a|b would split the row in the rendered pull request.
+_LINK_ESCAPES = str.maketrans(
+    {"(": "%28", ")": "%29", " ": "%20", "<": "%3C", ">": "%3E", "|": "%7C", "\n": "%0A", "\r": "%0D"}
+)
 
 # Characters that would break out of a Markdown table cell.
 _CELL_ESCAPES = str.maketrans(
@@ -96,13 +100,19 @@ def _cell(value: str) -> str:
     return value.translate(_CELL_ESCAPES).strip() or "-"
 
 
-def _text(value: str) -> str:
-    """Escape the only characters that could act as HTML in running text.
+# Control characters (including newlines) inside running text. The fetch URL
+# can be an upstream-supplied download_url, so a newline in it would otherwise
+# start a new Markdown line -- e.g. an extra bullet in the report header.
+_TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f]")
 
-    Used for values shown outside a table cell or code span (the fetch URL):
-    ``<``/``>`` render identically as entities but can no longer open a tag.
+
+def _text(value: str) -> str:
+    """Make a value safe as running text (the fetch URL line).
+
+    ``<``/``>`` become entities, so they render identically but cannot open a
+    tag; control characters become spaces, so they cannot start a new line.
     """
-    return value.replace("<", "&lt;").replace(">", "&gt;")
+    return _TEXT_CONTROLS.sub(" ", value).replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _code(value: str) -> str:

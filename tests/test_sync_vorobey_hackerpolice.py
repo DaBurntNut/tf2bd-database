@@ -969,10 +969,10 @@ class PolicyFuzzTests(unittest.TestCase):
 # Report rendering
 # --------------------------------------------------------------------------- #
 class ReportTests(unittest.TestCase):
-    def info(self, changes=(), **kwargs):
+    def info(self, changes=(), *, source="https://example.invalid/list.json", **kwargs):
         return RunInfo(
             database_path=Path("playerlist.garou3299.json"),
-            source="https://example.invalid/list.json",
+            source=source,
             source_total=10,
             changes=tuple(changes),
             **{"source_skipped": 0, "dry_run": False, **kwargs},
@@ -1182,6 +1182,24 @@ class ReportTests(unittest.TestCase):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://example.invalid/a (b)",))
         report = render_report(self.info([change]))
         self.assertIn("https://example.invalid/a%20%28b%29", report)
+
+    def test_newline_in_the_fetch_url_cannot_inject_a_report_line(self):
+        # The fetch URL can be an upstream-supplied download_url, so a newline
+        # in it must not start a new Markdown line in the pull request body.
+        report = render_report(self.info(source="https://example.invalid/a\n- **injected**\r\n- second"))
+        self.assertFalse(any(line.startswith("- **injected**") for line in report.splitlines()))
+        self.assertIn("injected", report)  # flattened onto one line, not dropped
+
+    def test_pipe_in_a_proof_url_cannot_split_the_table_row(self):
+        # Upstream proof links are third-party data; a raw "|" inside a table
+        # cell ends the cell, so GitHub would render a truncated row with an
+        # extra column. The URL keeps working because %7C decodes to "|".
+        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://example.invalid/a|b",))
+        report = render_report(self.info([change]))
+        self.assertIn("https://example.invalid/a%7Cb", report)
+        rows = [line for line in report.splitlines() if line.startswith("| `[U:1:1]`")]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].count("|"), 6)  # five cells, no stray separator
 
     def test_no_proof_note_without_evidence_links(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))  # no evidence links
