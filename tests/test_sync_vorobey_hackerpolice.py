@@ -1793,13 +1793,40 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(len(rows), MAX_CHANGE_TABLE_ROWS)
         self.assertIn("… and 3 more entries not shown here", report)
 
-    def test_report_body_is_hard_capped(self):
-        """Pathological input (very long names) can never break PR creation."""
+    def test_a_huge_report_shrinks_its_tables_instead_of_losing_its_tail(self):
+        """Pathological input must not cut off the closing sentence or the removed list."""
         changes = [Change(f"[U:1:{1000 + n}]", "x" * 900, ("suspicious",), ("cheater",)) for n in range(200)]
         report = render_report(self.info(changes, removed_upstream=tuple(f"[U:1:{5000 + n}]" for n in range(100))))
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        self.assertNotIn("report truncated to fit the pull request body limit", report)
+        # The two lines the pull request exists for are still there, in full.
+        self.assertIn("; nothing else is modified.", report)
+        self.assertIn("100 SteamIDs removed from the Vorobey hackerpolice list", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
+        # Rows beyond the reduced cap are announced rather than silently dropped,
+        # and the removed-SteamID list keeps every row: the change tables shrink
+        # first, because those changes are visible in the PR's own diff too.
+        self.assertIn("more entries not shown here", report)
+        self.assertEqual(report.count("| [Profile]("), 100)
+        report.encode("utf-8")
+
+    def test_a_single_enormous_row_is_still_cut_as_the_very_last_resort(self):
+        """One cell too big for any row cap: only then is the body truncated."""
+        change = Change("[U:1:1]", "x" * 70_000, ("suspicious",), ("cheater",))
+        report = render_report(self.info([change], removed_upstream=("[U:1:2]",)))
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
         self.assertIn("report truncated to fit the pull request body limit", report)
         report.encode("utf-8")
+
+    def test_a_report_that_already_fits_is_never_shrunk(self):
+        """The reduced caps only kick in when the body really is too big."""
+        changes = [Change(f"[U:1:{1000 + n}]", f"n{n}", ("suspicious",), ("cheater",)) for n in range(5)]
+        info = self.info(changes, removed_upstream=("[U:1:9]",))
+        self.assertEqual(
+            render_report(info),
+            report_module._render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS),
+        )
+        self.assertNotIn("more entries not shown here", render_report(info))
 
     def test_dry_run_and_include_proof_notes(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))
@@ -1815,7 +1842,7 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
     """The PR body lists EVERY SteamID that disappeared from the Vorobey list.
 
     The Vorobey list stores no player names, so the table is exactly
-    ``| SteamID | Profile Link |`` and every link is the Steam profile
+    ``| SteamID | Profile Link | SteamHistory |`` and every link is a SteamID64
     permalink (SteamID64 URL), never a vanity URL or a last-seen name.
     """
 
@@ -1849,7 +1876,8 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         # No explanatory filler above the table either: heading, then the table.
         self.assertNotIn("stores no player names", report)
         self.assertLess(
-            report.index("removed from the Vorobey hackerpolice list"), report.index("| SteamID | Profile Link |")
+            report.index("removed from the Vorobey hackerpolice list"),
+            report.index("| SteamID | Profile Link | SteamHistory |"),
         )
 
     def test_plural_count_and_numeric_order(self):
@@ -1890,7 +1918,7 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         self.assertIn("Proof link", lines[-1])
         self.assertIn("nothing else is modified.", lines[-2])
         # The removed table sits above the closing sentence, not below it.
-        self.assertLess(report.index("| Profile Link |"), report.index("nothing else is modified."))
+        self.assertLess(report.index("| Profile Link | SteamHistory |"), report.index("nothing else is modified."))
 
     def test_closing_sentence_names_the_database_that_changed(self):
         change = Change("[U:1:400]", "a", ("suspicious",), ("cheater",))
@@ -2037,6 +2065,21 @@ class ClosingMessageTests(unittest.TestCase):
 
     def test_no_changes(self):
         self.assertEqual(render_closing([]), "; nothing else is modified.")
+
+    def test_closing_sentence_is_bounded_for_a_huge_run(self):
+        limit = report_module.MAX_CLOSING_STEAMIDS
+        at_limit = [Change(f"[U+{n}]", "n", ("suspicious",), ("cheater",)) for n in range(limit)]
+        over = [Change(f"[U+{n}]", "n", ("suspicious",), ("cheater",)) for n in range(limit + 25)]
+        # Exactly at the cap: every ID is named, no "more" suffix.
+        self.assertNotIn("more", render_closing(at_limit, database="db.json"))
+        closing = render_closing(over, database="db.json")
+        self.assertIn(" and 25 more", closing)
+        self.assertLess(len(closing), 4_000)
+
+    def test_closing_sentence_counts_hidden_ids_with_thousands_separators(self):
+        changes = [Change(f"[U+{n}]", "n", ("cheater",), (), kind="demote") for n in range(1_200)]
+        closing = render_closing(changes, database="db.json")
+        self.assertIn("and 1,050 more", closing)
 
 
 # --------------------------------------------------------------------------- #
@@ -2294,7 +2337,7 @@ class CliTests(unittest.TestCase):
 
     def test_report_lists_every_removed_steamid_with_its_permalink(self):
         """Every ID gone from the list since the snapshot appears in the
-        ``| SteamID | Profile Link |`` table -- including ones that were not
+        ``| SteamID | Profile Link | SteamHistory |`` table -- including ones that were not
         demoted because they were never cheaters here, and ones that were
         never in this database at all."""
         self.database.write_text(
@@ -2321,7 +2364,7 @@ class CliTests(unittest.TestCase):
         report = report_file.read_text(encoding="utf-8")
         self.assertEqual(report, stdout)
         self.assertIn("**3 SteamIDs removed from the Vorobey hackerpolice list since the previous snapshot.**", report)
-        self.assertIn("| SteamID | Profile Link |", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
         for account in (300, 400, 500):
             steamid64 = 76561197960265728 + account
             self.assertIn(

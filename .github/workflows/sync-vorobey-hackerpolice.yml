@@ -15,8 +15,8 @@ name: Sync Vorobey hackerpolice
 # links are shown in the pull request only - they are never written into
 # playerlist.garou3299.json.
 # The pull request also lists EVERY SteamID removed from the hackerpolice list
-# since the previous snapshot (| SteamID | Profile Link | with the Steam
-# profile permalink), because that list stores no player names.
+# since the previous snapshot (| SteamID | Profile Link | SteamHistory |, with
+# the Steam profile permalink), because that list stores no player names.
 # The snapshot is only advanced when the removals it found were applied: a run
 # without --demote, or one vetoed by the mass-demotion guard, keeps the old
 # baseline so those removals stay demotion candidates. The snapshot is refreshed to the current list in the SAME

@@ -431,8 +431,11 @@ def run(args: argparse.Namespace) -> int:
         )
     )
     if args.report:
+        # Written atomically, like the database and the snapshot: this same file
+        # is the pull request body, so a crash or a full disk must never leave a
+        # half-written report for the next step to publish.
         try:
-            Path(args.report).write_text(report + "\n", encoding="utf-8")
+            _atomic_write_bytes(Path(args.report), (report + "\n").encode("utf-8"))
         except OSError as exc:
             raise SyncError(f"cannot write report {args.report}: {exc}") from exc
     print(report)

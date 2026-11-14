@@ -10,7 +10,10 @@ untrusted-output as well as untrusted-input territory:
   pipes and newlines cannot break the table, brackets cannot forge a link,
   angle brackets cannot inject HTML, and ``@`` cannot trigger a mention;
 * every table is row-capped, and the whole body has a hard length guard,
-  because GitHub rejects pull request bodies over 65,536 characters;
+  because GitHub rejects pull request bodies over 65,536 characters. A report
+  that would exceed the budget drops more rows (announced with an "and N more"
+  note) instead of being cut off, so the closing sentence and the removed
+  SteamIDs always survive;
 * the closing sentence names the database that changed exactly once.
 
 Order of the body: header bullets, promotions, demotions, the SteamIDs
@@ -32,6 +35,7 @@ from sources import SOURCE_REPO_URL, redact_url
 
 __all__ = [
     "MAX_CHANGE_TABLE_ROWS",
+    "MAX_CLOSING_STEAMIDS",
     "MAX_REMOVED_TABLE_ROWS",
     "MAX_REPORT_BYTES",
     "RunInfo",
@@ -42,11 +46,16 @@ __all__ = [
 ]
 
 # GitHub rejects a pull request body longer than 65,536 characters. Change
-# tables are capped, the removed table is capped, and the finished body is
-# hard-truncated as a last resort, so publishing the PR can never fail on
-# size -- however big a single run turns out to be.
+# tables are capped, the removed table is capped, an oversized body is
+# re-rendered with smaller caps (see _SHRINK_STEPS), and a hard truncation is
+# the last resort, so publishing the PR can never fail on size -- however big a
+# single run turns out to be.
 MAX_CHANGE_TABLE_ROWS = 150
 MAX_REMOVED_TABLE_ROWS = 100
+# The closing sentence names the changed SteamIDs too. A run with thousands of
+# changes would spend the whole byte budget there (and stop being readable), so
+# each clause names at most this many and says how many follow.
+MAX_CLOSING_STEAMIDS = 150
 # GitHub rejects a pull request body over 65,536 BYTES, and the body doubles
 # as the job summary, so the budget is measured in bytes with room to spare.
 # Characters would be the wrong unit: 30,000 Cyrillic player names are half the
@@ -255,17 +264,26 @@ def _sorted_steamids(steamids: Sequence[str]) -> list[str]:
     return sorted(steamids, key=_steamid_sort_key)
 
 
+def _steamid_list(steamids: Sequence[str], limit: int = MAX_CLOSING_STEAMIDS) -> str:
+    """Comma-separated SteamIDs, shortened with ``and N more`` past ``limit``."""
+    if len(steamids) <= limit:
+        return ", ".join(steamids)
+    return ", ".join(steamids[:limit]) + f" and {_count(len(steamids) - limit)} more"
+
+
 def _change_sort_key(change: Change) -> tuple[bool, int]:
     """Order report rows by numeric SteamID."""
     return _steamid_sort_key(change.steamid)
 
 
+def _permalink_cell(url: str | None, label: str) -> str:
+    """A Markdown link to ``url``, or ``-`` when it cannot be built."""
+    return "-" if url is None else _markdown_link(url, label)
+
+
 def _profile_cell(steamid: str) -> str:
     """Steam profile permalink for one SteamID, or ``-`` if it cannot be built."""
-    url = steam_profile_url(steamid)
-    if url is None:
-        return "-"
-    return _markdown_link(url, "Profile")
+    return _permalink_cell(steam_profile_url(steamid), "Profile")
 
 
 def _steam_history_cell(steamid: str) -> str:
@@ -274,13 +292,10 @@ def _steam_history_cell(steamid: str) -> str:
     SteamHistory keeps a profile's history (past names, avatars, bans), so the
     reviewer can see who a demoted or promoted player is even after a rename.
     """
-    url = steam_history_url(steamid)
-    if url is None:
-        return "-"
-    return _markdown_link(url, "SteamHistory")
+    return _permalink_cell(steam_history_url(steamid), "SteamHistory")
 
 
-def render_removed_table(steamids: Sequence[str]) -> list[str]:
+def render_removed_table(steamids: Sequence[str], limit: int = MAX_REMOVED_TABLE_ROWS) -> list[str]:
     """Render the "removed from the Vorobey list" table as Markdown lines.
 
     Vorobey's list records no player names, so the table is
@@ -295,7 +310,7 @@ def render_removed_table(steamids: Sequence[str]) -> list[str]:
     ordered = _sorted_steamids(steamids)
     count = len(ordered)
     rows = [_row((_steamid_cell(steamid), _profile_cell(steamid), _steam_history_cell(steamid))) for steamid in ordered]
-    rows, overflow = _capped(rows, MAX_REMOVED_TABLE_ROWS, "SteamID", "SteamIDs")
+    rows, overflow = _capped(rows, limit, "SteamID", "SteamIDs")
     headline = (
         f"**{_count(count)} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey hackerpolice list "
         "since the previous snapshot.**"
@@ -308,9 +323,9 @@ def render_removed_table(steamids: Sequence[str]) -> list[str]:
     ]
 
 
-def _with_removed_table(lines: list[str], steamids: Sequence[str]) -> list[str]:
+def _with_removed_table(lines: list[str], steamids: Sequence[str], limit: int = MAX_REMOVED_TABLE_ROWS) -> list[str]:
     """Append the removed table to an already rendered report body."""
-    table = render_removed_table(steamids)
+    table = render_removed_table(steamids, limit)
     if not table:
         return lines
     while lines and not lines[-1].strip():
@@ -345,7 +360,7 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
     def clause(head: str, target: str, steamids: list[str]) -> str:
         if database is None:
             head = head[:1].upper() + head[1:]  # standalone sentence starts capitalised
-        return f"{head} for {target}: " + ", ".join(steamids)
+        return f"{head} for {target}: " + _steamid_list(steamids)
 
     parts: list[str] = []
     if changed_steamids:
@@ -461,7 +476,7 @@ def _header_lines(info: RunInfo) -> list[str]:
     return lines
 
 
-def _promotion_lines(promotions: Sequence[Change]) -> list[str]:
+def _promotion_lines(promotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS) -> list[str]:
     """Render the "promoted to cheater" table block."""
     rows = [
         _row(
@@ -476,7 +491,7 @@ def _promotion_lines(promotions: Sequence[Change]) -> list[str]:
         )
         for change in promotions
     ]
-    rows, overflow = _capped(rows, MAX_CHANGE_TABLE_ROWS, "entry", "entries")
+    rows, overflow = _capped(rows, limit, "entry", "entries")
     count = len(promotions)
     return [
         f"**{_count(count)} {plural(count, 'entry', 'entries')} promoted to `cheater`.**",
@@ -486,7 +501,7 @@ def _promotion_lines(promotions: Sequence[Change]) -> list[str]:
     ]
 
 
-def _demotion_lines(demotions: Sequence[Change]) -> list[str]:
+def _demotion_lines(demotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS) -> list[str]:
     """Render the "demoted" table block."""
     rows = [
         _row(
@@ -500,7 +515,7 @@ def _demotion_lines(demotions: Sequence[Change]) -> list[str]:
         )
         for change in demotions
     ]
-    rows, overflow = _capped(rows, MAX_CHANGE_TABLE_ROWS, "entry", "entries")
+    rows, overflow = _capped(rows, limit, "entry", "entries")
     count = len(demotions)
     headline = (
         f"**{_count(count)} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
@@ -548,8 +563,8 @@ def _fit_body(text: str) -> str:
     return (keep[:cut] if cut > 0 else keep) + note
 
 
-def render_report(info: RunInfo) -> str:
-    """Render the PR body / job summary as Markdown."""
+def _render_body(info: RunInfo, change_limit: int, removed_limit: int) -> str:
+    """Render the body with at most ``change_limit``/``removed_limit`` rows per table."""
     lines = _header_lines(info)
 
     # Numeric SteamID order: the same run always renders the same table, and
@@ -562,16 +577,16 @@ def render_report(info: RunInfo) -> str:
             lines += ["**No database changes** (snapshot refresh only).", ""]
         else:
             lines += ["**No changes.**", ""]
-        return _safe(_fit_body("\n".join(_with_removed_table(lines, info.removed_upstream))))
+        return "\n".join(_with_removed_table(lines, info.removed_upstream, removed_limit))
 
     if promotions:
-        lines += _promotion_lines(promotions)
+        lines += _promotion_lines(promotions, change_limit)
     if demotions:
-        lines += _demotion_lines(demotions)
+        lines += _demotion_lines(demotions, change_limit)
 
     # Upstream removals first: the closing sentence and the proof note that
     # follow are always the last thing in the report.
-    lines = _with_removed_table(lines, info.removed_upstream)
+    lines = _with_removed_table(lines, info.removed_upstream, removed_limit)
 
     closing = render_closing(info.changes, database=info.database_name)
 
@@ -597,4 +612,39 @@ def render_report(info: RunInfo) -> str:
         )
         lines.append(note)
     lines.append("")
-    return _safe(_fit_body("\n".join(lines)))
+    return "\n".join(lines)
+
+
+# Tried in order when a report would exceed MAX_REPORT_BYTES. Rows are dropped
+# (each drop is announced with an "and N more" note) instead of the body being
+# cut off, because the closing sentence and the removed-SteamID list are what
+# the pull request exists to communicate. The change tables shrink first --
+# the same changes are visible in the PR's own diff -- and the removed list
+# only after them; the last resort is one row per table, and _fit_body() after
+# that for a single row that is itself enormous.
+_SHRINK_STEPS: tuple[tuple[int, int], ...] = (
+    (100, MAX_REMOVED_TABLE_ROWS),
+    (50, MAX_REMOVED_TABLE_ROWS),
+    (25, MAX_REMOVED_TABLE_ROWS),
+    (10, MAX_REMOVED_TABLE_ROWS),
+    (5, MAX_REMOVED_TABLE_ROWS),
+    (1, MAX_REMOVED_TABLE_ROWS),
+    (1, 50),
+    (1, 10),
+    (1, 1),
+)
+
+
+def render_report(info: RunInfo) -> str:
+    """Render the PR body / job summary as Markdown.
+
+    Tables are capped, and a report that would still exceed the byte budget is
+    re-rendered with fewer rows rather than truncated, so it always ends with
+    its closing sentence.
+    """
+    text = _render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS)
+    for change_limit, removed_limit in _SHRINK_STEPS:
+        if _utf8_len(text) <= MAX_REPORT_BYTES:
+            break
+        text = _render_body(info, change_limit, removed_limit)
+    return _safe(_fit_body(text))
