@@ -2200,6 +2200,28 @@ class RepositoryDataTests(unittest.TestCase):
         # a hand-reformatted list would show up as a thousands-line diff.
         self.assertEqual(dumps(database), original)
 
+    def test_every_publishing_step_requires_a_successful_sync(self):
+        """A red run must never publish, and must never claim "nothing to do".
+
+        GitHub runs a step with an explicit `if:` even when an earlier step
+        failed or was skipped, so each of these four steps has to test the
+        sync step's own outcome -- otherwise a failing lint/test step turns
+        the job red while the last step still prints "Nothing to publish".
+        """
+        workflow = (self.ROOT / ".github/workflows/sync-vorobey-hackerpolice.yml").read_text(encoding="utf-8")
+        steps = workflow.split("\n      - ")
+        for name in (
+            "Open or update pull request",
+            "Push branch and link a manual pull request",
+            "Commit directly to the default branch",
+            "Nothing to do",
+        ):
+            block = next((step for step in steps if step.startswith(f"name: {name}")), None)
+            self.assertIsNotNone(block, f"workflow step not found: {name}")
+            condition = [line for line in block.splitlines() if line.strip().startswith("if:")]
+            self.assertEqual(len(condition), 1, f"{name} must have exactly one condition")
+            self.assertIn("steps.sync.outcome == 'success'", condition[0], f"{name} can run after a failed sync")
+
     def test_shipped_snapshot_is_a_usable_hackerpolice_list(self):
         snapshot = load_snapshot(self.ROOT / "snapshot" / "playerlist.vorobey-hackerpolice.json")
         self.assertIsNotNone(snapshot)

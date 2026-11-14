@@ -24,7 +24,7 @@ I’m currently using [this](https://github.com/surepy/tf2_bot_detector), which 
 
 ## What does the Bot do?
 
-Every day, a bot compares `playerlist.garou3299.json` with the
+Every day at **05:23 UTC**, a bot compares `playerlist.garou3299.json` with the
 [Vorobey hackerpolice cheater list](https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json)
 and opens a pull request with its proposals. **Nothing changes until the
 pull request is merged.**

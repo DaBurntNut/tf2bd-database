@@ -185,7 +185,11 @@ jobs:
         id: pr
         # A missing PR permission is handled by the fallback step below.
         continue-on-error: true
-        if: steps.sync.outputs.changed == 'true' && env.MODE != 'commit'
+        # steps.sync.outcome is what keeps a red run from publishing: without it
+        # these steps also run when the sync step was SKIPPED (e.g. a failing
+        # lint/test step above), printing a misleading "Nothing to publish"
+        # line -- or publishing from a run whose own checks failed.
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE != 'commit'
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.BOT_TOKEN || github.token }}
@@ -202,7 +206,7 @@ jobs:
           body-path: ${{ runner.temp }}/hackerpolice-sync-report.md
 
       - name: Push branch and link a manual pull request
-        if: steps.sync.outputs.changed == 'true' && env.MODE != 'commit' && steps.pr.outcome == 'failure'
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE != 'commit' && steps.pr.outcome == 'failure'
         run: |
           set -euo pipefail
 
@@ -240,7 +244,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit directly to the default branch
-        if: steps.sync.outputs.changed == 'true' && env.MODE == 'commit'
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE == 'commit'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -250,5 +254,5 @@ jobs:
           git push
 
       - name: Nothing to do
-        if: steps.sync.outputs.changed != 'true'
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed != 'true'
         run: echo "Nothing to publish (no database or snapshot changes, or this was a dry run)."
