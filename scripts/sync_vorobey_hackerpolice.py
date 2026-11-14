@@ -181,12 +181,17 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     an exact replica of the upstream file (no encoding/newline translation
     ever touches them).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Write THROUGH a symlink. Replacing the link itself would delete it and
+    # leave the file it points at -- the one the operator actually keeps, and
+    # the one every other tool reads -- untouched, while this run reported
+    # success. A chain of links resolves to the final target.
+    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
     # mkstemp creates the file with O_EXCL and a unique name, so concurrent
     # runs -- separate processes or threads -- never share (and interleave
     # writes into) one temp file. The final replace is atomic, so readers
     # only ever see complete files.
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -195,9 +200,9 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             os.fsync(handle.fileno())  # content durable BEFORE it becomes visible
         # mkstemp forces 0600 permissions; keep the file's usual mode:
         # the replaced file's own permissions, or a plain 0644 for new ones.
-        tmp.chmod(stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644)
-        tmp.replace(path)
-        _fsync_directory(path.parent)  # make the rename itself durable
+        tmp.chmod(stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o644)
+        tmp.replace(target)
+        _fsync_directory(target.parent)  # make the rename itself durable
     except OSError:
         tmp.unlink(missing_ok=True)  # never leave a stale .tmp file behind
         raise
@@ -216,7 +221,12 @@ def write_database(path: Path, rendered: str | PlayerList, original: str, *, dry
         rendered = dumps(rendered)
     modified = rendered != original
     if modified and not dry_run:
-        _atomic_write_bytes(path, rendered.encode("utf-8"))
+        try:
+            _atomic_write_bytes(path, rendered.encode("utf-8"))
+        except OSError as exc:
+            # Name the file the operator asked for; the raw OSError mentions
+            # the temporary file, which means nothing to them.
+            raise SyncError(f"cannot write {path}: {exc}") from exc
     return modified
 
 
@@ -229,7 +239,10 @@ def write_snapshot(path: Path, raw: bytes, original: bytes | None, *, dry_run: b
     """
     changed = raw != original
     if changed and not dry_run:
-        _atomic_write_bytes(path, raw)
+        try:
+            _atomic_write_bytes(path, raw)
+        except OSError as exc:
+            raise SyncError(f"cannot write {path}: {exc}") from exc
     return changed
 
 

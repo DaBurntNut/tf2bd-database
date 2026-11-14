@@ -206,7 +206,42 @@ def dumps(database: PlayerList) -> str:
     Tab indentation, alphabetically sorted keys, ASCII escapes and a trailing
     newline: re-serialising an untouched file produces byte-identical output.
     """
-    return json.dumps(database, indent="\t", sort_keys=True, ensure_ascii=True) + "\n"
+    return json.dumps(database, indent="\t", sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
+
+
+class _StrictJSONError(ValueError):
+    """Input the standard library accepts but standard JSON does not."""
+
+
+def _reject_constant(name: str) -> Any:
+    """Refuse ``NaN``/``Infinity``/``-Infinity``, which are NOT JSON."""
+    raise _StrictJSONError(f"{name} is not valid JSON (only standard JSON numbers are accepted)")
+
+
+def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Refuse an object that defines the same key twice.
+
+    ``json`` silently keeps the last one: a file with two ``attributes`` keys
+    would half-disappear on the next write, and two ``players`` keys would
+    turn a full database into whatever the second one says.
+    """
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise _StrictJSONError(f"duplicate key {key!r} in the same object")
+        seen[key] = value
+    return seen
+
+
+def strict_json_loads(raw: str | bytes) -> Any:
+    """Parse JSON, refusing what the standard library accepts silently.
+
+    Three things a lenient parse lets through, each of which this tool would
+    otherwise publish back to disk: ``NaN``/``Infinity`` (a file no strict
+    parser -- including TF2BD's -- can read), and duplicate keys (silent data
+    loss). Everything else behaves exactly like ``json.loads``.
+    """
+    return json.loads(raw, parse_constant=_reject_constant, object_pairs_hook=_reject_duplicates)
 
 
 def load(path: Path, *, encoding: str = "utf-8") -> tuple[PlayerList, str]:
@@ -218,7 +253,7 @@ def load(path: Path, *, encoding: str = "utf-8") -> tuple[PlayerList, str]:
         # any other unreadable file instead of crashing with a traceback.
         raise PlayerListError(f"cannot read {path}: {exc}") from exc
     try:
-        database = json.loads(original)
+        database = strict_json_loads(original)
     except (json.JSONDecodeError, RecursionError, ValueError) as exc:
         # ValueError: e.g. a JSON number with more digits than Python's
         # int-parsing limit -- invalid input, not a crash.

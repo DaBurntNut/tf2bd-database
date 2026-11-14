@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
-from playerlist import normalize_steamid
+from playerlist import normalize_steamid, strict_json_loads
 
 SOURCE_REPO_URL = "https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json"
 
@@ -157,7 +157,7 @@ def removed_steamids(previous: HackerpoliceIndex, current: HackerpoliceIndex) ->
 def _parse_document(raw: bytes, source: str) -> dict[str, Any]:
     """Parse raw bytes as a playerlist document, raising SyncError."""
     try:
-        document = json.loads(raw)
+        document = strict_json_loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValueError) as exc:
         # ValueError: e.g. a JSON number beyond Python's int-parsing limit.
         raise SyncError(f"{redact_url(source)} is not valid JSON: {exc}") from exc

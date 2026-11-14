@@ -48,6 +48,7 @@ from playerlist import (
     player_name,
     sort_players,
     steam_profile_url,
+    strict_json_loads,
     validate,
 )
 from policy import Change, demote, is_racist_proof, promote, sync
@@ -789,6 +790,58 @@ class UntouchedPathTests(unittest.TestCase):
         with mock.patch.object(Path, "replace", side_effect=OSError("disk full")), self.assertRaises(OSError):
             sync_module._atomic_write_bytes(target, b"{}\n")
         self.assertEqual(list(self.root.iterdir()), [])  # no stale .tmp file
+
+    def test_write_through_a_symlink_updates_the_target_and_keeps_the_link(self):
+        """A symlinked playerlist must be edited, not replaced by a plain file.
+
+        Replacing the link would leave the real file untouched while the run
+        reported success -- the operator's file silently stops being updated.
+        """
+        real = self.root / "real.json"
+        real.write_bytes(b"old\n")
+        link = self.root / "link.json"
+        link.symlink_to(real)
+        sync_module._atomic_write_bytes(link, b"new\n")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(real.read_bytes(), b"new\n")
+        self.assertEqual(link.read_bytes(), b"new\n")
+
+    def test_write_through_a_chain_of_symlinks_lands_on_the_final_file(self):
+        real = self.root / "real.json"
+        real.write_bytes(b"old\n")
+        middle = self.root / "middle.json"
+        middle.symlink_to(real)
+        link = self.root / "link.json"
+        link.symlink_to(middle)
+        sync_module._atomic_write_bytes(link, b"new\n")
+        self.assertEqual(real.read_bytes(), b"new\n")
+        self.assertTrue(link.is_symlink() and middle.is_symlink())
+
+    def test_a_failed_write_names_the_file_the_operator_asked_for(self):
+        """The raw OSError names a temporary file, which explains nothing."""
+        target = self.root / "list.json"
+        target.write_text(dumps({"players": []}), encoding="utf-8")
+        with (
+            mock.patch.object(Path, "replace", side_effect=OSError("disk full")),
+            self.assertRaises(SyncError) as caught,
+        ):
+            sync_module.write_database(target, {"players": []}, "different", dry_run=False)
+        message = str(caught.exception)
+        self.assertIn(str(target), message)
+        self.assertIn("disk full", message)
+        self.assertNotIn(".tmp", message)
+
+    def test_a_failed_snapshot_write_names_the_snapshot_file(self):
+        target = self.root / "snapshot.json"
+        with (
+            mock.patch.object(Path, "replace", side_effect=OSError("disk full")),
+            self.assertRaises(SyncError) as caught,
+        ):
+            sync_module.write_snapshot(target, b"new\n", b"old\n", dry_run=False)
+        message = str(caught.exception)
+        self.assertIn(str(target), message)
+        self.assertIn("disk full", message)
+        self.assertNotIn(".tmp", message)
 
     def test_write_creates_a_missing_parent_directory(self):
         nested = self.root / "a" / "b" / "list.json"
@@ -2525,6 +2578,88 @@ class CliTests(unittest.TestCase):
 # Full PR lifecycle in a real Git repo
 # --------------------------------------------------------------------------- #
 @unittest.skipUnless(shutil.which("git"), "git is required for the lifecycle test")
+class UnpublishableJsonTests(unittest.TestCase):
+    """Files this tool must refuse rather than rewrite into something broken.
+
+    Python's json accepts NaN/Infinity (not JSON) and silently keeps the last
+    of two duplicate keys; writing either back would publish a database that
+    strict parsers reject, or quietly discard half of a hand-edited entry.
+    """
+
+    UPSTREAM = '{"players":[{"steamid":"[U:1:100]","attributes":["cheater"]}]}'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.database = dumps({"players": [player("[U:1:100]", ["suspicious"])]})
+
+    def write(self, name, body):
+        (self.root / name).write_text(body, encoding="utf-8")
+
+    def read(self, name):
+        return (self.root / name).read_text(encoding="utf-8")
+
+    def run_cli(self):
+        """Run the real entry point with the temporary directory as cwd."""
+        previous = os.getcwd()
+        os.chdir(self.root)
+        try:
+            return sync_module.main(["--database", "db.json", "--source", "up.json", "--snapshot", "snap.json", "-q"])
+        finally:
+            os.chdir(previous)
+
+    def assert_refused(self, *, database, upstream, snapshot=None):
+        self.write("db.json", database)
+        self.write("up.json", upstream)
+        if snapshot is not None:
+            self.write("snap.json", snapshot)
+        self.assertEqual(self.run_cli(), 2)
+        self.assertEqual(self.read("db.json"), database)  # not rewritten
+        if snapshot is None:
+            self.assertFalse((self.root / "snap.json").exists())
+
+    def test_nan_in_the_database_is_refused(self):
+        self.assert_refused(
+            database='{"players":[{"steamid":"[U:1:100]","attributes":["suspicious"],"last_seen":{"time":NaN}}]}',
+            upstream=self.UPSTREAM,
+        )
+
+    def test_duplicate_players_key_in_the_database_is_refused(self):
+        """Two 'players' keys would silently empty the database."""
+        self.assert_refused(
+            database='{"players":[{"steamid":"[U:1:100]","attributes":["suspicious"]}],"players":[]}',
+            upstream=self.UPSTREAM,
+        )
+
+    def test_infinity_in_the_upstream_list_is_refused(self):
+        self.assert_refused(
+            database=self.database,
+            upstream='{"players":[{"steamid":"[U:1:100]","attributes":["cheater"],"x":Infinity}]}',
+        )
+
+    def test_duplicate_key_in_the_upstream_list_is_refused(self):
+        self.assert_refused(
+            database=self.database,
+            upstream='{"players":[{"steamid":"[U:1:100]"}],"players":[{"steamid":"[U:1:200]"}]}',
+        )
+
+    def test_duplicate_key_in_the_snapshot_is_refused(self):
+        self.assert_refused(
+            database=self.database,
+            upstream=self.UPSTREAM,
+            snapshot='{"players":[],"players":[]}',
+        )
+
+    def test_the_refusal_names_the_problem(self):
+        self.write("db.json", '{"players":[],"players":[]}')
+        self.write("up.json", self.UPSTREAM)
+        with mock.patch.object(sync_module.LOGGER, "error") as logged:
+            self.run_cli()
+        message = " ".join(str(call.args) for call in logged.call_args_list)
+        self.assertIn("duplicate key", message)
+
+
 class LifecycleTests(unittest.TestCase):
     """Run -> merge -> upstream moves -> run -> idle, plus closed-PR re-proposal."""
 
@@ -2863,6 +2998,34 @@ class SerialisationTests(unittest.TestCase):
 
             with self.assertRaises(PlayerListError):
                 load(Path(tmp) / "missing.json")
+
+
+class StrictJsonTests(unittest.TestCase):
+    """What the standard library accepts but standard JSON does not."""
+
+    def test_nan_and_infinity_are_refused(self):
+        for body in ('{"t": NaN}', '{"t": Infinity}', '{"t": -Infinity}', '{"t": [1, NaN]}'):
+            with self.assertRaises(ValueError) as caught:
+                strict_json_loads(body)
+            self.assertIn("not valid JSON", str(caught.exception))
+
+    def test_duplicate_keys_are_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            strict_json_loads('{"players": [1], "players": []}')
+        self.assertIn("duplicate key", str(caught.exception))
+        with self.assertRaises(ValueError):
+            strict_json_loads('{"a": {"attributes": ["x"], "attributes": ["y"]}}')
+
+    def test_the_same_input_as_the_standard_library_still_parses(self):
+        for body in ('{"players": []}', '{"a": [1, 2.5, true, false, null]}', '{"s": "ы\\u00e9"}', "[]", "3"):
+            self.assertEqual(strict_json_loads(body), json.loads(body))
+        # Bytes, a BOM (already decoded away) and nesting depth behave as before.
+        self.assertEqual(strict_json_loads(b'{"players": []}'), {"players": []})
+
+    def test_serialising_a_non_finite_number_is_refused(self):
+        """Belt and braces: even a future code path cannot write NaN to disk."""
+        with self.assertRaises(ValueError):
+            dumps({"players": [{"time": float("nan")}]})
 
 
 class DocumentHandlingTests(unittest.TestCase):
