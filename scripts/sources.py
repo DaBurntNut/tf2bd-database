@@ -99,7 +99,11 @@ def _declared_length(response: object) -> int | None:
     """Usable ``Content-Length`` of a response, or ``None`` when absent/invalid."""
     response_headers = getattr(response, "headers", None)
     declared = response_headers.get("Content-Length") if response_headers is not None else None
-    return int(declared) if isinstance(declared, str) and declared.isdigit() else None
+    # ASCII digits only: isdigit() also accepts things like "²", which int()
+    # then refuses -- a malformed header must not crash the fetch.
+    if isinstance(declared, str) and declared.isascii() and declared.isdigit():
+        return int(declared)
+    return None
 
 
 @dataclass(frozen=True)

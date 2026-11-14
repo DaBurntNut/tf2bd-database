@@ -33,11 +33,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import sources
 from playerlist import (
     PlayerListError,
+    ValidationResult,
     account_id,
     dumps,
     load,
     normalize_steamid,
     order_attributes,
+    player_name,
     sort_players,
     steam_profile_url,
     validate,
@@ -255,6 +257,70 @@ class SourceFetchTests(unittest.TestCase):
             "https://api.github.com/repos/Nocrex/Tom/git/blobs/" + "c" * 64,
         )
 
+    def test_unparsable_source_is_a_clean_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "broken.json"
+            broken.write_text("{not json", encoding="utf-8")
+            array = Path(tmp) / "array.json"
+            array.write_text("[]", encoding="utf-8")
+            for path in (broken, array):
+                with self.assertRaises(SyncError):
+                    load_first_available_raw([str(path)])
+
+    def test_non_http_scheme_is_refused(self):
+        with self.assertRaises(SyncError):
+            load_first_available_raw(["ftp://example.invalid/list.json"])
+
+    def test_unreadable_snapshot_is_an_error_but_missing_one_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(load_snapshot(Path(tmp) / "absent.json"))
+            with self.assertRaises(SyncError):
+                load_snapshot(Path(tmp))  # a directory, not a file
+
+    def test_bad_base64_envelope_falls_through_to_the_next_strategy(self):
+        envelope = json.dumps({"encoding": "base64", "content": "!!!not base64!!!", "download_url": self.URL}).encode(
+            "utf-8"
+        )
+        with (
+            mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(envelope), _FakeResponse(self.BODY)]),
+            mock.patch("sources.time.sleep"),
+        ):
+            _, _, raw = load_first_available_raw([self.API_URL])
+        self.assertEqual(raw, self.BODY)
+
+    def test_inline_content_that_is_not_a_playerlist_falls_through(self):
+        inner = base64.b64encode(b"[]").decode("ascii")
+        envelope = json.dumps({"encoding": "base64", "content": inner, "download_url": self.URL}).encode("utf-8")
+        with (
+            mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(envelope), _FakeResponse(self.BODY)]),
+            mock.patch("sources.time.sleep"),
+        ):
+            document, _, raw = load_first_available_raw([self.API_URL])
+        self.assertEqual(raw, self.BODY)
+        self.assertEqual(len(document["players"]), 1)
+
+    def test_a_failing_candidate_is_skipped_for_the_next_one(self):
+        sha = "d" * 40
+        # download_url (3 failed attempts) is tried before the blob endpoint.
+        envelope = json.dumps(
+            {"encoding": "none", "content": "", "sha": sha, "download_url": "https://raw.invalid/list.json"}
+        ).encode("utf-8")
+        with (
+            mock.patch(
+                "sources._OPENER.open",
+                side_effect=[
+                    _FakeResponse(envelope),
+                    urllib.error.URLError("raw host down"),
+                    urllib.error.URLError("raw host down"),
+                    urllib.error.URLError("raw host down"),
+                    _FakeResponse(self.BODY),
+                ],
+            ),
+            mock.patch("sources.time.sleep"),
+        ):
+            _, _, raw = load_first_available_raw([self.API_URL])
+        self.assertEqual(raw, self.BODY)
+
     def test_oversized_local_source_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "big.json"
@@ -298,6 +364,15 @@ class SourceFetchTests(unittest.TestCase):
             handler.redirect_request(request, None, 302, "Found", Message(), "http://example.invalid/list.json")
         upgraded = handler.redirect_request(request, None, 302, "Found", Message(), "https://cdn.invalid/list.json")
         self.assertEqual(upgraded.full_url, "https://cdn.invalid/list.json")
+
+    def test_non_ascii_content_length_is_ignored_instead_of_crashing(self):
+        """isdigit() accepts "²", int() does not: a malformed header must be
+        ignored (download, then the byte cap applies) rather than raise."""
+        response = _FakeResponse(self.BODY, {"Content-Length": "²"})
+        with mock.patch("sources._OPENER.open", return_value=response), mock.patch("sources.time.sleep"):
+            _, _, raw = load_first_available_raw([self.URL])
+        self.assertEqual(raw, self.BODY)
+        self.assertEqual(response.read_count, 1)
 
     def test_oversized_declared_length_is_rejected_without_downloading(self):
         response = _FakeResponse(self.BODY, {"Content-Length": str(10 * 1024 * 1024)})
@@ -606,6 +681,63 @@ class DemoteTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Policy invariants over randomised inputs (seeded: fully deterministic)
 # --------------------------------------------------------------------------- #
+class MalformedEntryTests(unittest.TestCase):
+    """Malformed or unrelated entries must be skipped, never crash or be lost."""
+
+    def test_demote_keeps_entries_it_cannot_interpret(self):
+        players = [
+            "not a dict",
+            {"attributes": ["cheater"]},  # no steamid
+            player("nope", ["cheater"]),  # unusable steamid
+            player("[U:1:400]", []),  # no attributes
+            player("[U:1:401]", [1]),  # non-string attribute
+            player("[U:1:402]", ["suspicious"]),  # not a cheater
+            player("[U:1:100]", ["cheater"]),  # the only real demotion
+        ]
+        database = {"players": list(players)}
+        changes = demote(database, {"[U:1:100]", "[U:1:999]"})
+        self.assertEqual(len(changes), 1)
+        # [U:1:999] is "removed upstream" but absent locally: nothing to do.
+        self.assertEqual(len(database["players"]), 6)  # only [U:1:100] dropped
+        self.assertEqual(database["players"][0], "not a dict")
+
+    def test_promote_skips_entries_it_cannot_interpret(self):
+        index = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in (200, 201, 202, 203)])
+        database = {
+            "players": [
+                "not a dict",
+                {"attributes": ["suspicious"]},
+                player("nope", ["suspicious"]),
+                player("[U:1:200]", []),
+                player("[U:1:201]", [1]),
+                player("[U:1:202]", ["cheater"]),  # already a cheater
+                player("[U:1:203]", ["suspicious"]),
+                player("[U:1:999]", ["suspicious"]),  # not on the list
+            ]
+        }
+        changes = promote(database, index)
+        promoted = [change.steamid for change in changes]
+        self.assertEqual(promoted, ["[U:1:203]"])
+
+    def test_sync_tolerates_a_missing_players_array(self):
+        self.assertEqual(promote({}, index_of()), [])
+        self.assertEqual(demote({}, {"[U:1:1]"}), [])
+
+    def test_include_proof_is_idempotent_and_keeps_evidence(self):
+        index = index_of(hackerpolice_entry("[U:1:100]", [HACKERPOLICE_PROOF, "  "]))
+        database = {"players": [player("[U:1:100]", ["suspicious"])]}
+        promote(database, index, include_proof=True)
+        first = list(database["players"][0]["proof"])
+        self.assertEqual(len(first), 1)
+        self.assertIn(PROOF_MARKER, first[0])
+        self.assertIn(HACKERPOLICE_PROOF, first[0])
+        # Re-running (e.g. a second sync, or the same player promoted again)
+        # must never duplicate the line this tool owns.
+        database["players"][0]["attributes"] = ["suspicious"]
+        promote(database, index, include_proof=True)
+        self.assertEqual(database["players"][0]["proof"], first)
+
+
 class PolicyFuzzTests(unittest.TestCase):
     def test_sync_invariants_hold(self):
         rng = random.Random(42)
@@ -666,9 +798,8 @@ class ReportTests(unittest.TestCase):
             database_path=Path("playerlist.garou3299.json"),
             source="https://example.invalid/list.json",
             source_total=10,
-            source_skipped=0,
             changes=tuple(changes),
-            **{"dry_run": False, **kwargs},
+            **{"source_skipped": 0, "dry_run": False, **kwargs},
         )
 
     def test_no_changes_message(self):
@@ -687,6 +818,56 @@ class ReportTests(unittest.TestCase):
         )
         # The actual URL the bytes were fetched from stays visible for debugging.
         self.assertIn("- Fetched from: https://example.invalid/list.json", report)
+
+    def test_unusable_steamid_renders_name_without_a_link(self):
+        changes = (Change(steamid="nope", name="someone", before=("suspicious",), after=("cheater",)),)
+        report = render_report(self.info(changes))
+        self.assertIn("someone", report)
+        self.assertNotIn("steamcommunity.com/profiles/None", report)
+
+    def test_unusable_source_entries_are_reported_in_the_header(self):
+        report = render_report(self.info(source_skipped=7))
+        self.assertIn("(10 entries, 7 unusable)", report)
+
+    def test_change_rows_are_sorted_by_steamid(self):
+        unsorted_changes = (
+            Change(steamid="[U:1:900]", name="c", before=("suspicious",), after=("cheater",)),
+            Change(steamid="[U:1:100]", name="a", before=("suspicious",), after=("cheater",)),
+            Change(steamid="[U:1:500]", name="b", before=("suspicious",), after=("cheater",)),
+        )
+        report = render_report(self.info(unsorted_changes))
+        rows = [line for line in report.splitlines() if line.startswith("| `[U:1:")]
+        self.assertEqual(
+            [row.split("`")[1] for row in rows],
+            ["[U:1:100]", "[U:1:500]", "[U:1:900]"],
+        )
+
+    def test_dry_run_says_the_database_and_snapshot_are_untouched(self):
+        report = render_report(self.info(dry_run=True))
+        self.assertIn("**dry run** (no database or snapshot written)", report)
+
+    def test_custom_snapshot_path_is_reported_verbatim(self):
+        report = render_report(self.info(snapshot_changed=True, snapshot_path=Path("mirror/vorobey.json")))
+        self.assertIn("- Snapshot: `mirror/vorobey.json` updated to an exact copy", report)
+        self.assertNotIn("snapshot/playerlist.vorobey-hackerpolice.json", report)
+
+    def test_proof_note_is_the_last_line_even_with_include_proof(self):
+        changes = (
+            Change(
+                steamid="[U:1:100]",
+                name="a",
+                before=("suspicious",),
+                after=("cheater",),
+                evidence=("https://example.invalid/p",),
+            ),
+        )
+        report = render_report(self.info(changes, include_proof=True))
+        lines = [line for line in report.splitlines() if line.strip()]
+        self.assertEqual(
+            lines[-1],
+            "Proof link comes from the Vorobey hackerpolice list and is shown for review only.",
+        )
+        self.assertIn("`--include-proof` was enabled", report)
 
     def test_snapshot_diff_shows_added_removed_and_net(self):
         report = render_report(
@@ -1498,6 +1679,56 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("→", raw.getvalue().decode("utf-8"))
 
+    def test_quiet_prints_only_the_report(self):
+        code, stdout, stderr = self.run_cli("--source", str(self.source), "--dry-run", "-q")
+        self.assertEqual(code, 0)
+        self.assertIn("## Vorobey hackerpolice sync", stdout)
+        self.assertEqual(stderr.strip(), "")
+
+    def test_verbose_logs_the_index_and_the_diff(self):
+        code, _, stderr = self.run_cli("--source", str(self.source), "--dry-run", "-v")
+        self.assertEqual(code, 0)
+        self.assertIn("Indexed 2 Vorobey hackerpolice SteamIDs", stderr)
+
+    def test_snapshot_must_not_be_the_database(self):
+        code, _, stderr = self.run_cli("--snapshot", str(self.database))
+        self.assertEqual(code, 2)
+        self.assertIn("--snapshot and --database must be different files", stderr)
+
+    def test_unwritable_report_path_is_a_clean_error(self):
+        report_dir = self.root / "report-dir"
+        report_dir.mkdir()
+        code, _, stderr = self.run_cli("--source", str(self.source), "--report", str(report_dir))
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write report", stderr)
+        # Nothing was written before the report failed.
+        self.assertNotIn("cheater", self.database.read_text(encoding="utf-8"))
+
+    def test_invalid_database_is_refused_before_anything_is_written(self):
+        self.database.write_text(
+            dumps({"players": [player("[U:1:100]", ["cheater"]), player("[U:1:100]", ["cheater"])]}),
+            encoding="utf-8",
+        )
+        before = self.database.read_text(encoding="utf-8")
+        code, _, stderr = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 2)
+        self.assertIn("not a usable playerlist", stderr)
+        self.assertIn("duplicate steamid", stderr)
+        self.assertEqual(self.database.read_text(encoding="utf-8"), before)
+
+    def test_unknown_attribute_warns_but_does_not_block(self):
+        self.database.write_text(
+            dumps({"players": [player("[U:1:100]", ["suspicious", "futuretag"])]}), encoding="utf-8"
+        )
+        code, _, stderr = self.run_cli("--source", str(self.source), "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("unknown attribute", stderr)
+
+    def test_unexpected_os_error_is_reported_as_exit_code_two(self):
+        with mock.patch("sync_vorobey_hackerpolice.run", side_effect=OSError("disk full")):
+            code = main(["--source", str(self.source)])
+        self.assertEqual(code, 2)
+
     def test_source_must_not_be_the_database(self):
         code, _, stderr = self.run_cli("--source", str(self.database))
         self.assertEqual(code, 2)
@@ -1663,6 +1894,13 @@ class RepositoryDataTests(unittest.TestCase):
 # TF2BD playerlist helpers
 # --------------------------------------------------------------------------- #
 class NormalizeSteamIdTests(unittest.TestCase):
+    def test_non_ascii_digits_are_rejected_not_crashed(self):
+        """Regression: "²".isdigit() is True but int("²") raises, so a single
+        corrupted SteamID used to crash the whole run; "١٢٣" was silently
+        accepted and minted [U:1:123]. Both are now simply unusable."""
+        for probe in ("²", "1²3", "١٢٣", "۷۳", "[U:1:١٢٣]", "[U:1:²]", "U:1:²", "STEAM_0:1:²"):
+            self.assertIsNone(normalize_steamid(probe), probe)
+
     def test_canonical(self):
         self.assertEqual(normalize_steamid("[U:1:1730017]"), "[U:1:1730017]")
 
@@ -1814,7 +2052,36 @@ class SerialisationTests(unittest.TestCase):
                 load(Path(tmp) / "missing.json")
 
 
+class DocumentHandlingTests(unittest.TestCase):
+    def test_non_object_json_is_a_clean_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "list.json"
+            path.write_text("[]", encoding="utf-8")
+            with self.assertRaises(PlayerListError):
+                load(path)
+
+    def test_validation_result_is_false_only_with_errors(self):
+        self.assertTrue(ValidationResult())
+        self.assertTrue(ValidationResult(warnings=["w"]))
+        self.assertFalse(ValidationResult(errors=["e"]))
+
+    def test_player_name_and_non_object_entries(self):
+        self.assertEqual(player_name({"last_seen": {"player_name": "Bob"}}), "Bob")
+        self.assertEqual(player_name({"last_seen": "nonsense"}), "")
+        self.assertEqual(player_name({}), "")
+        result = validate({"players": ["not a dict", player("[U:1:1]", ["cheater"])]})
+        self.assertIn("players[0] is not an object", result.errors)
+
+    def test_steam_notation_with_too_many_digits_is_unusable(self):
+        self.assertIsNone(normalize_steamid("STEAM_0:1:12345678901"))
+
+
 class ValidateTests(unittest.TestCase):
+    def test_non_ascii_steamid_is_a_validation_error_not_a_crash(self):
+        result = validate({"players": [{"steamid": "²", "attributes": ["cheater"]}]})
+        self.assertTrue(result.errors)
+        self.assertIn("unusable steamid", result.errors[0])
+
     def test_valid_database(self):
         result = validate({"players": [{"steamid": "[U:1:1]", "attributes": ["cheater"]}]})
         self.assertEqual(result.errors, [])

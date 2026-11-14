@@ -81,6 +81,10 @@ PROMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "Hackerpoli
 DEMOTION_HEADER = ("SteamID", "Last known name", "Before", "After")
 REMOVED_HEADER = ("SteamID", "Profile Link")
 
+# Display default only: the CLI always passes the real --snapshot path in
+# RunInfo, so a custom path is reported correctly instead of the default.
+DEFAULT_SNAPSHOT_LABEL = "snapshot/playerlist.vorobey-hackerpolice.json"
+
 
 def _safe(text: str) -> str:
     """Replace lone surrogates so the report is always UTF-8 encodable."""
@@ -194,6 +198,11 @@ def _sorted_steamids(steamids: Sequence[str]) -> list[str]:
     return sorted(steamids, key=_steamid_sort_key)
 
 
+def _change_sort_key(change: Change) -> tuple[bool, int]:
+    """Order report rows by numeric SteamID."""
+    return _steamid_sort_key(change.steamid)
+
+
 def _profile_cell(steamid: str) -> str:
     """Steam profile permalink for one SteamID, or ``-`` if it cannot be built."""
     url = steam_profile_url(steamid)
@@ -278,7 +287,7 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
 
     body = "; ".join(parts)
     if database is not None:
-        body = f"In `{database}`: {body}"
+        body = f"In `{_code(database)}`: {body}"
     return body + "; nothing else is modified."
 
 
@@ -310,6 +319,9 @@ class RunInfo:
     # True when the snapshot file itself was refreshed this run, so a
     # snapshot-only PR does not misleadingly report "No changes."
     snapshot_changed: bool = False
+    # The snapshot file this run used (--snapshot), so the report never names
+    # a path the run did not actually touch.
+    snapshot_path: Path | None = None
 
     @property
     def database_name(self) -> str:
@@ -336,7 +348,7 @@ def _header_lines(info: RunInfo) -> list[str]:
         f"- Run at: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
     ]
     if info.dry_run:
-        lines.append("- Mode: **dry run** (no files written)")
+        lines.append("- Mode: **dry run** (no database or snapshot written)")
     if info.previous_source_total is not None:
         current_total = info.previous_source_total + info.added_to_source - info.removed_from_source
         net = info.added_to_source - info.removed_from_source
@@ -364,10 +376,8 @@ def _header_lines(info: RunInfo) -> list[str]:
         lines.append(f"- Snapshot: {info.snapshot_note}")
     elif info.snapshot_changed:
         verb = "would be updated" if info.dry_run else "updated"
-        lines.append(
-            f"- Snapshot: `snapshot/playerlist.vorobey-hackerpolice.json` {verb} "
-            "to an exact copy of the current upstream file"
-        )
+        label = _code(str(info.snapshot_path) if info.snapshot_path is not None else DEFAULT_SNAPSHOT_LABEL)
+        lines.append(f"- Snapshot: `{label}` {verb} to an exact copy of the current upstream file")
     lines.append("")
     return lines
 
@@ -426,8 +436,10 @@ def render_report(info: RunInfo) -> str:
     """Render the PR body / job summary as Markdown."""
     lines = _header_lines(info)
 
-    promotions = [change for change in info.changes if change.kind == "promote"]
-    demotions = [change for change in info.changes if change.kind == "demote"]
+    # Numeric SteamID order: the same run always renders the same table, and
+    # the reader can find an ID at a glance (changes arrive in database order).
+    promotions = sorted((change for change in info.changes if change.kind == "promote"), key=_change_sort_key)
+    demotions = sorted((change for change in info.changes if change.kind == "demote"), key=_change_sort_key)
 
     if not promotions and not demotions:
         if info.snapshot_changed:
@@ -452,18 +464,21 @@ def render_report(info: RunInfo) -> str:
     lines += ["", closing]
 
     total_links = sum(len(change.evidence) for change in promotions)
-    if total_links:
-        note = (
-            "Proof link comes from the Vorobey hackerpolice list and is shown for review only."
-            if total_links == 1
-            else "Proof links come from the Vorobey hackerpolice list and are shown for review only."
-        )
-        lines.append(note)
     if info.include_proof:
         lines += [
             "",
             "**Note:** `--include-proof` was enabled, so an `[auto]` proof line citing the",
             "hackerpolice list was also written into each entry above.",
         ]
+        if total_links:
+            lines.append("")
+    if total_links:
+        # Deliberately the last line of the report.
+        note = (
+            "Proof link comes from the Vorobey hackerpolice list and is shown for review only."
+            if total_links == 1
+            else "Proof links come from the Vorobey hackerpolice list and are shown for review only."
+        )
+        lines.append(note)
     lines.append("")
     return _safe(_fit_body("\n".join(lines)))

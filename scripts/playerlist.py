@@ -24,7 +24,11 @@ CANONICAL_SUFFIX = "]"
 ATTRIBUTE_ORDER: tuple[str, ...] = ("cheater", "suspicious", "exploiter", "racist")
 KNOWN_ATTRIBUTES = frozenset(ATTRIBUTE_ORDER)
 
-_ACCOUNT_ID_RE = re.compile(r"\d+")
+# ASCII digits only: \d also matches Arabic-Indic/Devanagari digits and
+# str.isdigit() also accepts things like "²" that int() then refuses, so a
+# corrupted or hostile SteamID could crash the run (or silently mint an id
+# from "١٢٣"). Every pattern and parser below is ASCII-strict.
+_ACCOUNT_ID_RE = re.compile(r"[0-9]+")
 # The canonical form is written upper-case by TF2BD, but matching is
 # case-insensitive on every notation so a hand-edited "[u:1:…]" still maps to
 # the same player (and is caught as a duplicate by validate()).
@@ -32,8 +36,8 @@ _U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$", re.IGNORECASE)
 _U_BARE_RE = re.compile(rf"^U:1:({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE)
 _U_INSTANCE_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):{_ACCOUNT_ID_RE.pattern}\]$", re.IGNORECASE)
 _STEAM2_RE = re.compile(r"^STEAM_[0-5]:([01]):(\d+)$", re.IGNORECASE)
-_STEAMID64_RE = re.compile(r"^\d{17}$")
-_PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/(\d{17})", re.IGNORECASE)
+_STEAMID64_RE = re.compile(r"^[0-9]{17}$")
+_PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/([0-9]{17})", re.IGNORECASE)
 
 
 class PlayerListError(Exception):
@@ -68,13 +72,17 @@ def _account_from_steamid64(value: int) -> int | None:
 
 
 def _bounded_int(digits: str) -> int | None:
-    """Parse a decimal string, or return ``None`` if it has >10 significant digits.
+    """Parse an ASCII decimal string, or return ``None`` if it is unusable.
 
-    Guards ``int()`` against Python's int-parsing digit limit: a SteamID
-    string with thousands of digits (hostile or corrupted input) must be
-    rejected, not crash the sync. Account ids fit in 10 digits, so anything
-    longer is out of range anyway; leading zeros are ignored.
+    Rejects anything that is not plain ASCII digits (``int()`` would raise on
+    "²" and would happily accept "١٢٣"), and rejects more than 10 significant
+    digits: that also guards Python's int-parsing digit limit, which a SteamID
+    of thousands of digits (hostile or corrupted input) would otherwise hit.
+    Account ids fit in 10 digits, so anything longer is out of range anyway;
+    leading zeros are ignored.
     """
+    if not (digits.isascii() and digits.isdigit()):
+        return None
     significant = digits.lstrip("0") or "0"
     if len(significant) > 10:
         return None
@@ -123,7 +131,7 @@ def normalize_steamid(value: Any) -> str | None:
         account = _account_from_steamid64(int(text))
         return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
 
-    if text.isdigit():
+    if text.isascii() and text.isdigit():
         # Bare account id given as a string, e.g. "1730017" (the int form of
         # this is accepted above, so accept the string form too).
         account = _bounded_int(text)

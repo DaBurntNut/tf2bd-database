@@ -381,6 +381,7 @@ def run(args: argparse.Namespace) -> int:
             demotion_note=demotion_note,
             snapshot_note=snapshot_note,
             snapshot_changed=snapshot_changed,
+            snapshot_path=snapshot_path,
         )
     )
     if args.report:
