@@ -30,6 +30,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import playerlist as playerlist_module
+import report as report_module
 import sources
 from playerlist import (
     PlayerListError,
@@ -364,6 +366,87 @@ class SourceFetchTests(unittest.TestCase):
             handler.redirect_request(request, None, 302, "Found", Message(), "http://example.invalid/list.json")
         upgraded = handler.redirect_request(request, None, 302, "Found", Message(), "https://cdn.invalid/list.json")
         self.assertEqual(upgraded.full_url, "https://cdn.invalid/list.json")
+
+    def test_body_exactly_at_the_size_limit_is_accepted(self):
+        with (
+            mock.patch("sources._OPENER.open", return_value=_FakeResponse(self.BODY)),
+            mock.patch("sources.MAX_SOURCE_BYTES", len(self.BODY)),
+            mock.patch("sources.time.sleep"),
+        ):
+            _, _, raw = load_first_available_raw([self.URL])
+        self.assertEqual(raw, self.BODY)
+        with (
+            mock.patch("sources._OPENER.open", return_value=_FakeResponse(self.BODY)),
+            mock.patch("sources.MAX_SOURCE_BYTES", len(self.BODY) - 1),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
+
+    def test_network_errors_are_retried_with_backoff(self):
+        with (
+            mock.patch("sources._OPENER.open", side_effect=urllib.error.URLError("down")) as opener,
+            mock.patch("sources.time.sleep") as sleep,
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
+        self.assertEqual(opener.call_count, sources.FETCH_ATTEMPTS)
+        self.assertEqual(sleep.call_count, sources.FETCH_ATTEMPTS - 1)
+
+    def test_local_source_exactly_at_the_limit_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "exact.json"
+            path.write_bytes(self.BODY)
+            with mock.patch("sources.MAX_SOURCE_BYTES", len(self.BODY)):
+                _, _, raw = load_first_available_raw([str(path)])
+        self.assertEqual(raw, self.BODY)
+
+    def test_declared_length_boundary_is_exact(self):
+        for declared, accepted in ((len(self.BODY), True), (len(self.BODY) + 1, False)):
+            response = _FakeResponse(self.BODY, {"Content-Length": str(declared)})
+            with (
+                mock.patch("sources._OPENER.open", return_value=response),
+                mock.patch("sources.MAX_SOURCE_BYTES", len(self.BODY)),
+                mock.patch("sources.time.sleep"),
+            ):
+                if accepted:
+                    _, _, raw = load_first_available_raw([self.URL])
+                    self.assertEqual(raw, self.BODY)
+                else:
+                    with self.assertRaises(SyncError):
+                        load_first_available_raw([self.URL])
+                    self.assertEqual(response.read_count, 0)  # rejected before download
+
+    def test_server_errors_are_retried_and_client_errors_are_not(self):
+        for code, expected_attempts in (
+            (500, sources.FETCH_ATTEMPTS),
+            (599, sources.FETCH_ATTEMPTS),
+            (600, 1),
+            (404, 1),
+        ):
+            error = urllib.error.HTTPError(self.URL, code, "boom", Message(), None)
+            with (
+                mock.patch("sources._OPENER.open", side_effect=error) as opener,
+                mock.patch("sources.time.sleep") as sleep,
+                self.assertRaises(SyncError),
+            ):
+                load_first_available_raw([self.URL])
+            self.assertEqual(opener.call_count, expected_attempts, f"HTTP {code}")
+            # never sleep after the final attempt
+            self.assertEqual(sleep.call_count, expected_attempts - 1, f"HTTP {code}")
+
+    def test_backoff_grows_linearly_between_attempts(self):
+        error = urllib.error.HTTPError(self.URL, 503, "boom", Message(), None)
+        with (
+            mock.patch("sources._OPENER.open", side_effect=error),
+            mock.patch("sources.time.sleep") as sleep,
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [sources.RETRY_BACKOFF_SECONDS * attempt for attempt in range(1, sources.FETCH_ATTEMPTS)],
+        )
 
     def test_non_ascii_content_length_is_ignored_instead_of_crashing(self):
         """isdigit() accepts "²", int() does not: a malformed header must be
@@ -749,6 +832,14 @@ class PolicyPropertyTests(unittest.TestCase):
             settled = dumps(database)
             self.assertEqual(sync(database, index, enable_demote=True, removed_ids=removed), [])
             self.assertEqual(dumps(database), settled, "a second run changed the database")
+
+
+class EvidenceTests(unittest.TestCase):
+    def test_evidence_ignores_non_strings_and_blank_entries(self):
+        index = index_of(hackerpolice_entry("[U:1:100]", [1, "  ", None, "https://x", "https://x"]))
+        database = {"players": [player("[U:1:100]", ["suspicious"])]}
+        changes = promote(database, index)
+        self.assertEqual(changes[0].evidence, ("https://x",))  # de-duplicated, junk dropped
 
 
 class SyncInvariantTests(unittest.TestCase):
@@ -1364,6 +1455,69 @@ class ClosingMessageTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+class ReportBoundaryTests(unittest.TestCase):
+    def _info(self, **kwargs):
+        return RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://example.invalid/list.json",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+            **kwargs,
+        )
+
+    def test_exactly_the_row_limit_gets_no_overflow_note(self):
+        limit = MAX_CHANGE_TABLE_ROWS
+        changes = tuple(
+            Change(steamid=f"[U:1:{n}]", name="n", before=("suspicious",), after=("cheater",)) for n in range(limit)
+        )
+        rendered = render_report(self._info(changes=changes))
+        self.assertNotIn("more entries not shown", rendered)
+        one_more = (*changes, Change(steamid="[U:1:999999]", name="x", before=("suspicious",), after=("cheater",)))
+        self.assertIn("1 more entry not shown", render_report(self._info(changes=one_more)))
+
+    def test_body_exactly_at_the_character_limit_is_untouched(self):
+        text = "a" * MAX_REPORT_CHARS
+        self.assertEqual(report_module._fit_body(text), text)
+
+    def test_truncation_keeps_content_when_the_cut_lands_on_the_first_newline(self):
+        text = "\n" + "b" * (MAX_REPORT_CHARS + 100)
+        fitted = report_module._fit_body(text)
+        self.assertLessEqual(len(fitted), MAX_REPORT_CHARS)
+        self.assertTrue(fitted.lstrip("\n").startswith("b"), fitted[:20])
+
+    def test_promotions_and_demotions_land_in_their_own_tables(self):
+        changes = (
+            Change(steamid="[U:1:100]", name="p", before=("suspicious",), after=("cheater",)),
+            Change(steamid="[U:1:200]", name="d", before=("cheater", "racist"), after=("racist",), kind="demote"),
+        )
+        rendered = render_report(self._info(changes=changes))
+        promotion_block, demotion_block = rendered.split("demoted (in the previous snapshot", 1)
+        self.assertIn("[U:1:100]", promotion_block)
+        self.assertNotIn("[U:1:200]", promotion_block)
+        self.assertIn("[U:1:200]", demotion_block)
+
+    def test_proof_note_only_appears_when_a_link_exists(self):
+        with_link = (
+            Change(steamid="[U:1:1]", name="n", before=("suspicious",), after=("cheater",), evidence=("https://x",)),
+        )
+        without = (Change(steamid="[U:1:1]", name="n", before=("suspicious",), after=("cheater",)),)
+        self.assertIn("Proof link comes from", render_report(self._info(changes=with_link)))
+        self.assertNotIn("Proof link", render_report(self._info(changes=without)))
+
+    def test_multiple_links_use_the_plural_note(self):
+        changes = (
+            Change(
+                steamid="[U:1:1]",
+                name="n",
+                before=("suspicious",),
+                after=("cheater",),
+                evidence=("https://x", "https://y"),
+            ),
+        )
+        self.assertIn("Proof links come from", render_report(self._info(changes=changes)))
+
+
 class ClosingOrderTests(unittest.TestCase):
     def test_closing_sentence_lists_steamids_numerically(self):
         changes = (
@@ -1786,6 +1940,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("→", raw.getvalue().decode("utf-8"))
 
+    def test_dry_run_never_writes_the_snapshot(self):
+        """A dry run must leave BOTH files alone, not just the database."""
+        snapshot = self.write_snapshot_fixture(hackerpolice_entry("[U:1:999]"))
+        before = snapshot.read_bytes()
+        code, _, stderr = self.run_cli(
+            "--source", str(self.source), "--snapshot", str(snapshot), "--demote", "--dry-run"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(snapshot.read_bytes(), before)
+        self.assertIn(f"Would update snapshot {snapshot}", stderr)
+
+    def test_log_reports_no_changes_and_snapshot_updates_exactly_once(self):
+        snapshot = self.write_snapshot_fixture(hackerpolice_entry("[U:1:999]"))
+        first = self.run_cli("--source", str(self.source), "--snapshot", str(snapshot), "--demote")
+        self.assertEqual(first[0], 0)
+        self.assertIn(f"Updated snapshot {snapshot}", first[2])
+        second = self.run_cli("--source", str(self.source), "--snapshot", str(snapshot), "--demote")
+        self.assertEqual(second[0], 0)
+        self.assertIn("No changes: nothing to update.", second[2])
+        self.assertNotIn("Updated snapshot", second[2])
+
     def test_quiet_prints_only_the_report(self):
         code, stdout, stderr = self.run_cli("--source", str(self.source), "--dry-run", "-q")
         self.assertEqual(code, 0)
@@ -2001,6 +2176,20 @@ class RepositoryDataTests(unittest.TestCase):
 # TF2BD playerlist helpers
 # --------------------------------------------------------------------------- #
 class NormalizeSteamIdTests(unittest.TestCase):
+    def test_account_id_zero_is_never_a_valid_steamid(self):
+        from playerlist import STEAMID64_BASE
+
+        for probe in (
+            0,
+            "0",
+            "[U:1:0]",
+            STEAMID64_BASE,
+            str(STEAMID64_BASE),
+            f"https://steamcommunity.com/profiles/{STEAMID64_BASE}",
+        ):
+            self.assertIsNone(normalize_steamid(probe), probe)
+        self.assertIsNone(playerlist_module._bounded_int("²"))  # defensive guard, unreachable from input
+
     def test_non_ascii_digits_are_rejected_not_crashed(self):
         """Regression: "²".isdigit() is True but int("²") raises, so a single
         corrupted SteamID used to crash the whole run; "١٢٣" was silently
