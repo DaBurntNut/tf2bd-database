@@ -39,7 +39,8 @@ run.
 
 Only players who were in the previous snapshot and are gone now are demoted, so
 **cheaters added by hand are never touched**. Every removed SteamID is listed in
-the pull request with its profile link. `snapshot/playerlist.vorobey-hackerpolice.json`
+the pull request with its profile link, and every table also links each player's
+[SteamHistory](https://steamhistory.net/) page. `snapshot/playerlist.vorobey-hackerpolice.json`
 is yesterday's copy of Vorobey's list — the bot compares against it to know who
 was removed, and updates it in the same pull request. Evidence links stay in the
 pull request; they reach the database only if you run the script yourself with

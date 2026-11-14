@@ -20,8 +20,9 @@ mass-demotion guard -- because advancing it would forget those removals.
 
 The report (pull request body / job summary) lists every SteamID that
 disappeared from the upstream list since the previous snapshot, as a
-``| SteamID | Profile Link |`` table -- the upstream list stores no player
-names, so each ID is shown with its Steam profile permalink.
+``| SteamID | Profile Link | SteamHistory |`` table -- the upstream list
+stores no player names, so each ID is shown with its Steam profile
+permalink and its SteamHistory page.
 
 Usage:
     python3 scripts/sync_vorobey_hackerpolice.py --dry-run

@@ -17,6 +17,7 @@ import io
 import json
 import os
 import random
+import re
 import runpy
 import shutil
 import stat
@@ -47,6 +48,7 @@ from playerlist import (
     order_attributes,
     player_name,
     sort_players,
+    steam_history_url,
     steam_profile_url,
     strict_json_loads,
     validate,
@@ -1432,6 +1434,10 @@ class PolicyFuzzTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Report rendering
 # --------------------------------------------------------------------------- #
+# A table separator is a pipe that is not escaped as "\\|" inside a cell.
+_UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+
+
 class ReportTests(unittest.TestCase):
     def info(self, changes=(), *, source="https://example.invalid/list.json", **kwargs):
         return RunInfo(
@@ -1507,6 +1513,41 @@ class ReportTests(unittest.TestCase):
         )
         # The actual URL the bytes were fetched from stays visible for debugging.
         self.assertIn("- Fetched from: https://example.invalid/list.json", report)
+
+    def test_every_change_row_links_the_player_to_steamhistory(self):
+        """Reviewers can open the archived profile (past names, bans) in one click."""
+        promote = Change("[U:1:100]", "a", ("suspicious",), ("cheater",))
+        demote = Change("[U:1:200]", "b", ("cheater",), ("racist",), kind="demote")
+        report = render_report(self.info([promote, demote]))
+        self.assertIn("| SteamHistory |", report)  # column header, in both tables
+        rows = [line for line in report.splitlines() if line.startswith("| `[U:1:")]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[0].endswith("| [SteamHistory](https://steamhistory.net/id/76561197960265828) |"))
+        self.assertTrue(rows[1].endswith("| [SteamHistory](https://steamhistory.net/id/76561197960265928) |"))
+
+    def test_steamhistory_column_is_dash_when_the_steamid_is_unusable(self):
+        change = Change(steamid="nope", name="someone", before=("suspicious",), after=("cheater",))
+        report = render_report(self.info([change]))
+        row = next(line for line in report.splitlines() if line.startswith("| `nope`"))
+        self.assertTrue(row.endswith("| - |"))
+        self.assertNotIn("steamhistory.net/id/None", report)
+
+    def test_every_row_has_exactly_as_many_cells_as_its_header(self):
+        """Adding a column later cannot silently produce a ragged table."""
+        promote = Change("[U:1:100]", "a|b", ("suspicious",), ("cheater",), ("https://example.invalid/x|y",))
+        demote = Change("[U:1:200]", "b", ("cheater",), ("racist",), kind="demote")
+        report = render_report(self.info([promote, demote], removed_upstream=("[U:1:5]",)))
+
+        def cells(line: str) -> int:
+            # An escaped "\\|" is part of a cell, not a separator.
+            return len(_UNESCAPED_PIPE.findall(line)) - 1
+
+        header_cells = None
+        for line in report.splitlines():
+            if line.startswith("| SteamID |"):
+                header_cells = cells(line)
+            elif line.startswith("| `["):
+                self.assertEqual(cells(line), header_cells, line)
 
     def test_unusable_steamid_renders_name_without_a_link(self):
         changes = (Change(steamid="nope", name="someone", before=("suspicious",), after=("cheater",)),)
@@ -1712,7 +1753,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("https://example.invalid/a%7Cb", report)
         rows = [line for line in report.splitlines() if line.startswith("| `[U:1:1]`")]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].count("|"), 6)  # five cells, no stray separator
+        self.assertEqual(rows[0].count("|"), 7)  # six cells, no stray separator
 
     def test_no_proof_note_without_evidence_links(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))  # no evidence links
@@ -1785,10 +1826,11 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
             "**1 SteamID removed from the Vorobey hackerpolice list since the previous snapshot.**",
             report,
         )
-        self.assertIn("| SteamID | Profile Link |", report)
-        self.assertIn("| --- | --- |", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
+        self.assertIn("| --- | --- | --- |", report)
         self.assertIn(
-            "| `[U:1:269327660]` | [Profile](https://steamcommunity.com/profiles/76561198229593388) |",
+            "| `[U:1:269327660]` | [Profile](https://steamcommunity.com/profiles/76561198229593388) "
+            "| [SteamHistory](https://steamhistory.net/id/76561198229593388) |",
             report,
         )
 
@@ -1809,8 +1851,14 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         self.assertEqual(
             rows,
             [
-                "| `[U:1:3]` | [Profile](https://steamcommunity.com/profiles/76561197960265731) |",
-                "| `[U:1:20]` | [Profile](https://steamcommunity.com/profiles/76561197960265748) |",
+                (
+                    "| `[U:1:3]` | [Profile](https://steamcommunity.com/profiles/76561197960265731) "
+                    "| [SteamHistory](https://steamhistory.net/id/76561197960265731) |"
+                ),
+                (
+                    "| `[U:1:20]` | [Profile](https://steamcommunity.com/profiles/76561197960265748) "
+                    "| [SteamHistory](https://steamhistory.net/id/76561197960265748) |"
+                ),
             ],
         )
 
@@ -2989,6 +3037,14 @@ class NormalizeSteamIdTests(unittest.TestCase):
         self.assertEqual(steam_profile_url("STEAM_0:1:865008"), "https://steamcommunity.com/profiles/76561197961995745")
         self.assertIsNone(steam_profile_url("nope"))
         self.assertIsNone(steam_profile_url(None))
+
+    def test_steam_history_url(self):
+        # Same SteamID64 as the Steam Community permalink, on SteamHistory's /id/ page.
+        self.assertEqual(steam_history_url("[U:1:269327660]"), "https://steamhistory.net/id/76561198229593388")
+        self.assertEqual(steam_history_url("STEAM_0:1:865008"), "https://steamhistory.net/id/76561197961995745")
+        self.assertEqual(steam_history_url(76561198229593388), "https://steamhistory.net/id/76561198229593388")
+        self.assertIsNone(steam_history_url("nope"))
+        self.assertIsNone(steam_history_url(None))
 
 
 class PluralTests(unittest.TestCase):

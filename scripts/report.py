@@ -14,7 +14,7 @@ untrusted-output as well as untrusted-input territory:
 * the closing sentence names the database that changed exactly once.
 
 Order of the body: header bullets, promotions, demotions, the SteamIDs
-removed from the upstream list (``| SteamID | Profile Link |``), and
+removed from the upstream list (``| SteamID | Profile Link | SteamHistory |``), and
 finally the closing sentence + proof note.
 """
 
@@ -26,7 +26,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from playerlist import account_id, steam_profile_url
+from playerlist import account_id, steam_history_url, steam_profile_url
 from policy import Change
 from sources import SOURCE_REPO_URL, redact_url
 
@@ -85,9 +85,9 @@ _CODE_ESCAPES = str.maketrans({"\\": "\\\\", "|": "\\|", "`": "\\`"})
 # (it is serialised with ensure_ascii, which re-escapes them losslessly).
 _SURROGATES_RE = re.compile(r"[\ud800-\udfff]")
 
-PROMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "Hackerpolice proof")
-DEMOTION_HEADER = ("SteamID", "Last known name", "Before", "After")
-REMOVED_HEADER = ("SteamID", "Profile Link")
+PROMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "Hackerpolice proof", "SteamHistory")
+DEMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "SteamHistory")
+REMOVED_HEADER = ("SteamID", "Profile Link", "SteamHistory")
 
 # Display default only: the CLI always passes the real --snapshot path in
 # RunInfo, so a custom path is reported correctly instead of the default.
@@ -219,6 +219,11 @@ def _capped(rows: Sequence[str], limit: int, singular: str, plural_form: str) ->
     return list(rows[:limit]), note
 
 
+def _row(cells: Sequence[str]) -> str:
+    """Render one table row from already-escaped cells (one string per column)."""
+    return "| " + " | ".join(cells) + " |"
+
+
 def _table(header: Sequence[str], rows: Sequence[str], overflow_note: str | None = None) -> list[str]:
     """Render a Markdown table, plus an optional overflow note underneath."""
     lines = [
@@ -255,20 +260,33 @@ def _profile_cell(steamid: str) -> str:
     return _markdown_link(url, "Profile")
 
 
+def _steam_history_cell(steamid: str) -> str:
+    """SteamHistory page for one SteamID, or ``-`` if it cannot be built.
+
+    SteamHistory keeps a profile's history (past names, avatars, bans), so the
+    reviewer can see who a demoted or promoted player is even after a rename.
+    """
+    url = steam_history_url(steamid)
+    if url is None:
+        return "-"
+    return _markdown_link(url, "SteamHistory")
+
+
 def render_removed_table(steamids: Sequence[str]) -> list[str]:
     """Render the "removed from the Vorobey list" table as Markdown lines.
 
-    Vorobey's list records no player names, so the table is exactly
-    ``| SteamID | Profile Link |``: the SteamID in canonical ``[U:1:x]``
-    form and the Steam Community profile *permalink* (the SteamID64 URL),
-    which keeps working even when the player renames themselves.
+    Vorobey's list records no player names, so the table is
+    ``| SteamID | Profile Link | SteamHistory |``: the SteamID in canonical
+    ``[U:1:x]`` form, the Steam Community profile *permalink* and the
+    SteamHistory page (both SteamID64 URLs, so they keep working even when the
+    player renames themselves).
     """
     if not steamids:
         return []
 
     ordered = _sorted_steamids(steamids)
     count = len(ordered)
-    rows = [f"| {_steamid_cell(steamid)} | {_profile_cell(steamid)} |" for steamid in ordered]
+    rows = [_row((_steamid_cell(steamid), _profile_cell(steamid), _steam_history_cell(steamid))) for steamid in ordered]
     rows, overflow = _capped(rows, MAX_REMOVED_TABLE_ROWS, "SteamID", "SteamIDs")
     headline = (
         f"**{_count(count)} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey hackerpolice list "
@@ -438,8 +456,16 @@ def _header_lines(info: RunInfo) -> list[str]:
 def _promotion_lines(promotions: Sequence[Change]) -> list[str]:
     """Render the "promoted to cheater" table block."""
     rows = [
-        f"| {_steamid_cell(change.steamid)} | {_name_cell(change)} | {_attributes_cell(change.before)} "
-        f"| {_attributes_cell(change.after)} | {_evidence_cell(change.evidence)} |"
+        _row(
+            (
+                _steamid_cell(change.steamid),
+                _name_cell(change),
+                _attributes_cell(change.before),
+                _attributes_cell(change.after),
+                _evidence_cell(change.evidence),
+                _steam_history_cell(change.steamid),
+            )
+        )
         for change in promotions
     ]
     rows, overflow = _capped(rows, MAX_CHANGE_TABLE_ROWS, "entry", "entries")
@@ -455,8 +481,15 @@ def _promotion_lines(promotions: Sequence[Change]) -> list[str]:
 def _demotion_lines(demotions: Sequence[Change]) -> list[str]:
     """Render the "demoted" table block."""
     rows = [
-        f"| {_steamid_cell(change.steamid)} | {_name_cell(change)} | {_attributes_cell(change.before)} "
-        f"| {_attributes_cell(change.after) or 'entry removed'} |"
+        _row(
+            (
+                _steamid_cell(change.steamid),
+                _name_cell(change),
+                _attributes_cell(change.before),
+                _attributes_cell(change.after) or "entry removed",
+                _steam_history_cell(change.steamid),
+            )
+        )
         for change in demotions
     ]
     rows, overflow = _capped(rows, MAX_CHANGE_TABLE_ROWS, "entry", "entries")
