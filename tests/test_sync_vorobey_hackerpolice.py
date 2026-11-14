@@ -2473,6 +2473,18 @@ class RepositoryDataTests(unittest.TestCase):
         # a hand-reformatted list would show up as a thousands-line diff.
         self.assertEqual(dumps(database), original)
 
+    def test_publishing_steps_stage_only_the_two_data_files(self):
+        """`git add -A` would publish whatever else happens to be in the workspace.
+
+        Verified by executing both steps against a local remote; this keeps the
+        property pinned without needing git in the test environment.
+        """
+        workflow = (self.ROOT / ".github/workflows/sync-vorobey-hackerpolice.yml").read_text(encoding="utf-8")
+        self.assertNotIn("git add -A", workflow)
+        self.assertNotIn("git add .", workflow)
+        self.assertEqual(workflow.count('git add -- "$DATABASE" "$SNAPSHOT"'), 2)
+        self.assertIn("compare/$BASE_BRANCH...$BOT_BRANCH?expand=1", workflow)
+
     def test_every_publishing_step_requires_a_successful_sync(self):
         """A red run must never publish, and must never claim "nothing to do".
 
