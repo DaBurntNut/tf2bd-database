@@ -691,6 +691,11 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         report = render_report(self.info(removed_upstream=("[U:1:2]",)))
         self.assertNotIn("Last known name", report)
         self.assertNotIn("UNKNOWN", report)
+        # No explanatory filler above the table either: heading, then the table.
+        self.assertNotIn("stores no player names", report)
+        self.assertLess(
+            report.index("removed from the Vorobey hackerpolice list"), report.index("| SteamID | Profile Link |")
+        )
 
     def test_plural_count_and_numeric_order(self):
         report = render_report(self.info(removed_upstream=("[U:1:20]", "[U:1:3]")))

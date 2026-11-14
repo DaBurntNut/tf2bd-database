@@ -134,8 +134,6 @@ def render_removed_table(steamids: Sequence[str]) -> list[str]:
         f"**{count} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey hackerpolice list "
         "since the previous snapshot.**",
         "",
-        "The Vorobey list stores no player names, so each SteamID is listed with its Steam profile permalink.",
-        "",
         "| SteamID | Profile Link |",
         "| --- | --- |",
     ]
