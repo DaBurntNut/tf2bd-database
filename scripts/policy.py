@@ -290,12 +290,20 @@ def sync(
 
     Both ``promote`` and ``demote`` are applied, then the playerlist is
     sorted once. This avoids redundant sorting when both operations run.
+
+    An ID that is listed in ``index`` (i.e. upstream lists it RIGHT NOW) is
+    dropped from ``removed_ids`` before demotion. The caller already derives
+    the set as "previous snapshot minus current list", so real runs never
+    overlap -- but enforcing it here makes the operation idempotent no matter
+    what a future caller passes, instead of promoting and demoting the same
+    entry in one run.
     """
     changes: list[Change] = []
     changes.extend(promote(database, index, include_proof=include_proof))
 
     if enable_demote:
-        changes.extend(demote(database, removed_ids))
+        still_listed = index.by_steamid
+        changes.extend(demote(database, [steamid for steamid in removed_ids if steamid not in still_listed]))
 
     players = database.get("players")
     if isinstance(players, list):

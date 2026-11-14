@@ -681,6 +681,91 @@ class DemoteTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Policy invariants over randomised inputs (seeded: fully deterministic)
 # --------------------------------------------------------------------------- #
+class PolicyPropertyTests(unittest.TestCase):
+    """Seeded property test over arbitrary databases and upstream states.
+
+    The rules are re-derived here from the spec (not from the implementation),
+    and a second run must always be a no-op: that is what keeps the daily bot
+    from churning the file.
+    """
+
+    RACIST_LINE = "[auto] automatically marked: Racist | reason: whatever"
+
+    def test_random_databases_satisfy_the_rules(self):
+        rng = random.Random(20261114)
+        tags = ("cheater", "suspicious", "exploiter", "racist")
+        for _ in range(250):
+            accounts = rng.sample(range(2, 300), rng.randint(0, 20))
+            players: list = []
+            listed: set = set()
+            removed: set = set()
+            for account in accounts:
+                steamid = f"[U:1:{account}]"
+                entry = player(steamid, rng.sample(tags, rng.randint(0, 3)), last_seen={"time": 1})
+                if rng.random() < 0.4:
+                    entry["proof"] = rng.choice(
+                        [[self.RACIST_LINE], ["https://y"], [self.RACIST_LINE, "https://y"], []]
+                    )
+                players.append(entry)
+                if rng.random() < 0.4:
+                    listed.add(steamid)
+                if rng.random() < 0.3:
+                    removed.add(steamid)
+
+            index = index_of(*[hackerpolice_entry(steamid) for steamid in listed])
+            database = {"players": copy.deepcopy(players)}
+            sync(database, index, enable_demote=True, removed_ids=removed)
+
+            after = {normalize_steamid(entry["steamid"]): entry for entry in database["players"]}
+            self.assertEqual(len(after), len(database["players"]), "duplicated entry after sync")
+            for original in players:
+                steamid = original["steamid"]
+                was, has = set(original["attributes"]), "cheater" in original["attributes"]
+                entry = after.get(steamid)
+                if not was:
+                    # No attributes at all: malformed, left alone by the policy
+                    # (the CLI refuses such a database before writing anything).
+                    self.assertEqual(entry, original)
+                    continue
+                if steamid in listed and has:
+                    # Still listed: never demoted, even if also in removed_ids.
+                    self.assertEqual(entry, original)
+                elif steamid in listed and was & {"suspicious", "racist"}:
+                    # Promoted: cheater added, suspicious settled, everything else kept.
+                    self.assertEqual(entry["attributes"], order_attributes((was | {"cheater"}) - {"suspicious"}))
+                    self.assertEqual(entry["last_seen"], original["last_seen"])
+                elif steamid in removed and has and "racist" not in was:
+                    # Removed upstream without a racist tag: the entry is gone.
+                    self.assertIsNone(entry)
+                elif steamid in removed and has:
+                    # Only the cheater tag goes (other tags survive); every proof
+                    # that is not an [auto] racist line is dropped with it.
+                    self.assertEqual(entry["attributes"], order_attributes(was - {"cheater"}))
+                    if "proof" in original:
+                        self.assertTrue(all(is_racist_proof(line) for line in entry["proof"]))
+                else:
+                    self.assertEqual(entry, original, "an unrelated entry was modified")
+
+            settled = dumps(database)
+            self.assertEqual(sync(database, index, enable_demote=True, removed_ids=removed), [])
+            self.assertEqual(dumps(database), settled, "a second run changed the database")
+
+
+class SyncInvariantTests(unittest.TestCase):
+    def test_an_id_listed_upstream_is_never_demoted(self):
+        """`removed_ids` should never contain a still-listed ID; even if a
+        caller passes one, sync must not promote and demote it in one run."""
+        index = index_of(hackerpolice_entry("[U:1:100]"))
+        database = {"players": [player("[U:1:100]", ["racist"])]}
+        changes = sync(database, index, enable_demote=True, removed_ids={"[U:1:100]"})
+        self.assertEqual(
+            [(c.steamid, c.kind, c.after) for c in changes], [("[U:1:100]", "promote", ("cheater", "racist"))]
+        )
+        self.assertEqual(database["players"][0]["attributes"], ["cheater", "racist"])
+        # ... and a second run must be a no-op.
+        self.assertEqual(sync(database, index, enable_demote=True, removed_ids={"[U:1:100]"}), [])
+
+
 class MalformedEntryTests(unittest.TestCase):
     """Malformed or unrelated entries must be skipped, never crash or be lost."""
 
@@ -901,6 +986,18 @@ class ReportTests(unittest.TestCase):
         self.assertIn("**1,200 new SteamIDs added**", report)
         self.assertIn("(12,345 → 13,542 entries; net +1,197)", report)
         self.assertIn("**1 SteamID removed from the Vorobey hackerpolice list", report)
+
+    def test_fetch_url_cannot_smuggle_html_into_the_report(self):
+        info = RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://example.invalid/<script>alert(1)</script>",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+        )
+        report = render_report(info)
+        self.assertNotIn("<script", report)
+        self.assertIn("&lt;script&gt;", report)
 
     def test_fetch_url_credentials_are_redacted(self):
         """A --source may carry a token; the PR body is public to the repo."""

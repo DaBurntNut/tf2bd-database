@@ -72,7 +72,7 @@ fits GitHub's size limit.
 
 | Rail | What it guarantees |
 | --- | --- |
-| Snapshot-only demotion | An entry is only demoted when its SteamID was in the previous snapshot *and* is gone from today's list — never merely "absent from Vorobey". Manually added cheaters are untouched. |
+| Snapshot-only demotion | An entry is only demoted when its SteamID was in the previous snapshot *and* is gone from today's list — never merely "absent from Vorobey", and never while upstream still lists it. Manually added cheaters are untouched. |
 | Mass-removal guard | If an implausibly large share of the snapshot disappears at once (more than 50 IDs and more than 20 %), demotion is skipped and the baseline is kept, so an upstream outage cannot wipe entries. A human can force it with `--allow-mass-demotion`. |
 | Frozen baseline | If a run finds removals it cannot apply (demotion disabled, or vetoed by the guard), the snapshot is **not** advanced — otherwise those removals would be forgotten forever. |
 | Exact snapshot | The snapshot is written from the fetched **bytes**, never re-encoded, and `.gitattributes` keeps Git from touching line endings. |

@@ -96,6 +96,15 @@ def _cell(value: str) -> str:
     return value.translate(_CELL_ESCAPES).strip() or "-"
 
 
+def _text(value: str) -> str:
+    """Escape the only characters that could act as HTML in running text.
+
+    Used for values shown outside a table cell or code span (the fetch URL):
+    ``<``/``>`` render identically as entities but can no longer open a tag.
+    """
+    return value.replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _code(value: str) -> str:
     """Make a string safe inside an inline code span (``…``)."""
     return value.translate(_CODE_ESCAPES)
@@ -344,7 +353,7 @@ def _header_lines(info: RunInfo) -> list[str]:
         "",
         f"- Database: `{_code(str(info.database_path))}`",
         f"- Vorobey hackerpolice list ({source_note}): {SOURCE_REPO_URL}",
-        f"- Fetched from: {redact_url(info.source)}",
+        f"- Fetched from: {_text(redact_url(info.source))}",
         f"- Run at: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
     ]
     if info.dry_run:
