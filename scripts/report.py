@@ -269,8 +269,14 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
     is removed from the database for this SteamID: ...; nothing else is
     modified."
     """
-    changed_steamids = [change.steamid for change in changes if (change.kind == "promote") or change.after]
-    removed_steamids = [change.steamid for change in changes if (change.kind == "demote") and not change.after]
+    # Same numeric order as the tables above, so the sentence reads the way
+    # the report does regardless of the order the changes were discovered in.
+    changed_steamids = _sorted_steamids(
+        [change.steamid for change in changes if (change.kind == "promote") or change.after]
+    )
+    removed_steamids = _sorted_steamids(
+        [change.steamid for change in changes if (change.kind == "demote") and not change.after]
+    )
 
     def clause(head: str, target: str, steamids: list[str]) -> str:
         if database is None:

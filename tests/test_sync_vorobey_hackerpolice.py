@@ -1364,6 +1364,16 @@ class ClosingMessageTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+class ClosingOrderTests(unittest.TestCase):
+    def test_closing_sentence_lists_steamids_numerically(self):
+        changes = (
+            Change(steamid="[U:1:900]", name="c", before=("suspicious",), after=("cheater",)),
+            Change(steamid="[U:1:100]", name="a", before=("suspicious",), after=("cheater",)),
+        )
+        closing = render_closing(changes, database="db.json")
+        self.assertIn("these SteamIDs: [U:1:100], [U:1:900];", closing)
+
+
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

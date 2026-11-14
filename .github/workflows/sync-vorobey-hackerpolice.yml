@@ -92,6 +92,12 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    # Own concurrency group: a pull request must never queue behind the nightly
+    # sync (which shares the group below for up to 10 minutes), and a newer
+    # push to the same PR cancels the older, now-pointless run.
+    concurrency:
+      group: checks-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
 
     steps:
       - name: Check out repository
