@@ -33,6 +33,7 @@ __all__ = [
     "RACIST_PROOF_PREFIX",
     "Change",
     "demote",
+    "is_racist_proof",
     "promote",
     "sync",
 ]
@@ -45,20 +46,32 @@ __all__ = [
 RACIST_PROOF_PREFIX = "[auto] automatically marked: Racist | reason:"
 
 
+def is_racist_proof(proof: str) -> bool:
+    """True if a proof line is one of the automatic ``Racist`` chat-log lines.
+
+    Matching is forgiving on purpose: leading/trailing whitespace and letter
+    case are ignored, so a future tool that writes ``[AUTO] Automatically
+    marked: RACIST`` still protects the line. Anything else -- a video link,
+    "Silent Aim & ESP", a hand-written "Racist behavior..." note -- is NOT a
+    racist proof and is dropped when the cheater tag goes away.
+    """
+    return proof.strip().casefold().startswith(RACIST_PROOF_PREFIX.casefold())
+
+
 def _filter_racist_proofs(proofs: Any) -> list[str]:
     """Keep only the ``[auto] ... Racist`` proof lines, dropping all others.
 
     When demoting ``cheater`` + ``racist`` -> ``racist``, the cheater tag was
     a false positive, so its evidence (video links, "Silent Aim & ESP", a
     hand-written "Racist behavior..." note, anything) is removed too. Only
-    proofs starting with :data:`RACIST_PROOF_PREFIX` -- the automatically
-    recorded chat-log lines that justify ``racist`` -- are kept, in order.
+    proofs that :func:`is_racist_proof` accepts -- the automatically recorded
+    chat-log lines that justify ``racist`` -- are kept, in order.
     A malformed (non-list) proof yields an empty list: it cannot contain a
     valid racist line, so nothing of it may survive the demotion either.
     """
     if not isinstance(proofs, list):
         return []
-    return [p for p in proofs if isinstance(p, str) and p.startswith(RACIST_PROOF_PREFIX)]
+    return [p for p in proofs if isinstance(p, str) and is_racist_proof(p)]
 
 
 @dataclass(frozen=True)
@@ -86,10 +99,21 @@ def _evidence_links(entry: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(links))
 
 
+def _proofs(player: Player) -> list[str]:
+    """The entry's proof list, tolerating a malformed value.
+
+    ``validate()`` rejects a non-list proof before anything is written, so
+    this only has to keep the policy itself crash-free while it runs.
+    """
+    proof = player.get("proof")
+    if isinstance(proof, list):
+        return list(proof)
+    return [] if proof is None else [str(proof)]
+
+
 def _write_proof(player: Player, evidence: tuple[str, ...]) -> None:
     """Write the ``[auto]`` proof line into a player entry (idempotent)."""
-    proof = player.get("proof")
-    proof = list(proof) if isinstance(proof, list) else ([] if proof is None else [str(proof)])
+    proof = _proofs(player)
     if not any(isinstance(item, str) and PROOF_MARKER in item for item in proof):
         line = f"{PROOF_MARKER} ({SOURCE_REPO_URL})"
         if evidence:
@@ -157,6 +181,66 @@ def promote(database: PlayerList, index: HackerpoliceIndex, *, include_proof: bo
     return changes
 
 
+def _demoted_entry(player: Player, removed: frozenset[str]) -> tuple[bool, Change | None]:
+    """Apply the demotion rule to ONE entry, in place.
+
+    Returns ``(keep_entry, change)``: ``change`` is ``None`` when the rule does
+    not apply to this entry, and ``keep_entry`` says whether the entry survives
+    (a ``cheater``+``racist`` entry keeps ``racist``; a ``cheater``-only entry
+    is dropped). Every malformed case is left untouched -- ``validate()``
+    reports those before a run ever writes anything.
+    """
+    if not isinstance(player, dict):
+        return True, None
+
+    canonical = normalize_steamid(player.get("steamid"))
+    if canonical is None:
+        return True, None
+
+    # Not proven to have been removed upstream (never listed, or still
+    # listed) - nothing to demote, however the entry got its cheater tag.
+    if canonical not in removed:
+        return True, None
+
+    attributes = player.get("attributes")
+    if not isinstance(attributes, list) or not attributes:
+        return True, None
+    if not all(isinstance(attribute, str) for attribute in attributes):
+        return True, None  # malformed entry; validation reports it
+
+    before = tuple(attributes)
+    if PROMOTED_TO not in before:
+        return True, None  # not a cheater - nothing to demote
+
+    if "racist" not in before:
+        # Remove the whole entry (cheater without racist)
+        return False, Change(
+            steamid=canonical,
+            name=player_name(player),
+            before=before,
+            after=(),
+            kind="demote",
+        )
+
+    # Remove only cheater, keep racist
+    after = tuple(order_attributes({*before} - {PROMOTED_TO}))
+    player["attributes"] = list(after)
+
+    # Drop every proof except the "[auto] ... Racist" lines: the cheater tag
+    # was a false positive, so its evidence must not stay behind pretending to
+    # justify the remaining racist tag.
+    if "proof" in player:
+        player["proof"] = _filter_racist_proofs(player.get("proof"))
+
+    return True, Change(
+        steamid=canonical,
+        name=player_name(player),
+        before=before,
+        after=after,
+        kind="demote",
+    )
+
+
 def demote(database: PlayerList, removed_ids: Collection[str]) -> list[Change]:
     """Remove ``cheater`` (or the whole entry) for IDs removed upstream.
 
@@ -179,71 +263,14 @@ def demote(database: PlayerList, removed_ids: Collection[str]) -> list[Change]:
     players = database.get("players")
     if not isinstance(players, list):
         return changes
+
     kept: list[Player] = []
-
     for player in players:
-        if not isinstance(player, dict):
+        keep, change = _demoted_entry(player, removed)
+        if change is not None:
+            changes.append(change)
+        if keep:
             kept.append(player)
-            continue
-
-        canonical = normalize_steamid(player.get("steamid"))
-        if canonical is None:
-            kept.append(player)
-            continue
-
-        # Not proven to have been removed upstream (never listed, or still
-        # listed) - nothing to demote, however the entry got its cheater tag.
-        if canonical not in removed:
-            kept.append(player)
-            continue
-
-        attributes = player.get("attributes")
-        if not isinstance(attributes, list) or not attributes:
-            kept.append(player)
-            continue
-        if not all(isinstance(attribute, str) for attribute in attributes):
-            kept.append(player)  # malformed entry; validation reports it
-            continue
-
-        before = tuple(attributes)
-        if PROMOTED_TO not in before:
-            # Not a cheater - nothing to demote
-            kept.append(player)
-            continue
-
-        if "racist" in before:
-            # Remove only cheater, keep racist
-            after = tuple(order_attributes({*before} - {PROMOTED_TO}))
-            player["attributes"] = list(after)
-
-            # Drop every proof except the "[auto] ... Racist" lines: the
-            # cheater tag was a false positive, so its evidence must not
-            # stay behind pretending to justify the remaining racist tag.
-            if "proof" in player:
-                player["proof"] = _filter_racist_proofs(player.get("proof"))
-
-            changes.append(
-                Change(
-                    steamid=canonical,
-                    name=player_name(player),
-                    before=before,
-                    after=after,
-                    kind="demote",
-                )
-            )
-            kept.append(player)
-        else:
-            # Remove the whole entry (cheater without racist)
-            changes.append(
-                Change(
-                    steamid=canonical,
-                    name=player_name(player),
-                    before=before,
-                    after=(),
-                    kind="demote",
-                )
-            )
-            # Entry is dropped - not added to kept
 
     database["players"] = kept
     return changes
@@ -266,12 +293,20 @@ def sync(
 
     Both ``promote`` and ``demote`` are applied, then the playerlist is
     sorted once. This avoids redundant sorting when both operations run.
+
+    An ID that is listed in ``index`` (i.e. upstream lists it RIGHT NOW) is
+    dropped from ``removed_ids`` before demotion. The caller already derives
+    the set as "previous snapshot minus current list", so real runs never
+    overlap -- but enforcing it here makes the operation idempotent no matter
+    what a future caller passes, instead of promoting and demoting the same
+    entry in one run.
     """
     changes: list[Change] = []
     changes.extend(promote(database, index, include_proof=include_proof))
 
     if enable_demote:
-        changes.extend(demote(database, removed_ids))
+        still_listed = index.by_steamid
+        changes.extend(demote(database, [steamid for steamid in removed_ids if steamid not in still_listed]))
 
     players = database.get("players")
     if isinstance(players, list):

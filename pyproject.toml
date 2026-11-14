@@ -26,4 +26,7 @@ include = ["scripts"]
 extraPaths = ["scripts"]
 
 [tool.mypy]
+# Strict on the shipped code: it is five small modules, and the bot runs
+# unattended, so a type error is worth failing a pull request over.
+strict = true
 mypy_path = "scripts"

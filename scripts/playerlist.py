@@ -24,13 +24,20 @@ CANONICAL_SUFFIX = "]"
 ATTRIBUTE_ORDER: tuple[str, ...] = ("cheater", "suspicious", "exploiter", "racist")
 KNOWN_ATTRIBUTES = frozenset(ATTRIBUTE_ORDER)
 
-_ACCOUNT_ID_RE = re.compile(r"\d+")
-_U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$")
+# ASCII digits only: \d also matches Arabic-Indic/Devanagari digits and
+# str.isdigit() also accepts things like "²" that int() then refuses, so a
+# corrupted or hostile SteamID could crash the run (or silently mint an id
+# from "١٢٣"). Every pattern and parser below is ASCII-strict.
+_ACCOUNT_ID_RE = re.compile(r"[0-9]+")
+# The canonical form is written upper-case by TF2BD, but matching is
+# case-insensitive on every notation so a hand-edited "[u:1:…]" still maps to
+# the same player (and is caught as a duplicate by validate()).
+_U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$", re.IGNORECASE)
 _U_BARE_RE = re.compile(rf"^U:1:({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE)
-_U_INSTANCE_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):{_ACCOUNT_ID_RE.pattern}\]$")
-_STEAM2_RE = re.compile(r"^STEAM_[0-5]:([01]):(\d+)$", re.IGNORECASE)
-_STEAMID64_RE = re.compile(r"^\d{17}$")
-_PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/(\d{17})", re.IGNORECASE)
+_U_INSTANCE_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):{_ACCOUNT_ID_RE.pattern}\]$", re.IGNORECASE)
+_STEAM2_RE = re.compile(rf"^STEAM_[0-5]:([01]):({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE)
+_STEAMID64_RE = re.compile(r"^[0-9]{17}$")
+_PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/([0-9]{17})", re.IGNORECASE)
 
 
 class PlayerListError(Exception):
@@ -65,13 +72,17 @@ def _account_from_steamid64(value: int) -> int | None:
 
 
 def _bounded_int(digits: str) -> int | None:
-    """Parse a decimal string, or return ``None`` if it has >10 significant digits.
+    """Parse an ASCII decimal string, or return ``None`` if it is unusable.
 
-    Guards ``int()`` against Python's int-parsing digit limit: a SteamID
-    string with thousands of digits (hostile or corrupted input) must be
-    rejected, not crash the sync. Account ids fit in 10 digits, so anything
-    longer is out of range anyway; leading zeros are ignored.
+    Rejects anything that is not plain ASCII digits (``int()`` would raise on
+    "²" and would happily accept "١٢٣"), and rejects more than 10 significant
+    digits: that also guards Python's int-parsing digit limit, which a SteamID
+    of thousands of digits (hostile or corrupted input) would otherwise hit.
+    Account ids fit in 10 digits, so anything longer is out of range anyway;
+    leading zeros are ignored.
     """
+    if not (digits.isascii() and digits.isdigit()):
+        return None
     significant = digits.lstrip("0") or "0"
     if len(significant) > 10:
         return None
@@ -120,7 +131,7 @@ def normalize_steamid(value: Any) -> str | None:
         account = _account_from_steamid64(int(text))
         return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
 
-    if text.isdigit():
+    if text.isascii() and text.isdigit():
         # Bare account id given as a string, e.g. "1730017" (the int form of
         # this is accepted above, so accept the string form too).
         account = _bounded_int(text)
@@ -195,19 +206,59 @@ def dumps(database: PlayerList) -> str:
     Tab indentation, alphabetically sorted keys, ASCII escapes and a trailing
     newline: re-serialising an untouched file produces byte-identical output.
     """
-    return json.dumps(database, indent="\t", sort_keys=True, ensure_ascii=True) + "\n"
+    return json.dumps(database, indent="\t", sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
 
 
-def load(path: Path, *, encoding: str = "utf-8") -> tuple[PlayerList, str]:
-    """Read a playerlist, returning the parsed document and its original text."""
+class _StrictJSONError(ValueError):
+    """Input the standard library accepts but standard JSON does not."""
+
+
+def _reject_constant(name: str) -> Any:
+    """Refuse ``NaN``/``Infinity``/``-Infinity``, which are NOT JSON."""
+    raise _StrictJSONError(f"{name} is not valid JSON (only standard JSON numbers are accepted)")
+
+
+def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Refuse an object that defines the same key twice.
+
+    ``json`` silently keeps the last one: a file with two ``attributes`` keys
+    would half-disappear on the next write, and two ``players`` keys would
+    turn a full database into whatever the second one says.
+    """
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise _StrictJSONError(f"duplicate key {key!r} in the same object")
+        seen[key] = value
+    return seen
+
+
+def strict_json_loads(raw: str | bytes) -> Any:
+    """Parse JSON, refusing what the standard library accepts silently.
+
+    Three things a lenient parse lets through, each of which this tool would
+    otherwise publish back to disk: ``NaN``/``Infinity`` (a file no strict
+    parser -- including TF2BD's -- can read), and duplicate keys (silent data
+    loss). Everything else behaves exactly like ``json.loads``.
+    """
+    return json.loads(raw, parse_constant=_reject_constant, object_pairs_hook=_reject_duplicates)
+
+
+def load(path: Path) -> tuple[PlayerList, str]:
+    """Read a playerlist, returning the parsed document and its original text.
+
+    The file must be UTF-8: that is what ``dumps()`` writes, so accepting any
+    other encoding here would guarantee a spurious rewrite of a file the run
+    did not otherwise change.
+    """
     try:
-        original = path.read_text(encoding=encoding)
+        original = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError: the file is not valid UTF-8 -- report it like
         # any other unreadable file instead of crashing with a traceback.
         raise PlayerListError(f"cannot read {path}: {exc}") from exc
     try:
-        database = json.loads(original)
+        database = strict_json_loads(original)
     except (json.JSONDecodeError, RecursionError, ValueError) as exc:
         # ValueError: e.g. a JSON number with more digits than Python's
         # int-parsing limit -- invalid input, not a crash.
