@@ -78,7 +78,7 @@ fits GitHub's size limit.
 | Exact snapshot | The snapshot is written from the fetched **bytes**, never re-encoded, and `.gitattributes` keeps Git from touching line endings. |
 | Bounded fetch | HTTPS only (a redirect downgrade to plain HTTP is refused), 64 MiB maximum for downloaded *and* local sources, 30 s timeout, 3 attempts, then the next fallback URL. When `raw.githubusercontent.com` is unreachable the file is fetched through the GitHub **blob API** by its sha, so the run survives an outage of the raw host. Credentials in a `--source` URL are redacted from the pull request body. |
 | Bounded PR body | Tables are row-capped and the body is hard-truncated below GitHub's 65,536-character limit, so opening the pull request can never fail on size. |
-| Checked changes | A pull request that touches `scripts/`, `tests/`, `pyproject.toml`, `.gitattributes` or the workflow runs `ruff` and the full test suite with read-only permissions — it never reads or writes the database. |
+| Checked changes | A pull request that touches `scripts/`, `tests/`, `pyproject.toml`, `.gitattributes` or the workflow runs `ruff`, `mypy --strict` and the full test suite with read-only permissions — it never reads or writes the database. |
 | Escaped output | Player names and proofs are escaped for Markdown: no broken tables, no forged links, no injected HTML, no `@` mentions. |
 
 ### Run it yourself
@@ -87,6 +87,7 @@ fits GitHub's size limit.
 python3 scripts/sync_vorobey_hackerpolice.py --dry-run      # report only
 python3 scripts/sync_vorobey_hackerpolice.py --demote --report out.md
 python3 -m unittest discover -s tests                        # run the test suite
+python3 -m mypy scripts                                     # strict type check
 ```
 
 Exit code `0` means success, `2` means the database or the Vorobey list was

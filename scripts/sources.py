@@ -24,7 +24,7 @@ import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from playerlist import normalize_steamid
 
@@ -83,7 +83,15 @@ class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
     downgrade keeps every fetched byte HTTPS-protected end to end.
     """
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None and urllib.parse.urlparse(new.full_url).scheme != "https":
             raise SyncError(f"refusing to follow a non-HTTPS redirect to {newurl}")
@@ -241,7 +249,7 @@ def _fetch_bytes(
                 declared = _declared_length(response)
                 if declared is not None and declared > MAX_SOURCE_BYTES:
                     raise _too_large(url)
-                body = response.read(MAX_SOURCE_BYTES + 1)
+                body: bytes = response.read(MAX_SOURCE_BYTES + 1)
             if len(body) > MAX_SOURCE_BYTES:
                 raise _too_large(url)
             return body
