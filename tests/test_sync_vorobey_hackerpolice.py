@@ -17,7 +17,9 @@ import io
 import json
 import os
 import random
+import runpy
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import playerlist as playerlist_module
 import report as report_module
 import sources
+import sync_vorobey_hackerpolice as sync_module
 from playerlist import (
     PlayerListError,
     ValidationResult,
@@ -478,6 +481,183 @@ class SourceFetchTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Promotion policy
 # --------------------------------------------------------------------------- #
+class UntouchedPathTests(unittest.TestCase):
+    """The branches nothing reached yet: error handling that protects the files.
+
+    Each of these is a guard that only fires when something goes wrong, which
+    is exactly the kind of code that rots silently without a test.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_oversize_body_is_rejected_then_the_next_source_is_used(self):
+        # A body past the download budget must be refused, not written to disk.
+        with (
+            mock.patch.object(sources, "MAX_SOURCE_BYTES", 100),
+            mock.patch(
+                "sources._OPENER.open",
+                side_effect=[_FakeResponse(b"x" * 101), _FakeResponse(SourceFetchTests.BODY)],
+            ),
+            mock.patch("sources.time.sleep"),
+        ):
+            document, source, raw = load_first_available_raw(["https://example.invalid/big.json", SourceFetchTests.URL])
+        self.assertEqual(source, SourceFetchTests.URL)
+        self.assertEqual(raw, SourceFetchTests.BODY)
+        self.assertEqual(document["players"][0]["steamid"], "[U:1:100]")
+
+    def test_non_http_url_is_refused_before_any_request(self):
+        with mock.patch("sources._OPENER.open") as urlopen, self.assertRaises(SyncError):
+            sources._fetch_bytes("file:///etc/passwd")
+        urlopen.assert_not_called()
+
+    def test_unreadable_local_source_falls_through_to_the_next_one(self):
+        local = self.root / "present.json"
+        local.write_text("{}", encoding="utf-8")
+        with (
+            mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(SourceFetchTests.BODY)]),
+            mock.patch.object(Path, "read_bytes", side_effect=OSError("input/output error")),
+            mock.patch("sources.time.sleep"),
+        ):
+            _, source, _ = load_first_available_raw([str(local), SourceFetchTests.URL])
+        self.assertEqual(source, SourceFetchTests.URL)  # the I/O error became a clean skip
+
+    def test_blob_url_is_only_derived_from_a_contents_api_url(self):
+        sha = "a" * 40
+        self.assertIsNone(sources._github_blob_url("https://api.github.com/repos/x/y/git/refs/main", sha))
+        self.assertIsNone(sources._github_blob_url("https://example.invalid/repos/x/y/contents/f.json", sha))
+        self.assertIsNone(sources._github_blob_url(SourceFetchTests.API_URL, "not-a-sha"))
+        self.assertEqual(
+            sources._github_blob_url(SourceFetchTests.API_URL, sha),
+            f"https://api.github.com/repos/Nocrex/Tom/git/blobs/{sha}",
+        )
+
+    def test_running_the_module_as_a_script_uses_main(self):
+        # Exactly what the workflow does: python3 scripts/sync_vorobey_hackerpolice.py
+        output = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["sync_vorobey_hackerpolice.py", "--help"]),
+            contextlib.redirect_stdout(output),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            runpy.run_module("sync_vorobey_hackerpolice", run_name="__main__")
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--include-proof", output.getvalue())
+
+    def test_indirect_document_skips_a_candidate_that_is_not_a_playerlist(self):
+        # A follow-up URL that answers with JSON which is neither a playerlist
+        # nor a base64 envelope: it must be skipped, not accepted.
+        envelope = json.dumps(
+            {
+                "encoding": "base64",
+                "content": base64.b64encode(b"{}").decode("ascii"),
+                "sha": "a" * 40,
+                "download_url": "https://example.invalid/download.json",
+            }
+        ).encode("utf-8")
+
+        def read(url):
+            if url == SourceFetchTests.API_URL:
+                return envelope
+            if url == "https://example.invalid/download.json":
+                return b'{"$schema": "x"}'  # JSON, but not a playerlist
+            raise SyncError("blocked")
+
+        with (
+            mock.patch("sources._read_bytes", side_effect=read),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([SourceFetchTests.API_URL])
+
+    def test_redact_url_keeps_the_port_and_drops_the_credentials(self):
+        self.assertEqual(
+            sources.redact_url("https://user:secret@example.invalid:8443/list.json"),
+            "https://example.invalid:8443/list.json",
+        )
+        self.assertNotIn("secret", sources.redact_url("https://user:secret@example.invalid/x"))
+
+    def test_a_directory_that_cannot_be_fsynced_does_not_fail_the_write(self):
+        # Some platforms cannot fsync a directory; the rename is already done,
+        # so failing to make it durable must not turn the write into an error.
+        target = self.root / "list.json"
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("cannot fsync a directory on this platform")
+            return real_fsync(fd)
+
+        with mock.patch("os.fsync", side_effect=fsync):
+            sync_module._atomic_write_bytes(target, b"{}\n")
+        self.assertEqual(target.read_bytes(), b"{}\n")
+
+    def test_indirect_document_with_no_usable_candidate_is_a_fetch_error(self):
+        # A GitHub API envelope that decodes to nothing usable, and every
+        # follow-up URL for it is blocked: the source must fail with a clear
+        # SyncError, not a traceback and not a half-parsed document.
+        envelope = json.dumps(
+            {"encoding": "base64", "content": base64.b64encode(b"{}").decode("ascii"), "sha": "a" * 40}
+        ).encode("utf-8")
+
+        def read(url):
+            if url == SourceFetchTests.API_URL:
+                return envelope
+            raise SyncError("blocked")
+
+        with (
+            mock.patch("sources._read_bytes", side_effect=read),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError) as caught,
+        ):
+            load_first_available_raw([SourceFetchTests.API_URL])
+        self.assertIn("cannot load the Vorobey hackerpolice list", str(caught.exception))
+
+    def test_failed_write_leaves_no_temp_file_behind(self):
+        target = self.root / "list.json"
+        with mock.patch.object(Path, "replace", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            sync_module._atomic_write_bytes(target, b"{}\n")
+        self.assertEqual(list(self.root.iterdir()), [])  # no stale .tmp file
+
+    def test_same_file_treats_a_stat_error_as_different_files(self):
+        first, second = self.root / "a.json", self.root / "b.json"
+        first.write_text("{}", encoding="utf-8")
+        second.write_text("{}", encoding="utf-8")
+        with mock.patch("os.path.samefile", side_effect=OSError("no such file")):
+            self.assertFalse(sync_module._same_file(first, second))
+        self.assertTrue(sync_module._same_file(first, first))
+
+    def test_database_that_fails_validation_after_sync_is_not_written(self):
+        database = self.root / "list.json"
+        database.write_text(dumps({"players": [player("[U:1:100]", ["suspicious"])]}), encoding="utf-8")
+        source = self.root / "upstream.json"
+        source.write_text(dumps({"players": [hackerpolice_entry("[U:1:100]")]}), encoding="utf-8")
+        before = database.read_bytes()
+        clean = playerlist_module.ValidationResult()
+        broken = playerlist_module.ValidationResult(errors=["simulated problem"])
+        # load_database() validates too: let that one pass, fail the post-sync one.
+        with mock.patch.object(sync_module, "validate", side_effect=[clean, broken]):
+            code = main(
+                ["--database", str(database), "--source", str(source), "--snapshot", str(self.root / "snapshot.json")]
+            )
+        self.assertEqual(code, 2)
+        self.assertEqual(database.read_bytes(), before)  # nothing written
+
+    def test_demote_leaves_an_entry_with_non_string_attributes_alone(self):
+        # validate() rejects this before the run starts; the policy still keeps
+        # the entry rather than crashing if it ever reaches here.
+        database = {"players": [{"steamid": "[U:1:100]", "attributes": [1, "cheater"]}]}
+        changes = demote(database, ["[U:1:100]"])  # type: ignore[arg-type]
+        self.assertEqual(changes, [])
+        self.assertEqual(len(database["players"]), 1)
+
+    def test_sync_without_a_players_array_is_a_no_op(self):
+        database = {"players": None}
+        self.assertEqual(sync(database, index_of(), enable_demote=True, removed_ids={"[U:1:100]"}), [])  # type: ignore[arg-type]
+
+
 class PromoteTests(unittest.TestCase):
     def setUp(self):
         self.index = index_of(
