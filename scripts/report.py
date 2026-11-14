@@ -28,7 +28,7 @@ from pathlib import Path
 
 from playerlist import account_id, steam_profile_url
 from policy import Change
-from sources import SOURCE_REPO_URL
+from sources import SOURCE_REPO_URL, redact_url
 
 __all__ = [
     "MAX_CHANGE_TABLE_ROWS",
@@ -183,9 +183,15 @@ def _table(header: Sequence[str], rows: Sequence[str], overflow_note: str | None
     return lines
 
 
+def _steamid_sort_key(steamid: str) -> tuple[bool, int]:
+    """Numeric order; unusable SteamIDs sort last (stably). Key computed once."""
+    account = account_id(steamid)
+    return (account is None, account or 0)
+
+
 def _sorted_steamids(steamids: Sequence[str]) -> list[str]:
     """Order SteamIDs numerically (unusable ones last, stably) for a stable diff."""
-    return sorted(steamids, key=lambda steamid: (account_id(steamid) is None, account_id(steamid) or 0))
+    return sorted(steamids, key=_steamid_sort_key)
 
 
 def _profile_cell(steamid: str) -> str:
@@ -324,9 +330,9 @@ def _header_lines(info: RunInfo) -> list[str]:
     lines = [
         "## Vorobey hackerpolice sync",
         "",
-        f"- Database: `{info.database_path}`",
+        f"- Database: `{_code(str(info.database_path))}`",
         f"- Vorobey hackerpolice list ({source_note}): {SOURCE_REPO_URL}",
-        f"- Fetched from: {info.source}",
+        f"- Fetched from: {redact_url(info.source)}",
         f"- Run at: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
     ]
     if info.dry_run:

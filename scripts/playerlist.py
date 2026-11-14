@@ -25,9 +25,12 @@ ATTRIBUTE_ORDER: tuple[str, ...] = ("cheater", "suspicious", "exploiter", "racis
 KNOWN_ATTRIBUTES = frozenset(ATTRIBUTE_ORDER)
 
 _ACCOUNT_ID_RE = re.compile(r"\d+")
-_U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$")
+# The canonical form is written upper-case by TF2BD, but matching is
+# case-insensitive on every notation so a hand-edited "[u:1:…]" still maps to
+# the same player (and is caught as a duplicate by validate()).
+_U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$", re.IGNORECASE)
 _U_BARE_RE = re.compile(rf"^U:1:({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE)
-_U_INSTANCE_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):{_ACCOUNT_ID_RE.pattern}\]$")
+_U_INSTANCE_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):{_ACCOUNT_ID_RE.pattern}\]$", re.IGNORECASE)
 _STEAM2_RE = re.compile(r"^STEAM_[0-5]:([01]):(\d+)$", re.IGNORECASE)
 _STEAMID64_RE = re.compile(r"^\d{17}$")
 _PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/(\d{17})", re.IGNORECASE)

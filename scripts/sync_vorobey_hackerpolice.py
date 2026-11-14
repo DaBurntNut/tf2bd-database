@@ -266,6 +266,11 @@ def run(args: argparse.Namespace) -> int:
         protected += [Path(source) for source in args.source or [] if not source.startswith(("http://", "https://"))]
         if any(_same_file(report_path, path) for path in protected):
             raise SyncError("--report must not be the same file as --database, --snapshot, or a local --source")
+    for source in args.source or []:
+        if not source.startswith(("http://", "https://")) and _same_file(Path(source), database_path):
+            # Reading the database as its own "upstream" would compare a file
+            # with itself and then rewrite it: refuse the mistake outright.
+            raise SyncError("--source must not be the same file as --database")
     database, original = load_database(database_path)
 
     source_document, source, source_bytes = load_first_available_raw(args.source or DEFAULT_SOURCES)
@@ -387,7 +392,10 @@ def run(args: argparse.Namespace) -> int:
 
     # Write the database, then refresh the snapshot in the SAME working tree
     # (=> same pull request) so the baseline only advances once a human
-    # merges the changes it produced. The snapshot refresh happens on every
+    # merges the changes it produced. The order matters: if the process dies
+    # between the two writes, a stale snapshot only makes the next run
+    # re-evaluate removals that are already applied (a no-op), whereas a
+    # fresh snapshot with an unwritten database would lose them forever. The snapshot refresh happens on every
     # run, even if the Garou database itself did not change, so a run whose
     # only change is the snapshot still opens a snapshot-only PR. Exception:
     # when demotion was skipped as unsafe (mass-demotion guard),

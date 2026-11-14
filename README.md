@@ -73,7 +73,7 @@ fits GitHub's size limit.
 | Mass-removal guard | If an implausibly large share of the snapshot disappears at once (more than 50 IDs and more than 20 %), demotion is skipped and the baseline is kept, so an upstream outage cannot wipe entries. A human can force it with `--allow-mass-demotion`. |
 | Frozen baseline | If a run finds removals it cannot apply (demotion disabled, or vetoed by the guard), the snapshot is **not** advanced — otherwise those removals would be forgotten forever. |
 | Exact snapshot | The snapshot is written from the fetched **bytes**, never re-encoded, and `.gitattributes` keeps Git from touching line endings. |
-| Bounded fetch | HTTPS only (a redirect downgrade to plain HTTP is refused), 64 MiB maximum, 30 s timeout, 3 attempts, then the next fallback URL. |
+| Bounded fetch | HTTPS only (a redirect downgrade to plain HTTP is refused), 64 MiB maximum for downloaded *and* local sources, 30 s timeout, 3 attempts, then the next fallback URL. When `raw.githubusercontent.com` is unreachable the file is fetched through the GitHub **blob API** by its sha, so the run survives an outage of the raw host. Credentials in a `--source` URL are redacted from the pull request body. |
 | Bounded PR body | Tables are row-capped and the body is hard-truncated below GitHub's 65,536-character limit, so opening the pull request can never fail on size. |
 | Escaped output | Player names and proofs are escaped for Markdown: no broken tables, no forged links, no injected HTML, no `@` mentions. |
 

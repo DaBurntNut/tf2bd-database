@@ -16,6 +16,7 @@ import base64
 import binascii
 import http.client
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -128,7 +129,7 @@ class HackerpoliceIndex:
 
 def added_steamids(previous: HackerpoliceIndex, current: HackerpoliceIndex) -> set[str]:
     """SteamIDs that are in the current list but were not in the previous snapshot."""
-    return set(current.by_steamid) - set(previous.by_steamid)
+    return current.by_steamid.keys() - previous.by_steamid.keys()
 
 
 def removed_steamids(previous: HackerpoliceIndex, current: HackerpoliceIndex) -> set[str]:
@@ -138,7 +139,7 @@ def removed_steamids(previous: HackerpoliceIndex, current: HackerpoliceIndex) ->
     IDs absent from both lists (e.g. manually added cheaters) are not in it,
     and IDs added upstream since the snapshot are not either.
     """
-    return set(previous.by_steamid) - set(current.by_steamid)
+    return previous.by_steamid.keys() - current.by_steamid.keys()
 
 
 def _parse_document(raw: bytes, source: str) -> dict[str, Any]:
@@ -172,6 +173,30 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     return HackerpoliceIndex.build(_parse_document(raw, str(path))), raw
 
 
+def redact_url(url: str) -> str:
+    """Hide credentials embedded in a URL before it is logged or published.
+
+    A ``--source`` may legitimately carry a token (``https://user:token@…``)
+    and this bot's output ends up in logs and in a pull request body: the
+    scheme/host/path are enough to debug a fetch, the secret is not.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    if parts.username is None:
+        return url
+    host = parts.hostname or ""
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
+def _too_large(source: str) -> SyncError:
+    """The one error used wherever a source exceeds the download budget."""
+    return SyncError(f"{redact_url(source)} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
+
+
 def _fetch_bytes(
     url: str,
     *,
@@ -185,7 +210,7 @@ def _fetch_bytes(
     the next source instead.
     """
     if not url.startswith(("https://", "http://")):
-        raise SyncError(f"refusing to fetch non-HTTP(S) URL: {url}")
+        raise SyncError(f"refusing to fetch non-HTTP(S) URL: {redact_url(url)}")
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -193,8 +218,16 @@ def _fetch_bytes(
             # Hostname comparison, not a substring match: a look-alike URL
             # such as https://api.github.com.example.invalid/ must not be
             # treated as the GitHub API.
-            if urllib.parse.urlparse(url).hostname == "api.github.com":
-                headers["Accept"] = "application/vnd.github.raw"
+            parsed = urllib.parse.urlparse(url)
+            if parsed.hostname == "api.github.com":
+                # Blobs answer with the file itself -- exactly the bytes the
+                # snapshot must replicate. Contents endpoints must answer
+                # with JSON instead: "vnd.github.raw" is refused outright for
+                # files over 1 MB, which would kill the fallback before the
+                # sha-based blob fetch ever got a chance to run.
+                headers["Accept"] = (
+                    "application/vnd.github.raw" if "/git/blobs/" in parsed.path else "application/vnd.github+json"
+                )
             request = urllib.request.Request(url, headers=headers)
             # Scheme is restricted to HTTP(S) above (Bandit B310); the opener
             # only adds the HTTPS-downgrade guard.
@@ -203,10 +236,10 @@ def _fetch_bytes(
                 # server says how big it is.
                 declared = _declared_length(response)
                 if declared is not None and declared > MAX_SOURCE_BYTES:
-                    raise SyncError(f"{url} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
+                    raise _too_large(url)
                 body = response.read(MAX_SOURCE_BYTES + 1)
             if len(body) > MAX_SOURCE_BYTES:
-                raise SyncError(f"{url} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
+                raise _too_large(url)
             return body
         except urllib.error.HTTPError as exc:
             last_error = exc
@@ -214,7 +247,7 @@ def _fetch_bytes(
                 break  # permanent: don't waste attempts, fall back sooner
             if attempt < attempts:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        except OSError as exc:  # URLError, socket timeouts, resets, ...
             last_error = exc
             if attempt < attempts:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
@@ -223,8 +256,8 @@ def _fetch_bytes(
             # fails identically on every attempt and every machine: report
             # it as a fetch failure so the caller falls back / exits cleanly
             # instead of crashing with a traceback.
-            raise SyncError(f"could not fetch {url}: {exc}") from exc
-    raise SyncError(f"could not fetch {url}: {last_error}")
+            raise SyncError(f"could not fetch {redact_url(url)}: {exc}") from exc
+    raise SyncError(f"could not fetch {redact_url(url)}: {last_error}")
 
 
 def _read_bytes(source: str) -> bytes:
@@ -232,17 +265,23 @@ def _read_bytes(source: str) -> bytes:
     if source.startswith(("http://", "https://")):
         return _fetch_bytes(source)
     try:
+        declared = Path(source).stat().st_size
+    except OSError as exc:
+        raise SyncError(f"cannot read {source}: {exc}") from exc
+    if declared > MAX_SOURCE_BYTES:
+        raise _too_large(source)
+    try:
         return Path(source).read_bytes()
     except OSError as exc:
         raise SyncError(f"cannot read {source}: {exc}") from exc
 
 
-def _unwrap_github_contents_envelope(document: dict[str, Any], raw: bytes) -> bytes | None:
-    """Decode a GitHub Contents API envelope to the file bytes it wraps.
+def _unwrap_github_contents_envelope(document: dict[str, Any]) -> bytes | None:
+    """Decode a GitHub Contents/Blob API envelope to the file bytes it wraps.
 
-    Normally the ``Accept: application/vnd.github.raw`` header makes the API
-    return the file itself, but if that is ever ignored the response is a
-    JSON envelope with the file base64-encoded in ``content``. Unwrapping it
+    Blob endpoints return the file itself, but a Contents/Blob response can
+    also be a JSON envelope with the file base64-encoded in ``content``.
+    Unwrapping it
     keeps the API fallback usable AND keeps the snapshot an exact copy of
     the file (the envelope itself is never written anywhere).
     """
@@ -255,8 +294,78 @@ def _unwrap_github_contents_envelope(document: dict[str, Any], raw: bytes) -> by
         return None
     # The Contents API omits the content for files over ~1 MB (this list is
     # larger): an empty decode is not a usable file, let the caller fall
-    # back to the envelope's download_url instead.
+    # back to download_url / the Git blob endpoint instead.
     return decoded or None
+
+
+def _github_blob_url(source: str, sha: Any) -> str | None:
+    """Git Blob API URL for a GitHub Contents API response, or ``None``.
+
+    The Contents API stops returning ``content`` for files over ~1 MB (this
+    list is ~1.9 MB), so the blob endpoint is the only API strategy that
+    still works -- and the only one that does not depend on
+    ``raw.githubusercontent.com`` being reachable, which makes it a genuinely
+    independent fallback rather than a second link to the same host.
+    """
+    if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40,64}", sha) is None:
+        return None
+    parsed = urllib.parse.urlparse(source)
+    if parsed.hostname != "api.github.com":
+        return None
+    repository, separator, _ = parsed.path.partition("/contents/")
+    if not separator or not repository.startswith("/repos/"):
+        return None
+    return f"https://api.github.com{repository}/git/blobs/{sha}"
+
+
+def _document_from(raw: bytes, source: str) -> tuple[dict[str, Any], bytes] | None:
+    """Parse ``raw`` and return it only when it is a playerlist document."""
+    try:
+        document = _parse_document(raw, source)
+    except SyncError:
+        return None
+    return (document, raw) if isinstance(document.get("players"), list) else None
+
+
+def _resolve_indirect_document(document: dict[str, Any], source: str) -> tuple[dict[str, Any], bytes] | None:
+    """Resolve a response that only points at the playerlist file.
+
+    Tried in order: the envelope's inline base64 ``content``, its
+    ``download_url``, and the Git Blob API URL built from its ``sha``. Every
+    strategy yields the file's OWN bytes, so the snapshot stays an exact
+    replica regardless of which one answers.
+    """
+    inline = _unwrap_github_contents_envelope(document)
+    if inline is not None:
+        resolved = _document_from(inline, source)
+        if resolved is not None:
+            return resolved
+
+    candidates: list[str] = []
+    download_url = document.get("download_url")
+    # download_url comes from the fetched document itself, so unlike an
+    # operator-supplied --source it is untrusted: HTTPS only, never a local
+    # path or a plaintext URL.
+    if isinstance(download_url, str) and download_url.startswith("https://"):
+        candidates.append(download_url)
+    blob_url = _github_blob_url(source, document.get("sha"))
+    if blob_url is not None:
+        candidates.append(blob_url)
+
+    for candidate in candidates:
+        try:
+            body = _read_bytes(candidate)
+            parsed = _parse_document(body, candidate)
+        except SyncError:
+            continue
+        # A blob response may itself be a base64 envelope instead of the file.
+        for payload in (body, _unwrap_github_contents_envelope(parsed)):
+            if payload is None:
+                continue
+            resolved = _document_from(payload, source)
+            if resolved is not None:
+                return resolved
+    return None
 
 
 def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], str, bytes]:
@@ -276,33 +385,14 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
             failures.append(str(exc))
             continue
         if not isinstance(document.get("players"), list):
-            unwrapped = _unwrap_github_contents_envelope(document, raw)
-            if unwrapped is None:
-                # Large-file envelopes carry no inline content, only a
-                # download_url pointing at the raw file: follow it, and the
-                # bytes downloaded there become the (exact) snapshot bytes.
-                download_url = document.get("download_url")
-                # download_url comes from the fetched document itself, so
-                # unlike an operator-supplied --source it is untrusted:
-                # HTTPS only -- never a local path or a plaintext URL.
-                if isinstance(download_url, str) and download_url.startswith("https://"):
-                    try:
-                        unwrapped = _read_bytes(download_url)
-                    except SyncError as exc:
-                        failures.append(str(exc))
-                        continue
-                else:
-                    failures.append(f"{source}: no 'players' array and no usable HTTPS download_url in response")
-                    continue
-            try:
-                document = _parse_document(unwrapped, source)
-            except SyncError as exc:
-                failures.append(str(exc))
+            resolved = _resolve_indirect_document(document, source)
+            if resolved is None:
+                failures.append(
+                    f"{source}: no 'players' array, and neither inline content, a usable HTTPS download_url "
+                    "nor a Git blob could be resolved"
+                )
                 continue
-            if not isinstance(document.get("players"), list):
-                failures.append(f"{source}: no 'players' array in response")
-                continue
-            raw = unwrapped
+            document, raw = resolved
         return document, source, raw
 
     raise SyncError("cannot load the Vorobey hackerpolice list:\n  " + "\n  ".join(failures))

@@ -58,6 +58,7 @@ from sources import (
     SyncError,
     added_steamids,
     load_first_available_raw,
+    load_snapshot,
     removed_steamids,
 )
 from sync_vorobey_hackerpolice import DEFAULT_SNAPSHOT, build_parser, main
@@ -130,6 +131,7 @@ class _FakeResponse:
 
 class SourceFetchTests(unittest.TestCase):
     URL = "https://example.invalid/list.json"
+    API_URL = "https://api.github.com/repos/Nocrex/Tom/contents/playerlist.vorobey-hackerpolice.json"
     BODY = b'\xef\xbb\xbf{"players": [{"steamid": "[U:1:100]", "attributes": ["cheater"]}]}'
 
     def fetch(self, side_effect):
@@ -176,6 +178,89 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(raw, self.BODY)
         self.assertEqual(len(document["players"]), 1)
         self.assertEqual(calls, 2)
+
+    def test_redact_url_strips_credentials_only(self):
+        self.assertEqual(sources.redact_url("https://u:secret@h.example/x?y=1"), "https://h.example/x?y=1")
+        self.assertEqual(sources.redact_url("https://h.example:8443/x"), "https://h.example:8443/x")
+        self.assertEqual(sources.redact_url("playerlist.garou3299.json"), "playerlist.garou3299.json")
+
+    def test_fetch_errors_redact_credentials(self):
+        """Failures are printed to a public Actions log: no tokens there."""
+        url = "https://bot:ghp_secret@example.invalid/list.json"
+        with (
+            mock.patch("sources._OPENER.open", side_effect=urllib.error.URLError("boom")),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError) as raised,
+        ):
+            load_first_available_raw([url])
+        self.assertNotIn("ghp_secret", str(raised.exception))
+        self.assertIn("https://example.invalid/list.json", str(raised.exception))
+
+    def test_large_file_envelope_falls_back_to_the_git_blob_api(self):
+        """Raw.githubusercontent unreachable + Contents API > 1 MB: the blob
+        endpoint by sha is the only remaining way to get the file."""
+        sha = "a" * 40
+        envelope = json.dumps({"encoding": "none", "content": "", "sha": sha}).encode("utf-8")
+        with (
+            mock.patch(
+                "sources._OPENER.open", side_effect=[_FakeResponse(envelope), _FakeResponse(self.BODY)]
+            ) as opener,
+            mock.patch("sources.time.sleep"),
+        ):
+            document, source, raw = load_first_available_raw([self.API_URL])
+        self.assertEqual(raw, self.BODY)
+        self.assertEqual(source, self.API_URL)
+        self.assertEqual(len(document["players"]), 1)
+        urls = [call.args[0].full_url for call in opener.call_args_list]
+        self.assertEqual(urls[0], self.API_URL)
+        self.assertEqual(urls[1], f"https://api.github.com/repos/Nocrex/Tom/git/blobs/{sha}")
+
+    def test_git_blob_envelope_is_decoded_to_the_file_bytes(self):
+        inner = b'{"players": [{"steamid": "[U:1:100]"}]}'
+        sha = "b" * 40
+        contents = json.dumps({"encoding": "none", "content": "", "sha": sha}).encode("utf-8")
+        blob = json.dumps({"encoding": "base64", "content": base64.b64encode(inner).decode("ascii")}).encode("utf-8")
+        with (
+            mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(contents), _FakeResponse(blob)]),
+            mock.patch("sources.time.sleep"),
+        ):
+            document, _, raw = load_first_available_raw([self.API_URL])
+        self.assertEqual(raw, inner)  # the envelope is never what gets snapshotted
+        self.assertEqual(len(document["players"]), 1)
+
+    def test_accept_header_matches_the_endpoint(self):
+        """Contents endpoints must answer in JSON (raw is refused > 1 MB);
+        blob endpoints return the file itself."""
+        with (
+            mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(self.BODY)]) as opener,
+            mock.patch("sources.time.sleep"),
+        ):
+            load_first_available_raw([self.API_URL])
+        self.assertEqual(opener.call_args_list[0].args[0].get_header("Accept"), "application/vnd.github+json")
+
+        blob_url = "https://api.github.com/repos/Nocrex/Tom/git/blobs/" + "a" * 40
+        with (
+            mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(self.BODY)]) as opener,
+            mock.patch("sources.time.sleep"),
+        ):
+            load_first_available_raw([blob_url])
+        self.assertEqual(opener.call_args_list[0].args[0].get_header("Accept"), "application/vnd.github.raw")
+
+    def test_blob_url_requires_the_github_api_and_a_valid_sha(self):
+        self.assertIsNone(sources._github_blob_url(self.URL, "a" * 40))  # not the API host
+        self.assertIsNone(sources._github_blob_url(self.API_URL, "not-a-sha"))
+        self.assertIsNone(sources._github_blob_url(self.API_URL, None))
+        self.assertEqual(
+            sources._github_blob_url(self.API_URL, "c" * 64),
+            "https://api.github.com/repos/Nocrex/Tom/git/blobs/" + "c" * 64,
+        )
+
+    def test_oversized_local_source_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "big.json"
+            path.write_bytes(b"x" * 4096)
+            with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError):
+                load_first_available_raw([str(path)])
 
     def test_malformed_urls_are_clean_errors_not_crashes(self):
         # Bad IPv6 literals / control characters make urllib raise
@@ -636,6 +721,19 @@ class ReportTests(unittest.TestCase):
         self.assertIn("(12,345 → 13,542 entries; net +1,197)", report)
         self.assertIn("**1 SteamID removed from the Vorobey hackerpolice list", report)
 
+    def test_fetch_url_credentials_are_redacted(self):
+        """A --source may carry a token; the PR body is public to the repo."""
+        info = RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://bot:ghp_secret@example.invalid/list.json?x=1",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+        )
+        report = render_report(info)
+        self.assertIn("- Fetched from: https://example.invalid/list.json?x=1", report)
+        self.assertNotIn("ghp_secret", report)
+
     def test_snapshot_only_change_is_reported_as_such(self):
         report = render_report(self.info(snapshot_changed=True))
         self.assertIn("snapshot refresh only", report)
@@ -1027,6 +1125,12 @@ class CliTests(unittest.TestCase):
         snapshot_file.write_text(dumps({"$schema": "x", "file_info": {}, "players": list(entries)}), encoding="utf-8")
         return snapshot_file
 
+    def test_version_flag(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as exit_:
+            build_parser().parse_args(["--version"])
+        self.assertEqual(exit_.exception.code, 0)
+        self.assertIn(sources.VERSION, out.getvalue())
+
     def test_snapshot_default_path_and_flags(self):
         self.assertEqual(DEFAULT_SNAPSHOT, "snapshot/playerlist.vorobey-hackerpolice.json")
         self.assertEqual(build_parser().parse_args([]).snapshot, DEFAULT_SNAPSHOT)
@@ -1233,6 +1337,17 @@ class CliTests(unittest.TestCase):
         # or they could never be demoted later.
         self.assertEqual(snapshot_fixture.read_bytes(), snapshot_before)
 
+    def test_allow_mass_demotion_forces_the_demotion(self):
+        self.database.write_text(
+            dumps({"$schema": "x", "file_info": {}, "players": [player("[U:1:400]", ["cheater"])]}),
+            encoding="utf-8",
+        )
+        self.write_snapshot_fixture(*[hackerpolice_entry(f"[U:1:{n}]") for n in range(400, 461)])
+        code, stdout, _ = self.run_cli("--source", str(self.source), "--demote", "--allow-mass-demotion")
+        self.assertEqual(code, 0)
+        self.assertNotIn("looks like an upstream problem", stdout)
+        self.assertEqual(json.loads(self.database.read_text(encoding="utf-8"))["players"], [])
+
     def test_empty_upstream_list_is_an_error_and_writes_nothing(self):
         empty = self.root / "empty.json"
         empty.write_text(dumps({"$schema": "x", "file_info": {}, "players": []}), encoding="utf-8")
@@ -1383,6 +1498,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("→", raw.getvalue().decode("utf-8"))
 
+    def test_source_must_not_be_the_database(self):
+        code, _, stderr = self.run_cli("--source", str(self.database))
+        self.assertEqual(code, 2)
+        self.assertIn("--source must not be the same file as --database", stderr)
+
     def test_missing_database_is_an_error(self):
         self.database.unlink()
         code, _, stderr = self.run_cli("--source", str(self.source))
@@ -1517,11 +1637,38 @@ class LifecycleTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Repository data integrity
+# --------------------------------------------------------------------------- #
+class RepositoryDataTests(unittest.TestCase):
+    """The data files this repository ships must be exactly what the bot expects."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_shipped_database_is_valid_and_canonically_formatted(self):
+        database, original = load(self.ROOT / "playerlist.garou3299.json")
+        self.assertEqual(validate(database).errors, [])
+        # Canonical formatting means a bot run never rewrites the whole file:
+        # a hand-reformatted list would show up as a thousands-line diff.
+        self.assertEqual(dumps(database), original)
+
+    def test_shipped_snapshot_is_a_usable_hackerpolice_list(self):
+        snapshot = load_snapshot(self.ROOT / "snapshot" / "playerlist.vorobey-hackerpolice.json")
+        self.assertIsNotNone(snapshot)
+        index = snapshot[0] if snapshot is not None else None
+        self.assertGreater(len(index.by_steamid), 1000)  # type: ignore[union-attr]
+        self.assertEqual(index.skipped, 0)  # type: ignore[union-attr]
+
+
+# --------------------------------------------------------------------------- #
 # TF2BD playerlist helpers
 # --------------------------------------------------------------------------- #
 class NormalizeSteamIdTests(unittest.TestCase):
     def test_canonical(self):
         self.assertEqual(normalize_steamid("[U:1:1730017]"), "[U:1:1730017]")
+
+    def test_lower_case_notations_map_to_the_same_player(self):
+        self.assertEqual(normalize_steamid("[u:1:1730017]"), "[U:1:1730017]")
+        self.assertEqual(normalize_steamid("[u:1:1730017:1]"), "[U:1:1730017]")
 
     def test_bare_and_instance_forms(self):
         self.assertEqual(normalize_steamid("U:1:1730017"), "[U:1:1730017]")
