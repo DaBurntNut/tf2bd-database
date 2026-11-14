@@ -481,6 +481,34 @@ class SourceFetchTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Promotion policy
 # --------------------------------------------------------------------------- #
+class WriteSnapshotTests(unittest.TestCase):
+    """write_snapshot()'s return value becomes the workflow's step output."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "snapshot.json"
+
+    def test_returns_true_and_writes_when_the_bytes_differ(self):
+        changed = sync_module.write_snapshot(self.path, b"new\n", b"old\n", dry_run=False)
+        self.assertTrue(changed)
+        self.assertEqual(self.path.read_bytes(), b"new\n")
+
+    def test_returns_false_and_leaves_the_file_alone_when_identical(self):
+        changed = sync_module.write_snapshot(self.path, b"same\n", b"same\n", dry_run=False)
+        self.assertFalse(changed)
+        self.assertFalse(self.path.exists())  # nothing written
+
+    def test_dry_run_reports_the_change_without_writing(self):
+        changed = sync_module.write_snapshot(self.path, b"new\n", b"old\n", dry_run=True)
+        self.assertTrue(changed)
+        self.assertFalse(self.path.exists())
+
+    def test_a_first_snapshot_counts_as_a_change(self):
+        self.assertTrue(sync_module.write_snapshot(self.path, b"first\n", None, dry_run=False))
+        self.assertEqual(self.path.read_bytes(), b"first\n")
+
+
 class UntouchedPathTests(unittest.TestCase):
     """The branches nothing reached yet: error handling that protects the files.
 
@@ -545,6 +573,28 @@ class UntouchedPathTests(unittest.TestCase):
             runpy.run_module("sync_vorobey_hackerpolice", run_name="__main__")
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("--include-proof", output.getvalue())
+
+    def test_envelope_with_non_string_content_is_not_unwrapped(self):
+        # encoding says base64 but content is not text: b64decode would raise,
+        # so the envelope must be rejected before it is tried.
+        self.assertIsNone(sources._unwrap_github_contents_envelope({"encoding": "base64", "content": 123}))
+        self.assertIsNone(sources._unwrap_github_contents_envelope({"content": "e30="}))
+        self.assertIsNone(sources._unwrap_github_contents_envelope({"encoding": "base64"}))
+        self.assertIsNone(sources._unwrap_github_contents_envelope({"encoding": "base64", "content": ""}))
+
+    def test_envelope_content_with_line_breaks_still_decodes(self):
+        # The API may wrap long base64 in newlines; strict validation would
+        # reject that and silently lose the fallback.
+        encoded = base64.encodebytes(b'{"players": []}').decode("ascii")
+        self.assertIn("\n", encoded)
+        self.assertEqual(
+            sources._unwrap_github_contents_envelope({"encoding": "base64", "content": encoded}), b'{"players": []}'
+        )
+
+    def test_redact_url_tolerates_a_url_it_cannot_parse(self):
+        # urlsplit raises on a malformed IPv6 literal; logging must not crash.
+        broken = "https://user:secret@[::1/list.json"
+        self.assertEqual(sources.redact_url(broken), broken)
 
     def test_indirect_document_skips_a_candidate_that_is_not_a_playerlist(self):
         # A follow-up URL that answers with JSON which is neither a playerlist
@@ -621,6 +671,26 @@ class UntouchedPathTests(unittest.TestCase):
             sync_module._atomic_write_bytes(target, b"{}\n")
         self.assertEqual(list(self.root.iterdir()), [])  # no stale .tmp file
 
+    def test_write_creates_a_missing_parent_directory(self):
+        nested = self.root / "a" / "b" / "list.json"
+        sync_module._atomic_write_bytes(nested, b"{}\n")
+        self.assertEqual(nested.read_bytes(), b"{}\n")
+
+    def test_write_into_an_existing_directory_keeps_the_existing_mode(self):
+        target = self.root / "list.json"
+        target.write_bytes(b"old\n")
+        target.chmod(0o640)
+        sync_module._atomic_write_bytes(target, b"new\n")
+        self.assertEqual(target.read_bytes(), b"new\n")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)  # mode preserved
+
+    def test_same_file_sees_two_hard_links_to_one_file(self):
+        first = self.root / "a.json"
+        first.write_text("{}", encoding="utf-8")
+        second = self.root / "b.json"
+        os.link(first, second)
+        self.assertTrue(sync_module._same_file(first, second))
+
     def test_same_file_treats_a_stat_error_as_different_files(self):
         first, second = self.root / "a.json", self.root / "b.json"
         first.write_text("{}", encoding="utf-8")
@@ -644,6 +714,29 @@ class UntouchedPathTests(unittest.TestCase):
             )
         self.assertEqual(code, 2)
         self.assertEqual(database.read_bytes(), before)  # nothing written
+
+    def test_policy_keeps_an_entry_whose_attributes_are_not_a_list(self):
+        # A bare string is iterable, so an unguarded loop would treat it as a
+        # list of one-character tags and mangle the entry.
+        # A tuple/set/dict of real tag names is the dangerous case: unlike a
+        # bare string it survives the "looks like attributes" checks, so an
+        # unguarded policy would rewrite (or crash on) a hand-edited entry.
+        for attributes in (
+            "cheater",
+            "suspicious",
+            "",
+            None,
+            {"cheater": True},
+            ("suspicious",),
+            ("cheater",),
+            frozenset({"racist"}),
+        ):
+            database = {"players": [{"steamid": "[U:1:100]", "attributes": attributes}]}
+            self.assertEqual(demote(database, ["[U:1:100]"]), [])
+            self.assertEqual(database["players"][0]["attributes"], attributes)
+            changes = promote(database, index_of(hackerpolice_entry("[U:1:100]")))
+            self.assertEqual(changes, [])
+            self.assertEqual(database["players"][0]["attributes"], attributes)
 
     def test_demote_leaves_an_entry_with_non_string_attributes_alone(self):
         # validate() rejects this before the run starts; the policy still keeps
