@@ -244,10 +244,15 @@ def strict_json_loads(raw: str | bytes) -> Any:
     return json.loads(raw, parse_constant=_reject_constant, object_pairs_hook=_reject_duplicates)
 
 
-def load(path: Path, *, encoding: str = "utf-8") -> tuple[PlayerList, str]:
-    """Read a playerlist, returning the parsed document and its original text."""
+def load(path: Path) -> tuple[PlayerList, str]:
+    """Read a playerlist, returning the parsed document and its original text.
+
+    The file must be UTF-8: that is what ``dumps()`` writes, so accepting any
+    other encoding here would guarantee a spurious rewrite of a file the run
+    did not otherwise change.
+    """
     try:
-        original = path.read_text(encoding=encoding)
+        original = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError: the file is not valid UTF-8 -- report it like
         # any other unreadable file instead of crashing with a traceback.

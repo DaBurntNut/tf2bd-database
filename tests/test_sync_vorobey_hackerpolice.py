@@ -378,6 +378,25 @@ class SourceFetchTests(unittest.TestCase):
         ):
             load_first_available_raw([self.URL])
 
+    def test_the_retry_count_comes_from_the_module_constant(self):
+        """It used to be frozen into a keyword default, so patching did nothing."""
+        with (
+            mock.patch.object(sources, "FETCH_ATTEMPTS", 1),
+            mock.patch("sources._OPENER.open", side_effect=urllib.error.URLError("boom")) as opener,
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
+        self.assertEqual(opener.call_count, 1)
+
+    def test_the_timeout_comes_from_the_module_constant(self):
+        with (
+            mock.patch.object(sources, "FETCH_TIMEOUT_SECONDS", 7),
+            mock.patch("sources._OPENER.open", return_value=_FakeResponse(self.BODY)) as opener,
+        ):
+            load_first_available_raw([self.URL])
+        self.assertEqual(opener.call_args.kwargs["timeout"], 7)
+
     def test_permanent_http_error_is_not_retried(self):
         error = urllib.error.HTTPError(self.URL, 404, "not found", Message(), None)
         with (

@@ -209,12 +209,7 @@ def _too_large(source: str) -> SyncError:
     return SyncError(f"{redact_url(source)} is larger than the {MAX_SOURCE_BYTES // (1024 * 1024)} MiB safety limit")
 
 
-def _fetch_bytes(
-    url: str,
-    *,
-    timeout: int = FETCH_TIMEOUT_SECONDS,
-    attempts: int = FETCH_ATTEMPTS,
-) -> bytes:
+def _fetch_bytes(url: str) -> bytes:
     """GET a URL and return the body bytes VERBATIM, retrying transient failures.
 
     Permanent client errors (4xx other than 429) are not retried -- they
@@ -224,7 +219,7 @@ def _fetch_bytes(
     if not url.startswith(("https://", "http://")):
         raise SyncError(f"refusing to fetch non-HTTP(S) URL: {redact_url(url)}")
     last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
         try:
             headers = {"User-Agent": USER_AGENT}
             # Hostname comparison, not a substring match: a look-alike URL
@@ -243,7 +238,7 @@ def _fetch_bytes(
             request = urllib.request.Request(url, headers=headers)
             # Scheme is restricted to HTTP(S) above (Bandit B310); the opener
             # only adds the HTTPS-downgrade guard.
-            with _OPENER.open(request, timeout=timeout) as response:  # nosec B310
+            with _OPENER.open(request, timeout=FETCH_TIMEOUT_SECONDS) as response:  # nosec B310
                 # Reject an oversized body before downloading it when the
                 # server says how big it is.
                 declared = _declared_length(response)
@@ -257,11 +252,11 @@ def _fetch_bytes(
             last_error = exc
             if exc.code != 429 and not 500 <= exc.code < 600:
                 break  # permanent: don't waste attempts, fall back sooner
-            if attempt < attempts:
+            if attempt < FETCH_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
         except OSError as exc:  # URLError, socket timeouts, resets, ...
             last_error = exc
-            if attempt < attempts:
+            if attempt < FETCH_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
         except (ValueError, http.client.HTTPException) as exc:
             # A malformed URL (bad IPv6 literal, control characters, ...)

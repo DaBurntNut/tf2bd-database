@@ -74,12 +74,13 @@ fits GitHub's size limit.
 | --- | --- |
 | Snapshot-only demotion | An entry is only demoted when its SteamID was in the previous snapshot *and* is gone from today's list — never merely "absent from Vorobey", and never while upstream still lists it. Manually added cheaters are untouched. |
 | Mass-removal guard | If an implausibly large share of the snapshot disappears at once (more than 50 IDs and more than 20 %), demotion is skipped and the baseline is kept, so an upstream outage cannot wipe entries. A human can force it with `--allow-mass-demotion`. |
+| Strict JSON | A file that Python accepts but JSON does not is refused, never rewritten: `NaN`/`Infinity` (which would publish a playerlist TF2BD itself cannot load) and duplicated keys (which would silently discard half of an entry). The bot also never writes a non-finite number. |
 | Frozen baseline | If a run finds removals it cannot apply (demotion disabled, or vetoed by the guard), the snapshot is **not** advanced — otherwise those removals would be forgotten forever. |
 | Exact snapshot | The snapshot is written from the fetched **bytes**, never re-encoded, and `.gitattributes` keeps Git from touching line endings. |
 | Bounded fetch | HTTPS only (a redirect downgrade to plain HTTP is refused), 64 MiB maximum for downloaded *and* local sources, 30 s timeout, 3 attempts, then the next fallback URL. When `raw.githubusercontent.com` is unreachable the file is fetched through the GitHub **blob API** by its sha, so the run survives an outage of the raw host. Credentials in a `--source` URL are redacted from the pull request body. |
-| Bounded PR body | Tables are row-capped and the body is hard-truncated below GitHub's 65,536-character limit, so opening the pull request can never fail on size. |
+| Bounded PR body | Tables are row-capped and the body is hard-truncated below GitHub's 65,536-**byte** limit (bytes, not characters: non-Latin player names are several bytes each, which is what GitHub counts), so opening the pull request can never fail on size. |
 | Checked changes | A pull request that touches `scripts/`, `tests/`, `pyproject.toml`, `.gitattributes` or the workflow runs `ruff`, `mypy --strict` and the full test suite with read-only permissions — it never reads or writes the database. |
-| Escaped output | Player names and proofs are escaped for Markdown: no broken tables, no forged links, no injected HTML, no `@` mentions. |
+| Escaped output | Player names and proofs are escaped for Markdown: no broken tables, no forged links, no injected HTML, no `@` mentions, and no invisible control characters — an `ESC` in a name cannot repaint the job log and a bidi override cannot reverse the rest of the line. |
 
 ### Run it yourself
 
@@ -90,8 +91,11 @@ python3 -m unittest discover -s tests                        # run the test suit
 python3 -m mypy scripts                                     # strict type check
 ```
 
-Exit code `0` means success, `2` means the database or the Vorobey list was
-unusable (nothing is written in that case).
+Exit code `0` means success. `2` means the run refused or failed: the database
+or the Vorobey list was unusable, two paths pointed at the same file, the source
+was not HTTPS, or an output could not be written. Nothing is written when a
+refusal happens before the first write; a failure *while* writing leaves the
+previous file intact (each one is replaced atomically, never edited in place).
 
 ### Update the Vorobey database copy
 
