@@ -312,7 +312,7 @@ def run(args: argparse.Namespace) -> int:
                 and len(removed) > MASS_DEMOTION_MAX_FRACTION * len(previous_index.by_steamid)
             ):
                 demotion_note = (
-                    f"skipped - {len(removed)} of {len(previous_index.by_steamid)} snapshot entries "
+                    f"skipped - {len(removed):,} of {len(previous_index.by_steamid):,} snapshot entries "
                     "disappeared upstream at once, which looks like an upstream problem, "
                     "not real removals (re-run with --allow-mass-demotion to force)"
                 )

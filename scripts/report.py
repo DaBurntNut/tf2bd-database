@@ -100,6 +100,15 @@ def plural(count: int, singular: str, plural_form: str) -> str:
     return singular if count == 1 else plural_form
 
 
+def _count(value: int) -> str:
+    """Render a count with thousands separators (``123456`` -> ``123,456``).
+
+    The Vorobey list is thousands of entries long, so an unseparated
+    "5798 entries" is needlessly hard to read and misread at a glance.
+    """
+    return f"{value:,}"
+
+
 def _sorted_steamids(steamids: Sequence[str]) -> list[str]:
     """Order SteamIDs numerically (unusable ones last, stably) for a stable diff."""
     return sorted(steamids, key=lambda steamid: (account_id(steamid) is None, account_id(steamid) or 0))
@@ -131,7 +140,7 @@ def render_removed_table(steamids: Sequence[str]) -> list[str]:
     count = len(ordered)
     shown = ordered[:MAX_REMOVED_TABLE_ROWS]
     lines = [
-        f"**{count} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey hackerpolice list "
+        f"**{_count(count)} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey hackerpolice list "
         "since the previous snapshot.**",
         "",
         "| SteamID | Profile Link |",
@@ -141,7 +150,8 @@ def render_removed_table(steamids: Sequence[str]) -> list[str]:
     if len(ordered) > len(shown):
         lines += [
             "",
-            f"… and {len(ordered) - len(shown)} more {plural(len(ordered) - len(shown), 'SteamID', 'SteamIDs')} "
+            f"… and {_count(len(ordered) - len(shown))} more "
+            f"{plural(len(ordered) - len(shown), 'SteamID', 'SteamIDs')} "
             "not shown here (the list is too long for a pull request body).",
         ]
     lines.append("")
@@ -225,7 +235,7 @@ class RunInfo:
 
 def render_report(info: RunInfo) -> str:
     """Render the PR body / job summary as Markdown."""
-    source_note = f"{info.source_total} entries"
+    source_note = f"{_count(info.source_total)} entries"
     if info.source_skipped:
         source_note += f", {info.source_skipped} unusable"
 
@@ -243,20 +253,20 @@ def render_report(info: RunInfo) -> str:
         current_total = info.previous_source_total + info.added_to_source - info.removed_from_source
         net = info.added_to_source - info.removed_from_source
         lines.append(
-            f"- Previous snapshot: {info.previous_source_total} entries; "
-            f"{info.removed_from_source} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} "
+            f"- Previous snapshot: {_count(info.previous_source_total)} entries; "
+            f"{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} "
             "removed upstream since then (only those are demotion candidates)"
         )
         lines.append(
-            f"- Snapshot diff: **{info.added_to_source} new "
+            f"- Snapshot diff: **{_count(info.added_to_source)} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
-            f"**{info.removed_from_source} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} removed** "
-            f"({info.previous_source_total} → {current_total} entries; net {net:+d})"
+            f"**{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} removed** "
+            f"({_count(info.previous_source_total)} → {_count(current_total)} entries; net {net:+,d})"
         )
     elif info.snapshot_changed:
         # No baseline existed: every current ID is new in the initial snapshot.
         lines.append(
-            f"- Snapshot diff: **{info.added_to_source} new "
+            f"- Snapshot diff: **{_count(info.added_to_source)} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
             "**0 SteamIDs removed** (no previous snapshot; initial snapshot)"
         )
@@ -283,7 +293,7 @@ def render_report(info: RunInfo) -> str:
     if promotions:
         count = len(promotions)
         lines += [
-            f"**{count} {plural(count, 'entry', 'entries')} promoted to `cheater`.**",
+            f"**{_count(count)} {plural(count, 'entry', 'entries')} promoted to `cheater`.**",
             "",
             "| SteamID | Last known name | Before | After | Hackerpolice proof |",
             "| --- | --- | --- | --- | --- |",
@@ -303,7 +313,7 @@ def render_report(info: RunInfo) -> str:
     if demotions:
         count = len(demotions)
         lines += [
-            f"**{count} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
+            f"**{_count(count)} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
             "removed from the hackerpolice list since).**",
             "",
             "| SteamID | Last known name | Before | After |",

@@ -1,11 +1,11 @@
 ## Vorobey hackerpolice sync
 
 - Database: `playerlist.garou3299.json`
-- Vorobey hackerpolice list (5798 entries): https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json
+- Vorobey hackerpolice list (123,456 entries): https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json
 - Fetched from: playerlist.vorobey-hackerpolice.json
-- Run at: 2026-11-14 16:35 UTC
-- Previous snapshot: 5802 entries; 4 SteamIDs removed upstream since then (only those are demotion candidates)
-- Snapshot diff: **0 new SteamIDs added**, **4 SteamIDs removed** (5802 → 5798 entries; net -4)
+- Run at: 2026-11-14 16:37 UTC
+- Previous snapshot: 123,460 entries; 4 SteamIDs removed upstream since then (only those are demotion candidates)
+- Snapshot diff: **0 new SteamIDs added**, **4 SteamIDs removed** (123,460 → 123,456 entries; net -4)
 - Snapshot: `snapshot/playerlist.vorobey-hackerpolice.json` updated to an exact copy of the current upstream file
 
 **2 entries promoted to `cheater`.**

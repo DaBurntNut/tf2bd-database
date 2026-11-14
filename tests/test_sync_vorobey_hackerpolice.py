@@ -567,6 +567,22 @@ class ReportTests(unittest.TestCase):
         report = render_report(self.info(added_to_source=10, snapshot_changed=True))
         self.assertIn("**10 new SteamIDs added**, **0 SteamIDs removed** (no previous snapshot", report)
 
+    def test_counts_use_thousands_separators(self):
+        report = render_report(
+            self.info(
+                previous_source_total=12345,
+                added_to_source=1200,
+                removed_from_source=3,
+                removed_upstream=("[U:1:1]",),
+                snapshot_changed=True,
+            )
+        )
+        self.assertIn("Vorobey hackerpolice list (10 entries)", report)  # source_total stays exact
+        self.assertIn("- Previous snapshot: 12,345 entries", report)
+        self.assertIn("**1,200 new SteamIDs added**", report)
+        self.assertIn("(12,345 → 13,542 entries; net +1,197)", report)
+        self.assertIn("**1 SteamID removed from the Vorobey hackerpolice list", report)
+
     def test_snapshot_only_change_is_reported_as_such(self):
         report = render_report(self.info(snapshot_changed=True))
         self.assertIn("snapshot refresh only", report)
