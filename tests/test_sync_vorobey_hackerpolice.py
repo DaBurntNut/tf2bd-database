@@ -2473,6 +2473,33 @@ class RepositoryDataTests(unittest.TestCase):
         # a hand-reformatted list would show up as a thousands-line diff.
         self.assertEqual(dumps(database), original)
 
+    @staticmethod
+    def job_block(text, name):
+        """The lines of one job, without needing a YAML parser in CI."""
+        lines = text.splitlines()
+        start = next(index for index, line in enumerate(lines) if line.rstrip() == f"  {name}:")
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            line = lines[index]
+            if line.strip() and not line.startswith("    "):
+                end = index
+                break
+        return "\n".join(lines[start:end])
+
+    def test_the_pull_request_job_cannot_write_to_the_repository(self):
+        # The checks job runs for contributions: its token must stay read-only.
+        workflow = (self.ROOT / ".github/workflows/sync-vorobey-hackerpolice.yml").read_text(encoding="utf-8")
+        block = self.job_block(workflow, "checks")
+        self.assertIn("contents: read", block)
+        self.assertNotIn("contents: write", block)
+        self.assertNotIn("pull-requests: write", block)
+
+    def test_a_running_sync_is_never_cancelled_and_cannot_hang_forever(self):
+        workflow = (self.ROOT / ".github/workflows/sync-vorobey-hackerpolice.yml").read_text(encoding="utf-8")
+        sync_block = self.job_block(workflow, "sync")
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn("timeout-minutes:", sync_block)  # a stuck fetch cannot hold the job
+
     def test_publishing_steps_stage_only_the_two_data_files(self):
         """`git add -A` would publish whatever else happens to be in the workspace.
 
