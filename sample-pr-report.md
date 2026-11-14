@@ -3,7 +3,7 @@
 - Database: `playerlist.garou3299.json`
 - Vorobey hackerpolice list (123,456 entries): https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json
 - Fetched from: playerlist.vorobey-hackerpolice.json
-- Run at: 2026-11-14 16:41 UTC
+- Run at: 2026-11-14 16:46 UTC
 - Previous snapshot: 123,460 entries; 4 SteamIDs removed upstream since then (only those are demotion candidates)
 - Snapshot diff: **0 new SteamIDs added**, **4 SteamIDs removed** (123,460 → 123,456 entries; net -4)
 - Snapshot: `snapshot/playerlist.vorobey-hackerpolice.json` updated to an exact copy of the current upstream file
@@ -31,6 +31,6 @@
 | `[U:1:809020068]` | [Profile](https://steamcommunity.com/profiles/76561198769285796) |
 | `[U:1:1000000001]` | [Profile](https://steamcommunity.com/profiles/76561198960265729) |
 
-Attributes are changed in `playerlist.garou3299.json` for these SteamIDs: [U:1:101711930], [U:1:477647173], [U:1:681777506]; Entry is removed for this SteamID: [U:1:1730017]; nothing else is modified.
+In `playerlist.garou3299.json`: attributes are changed for these SteamIDs: [U:1:101711930], [U:1:477647173], [U:1:681777506]; entry is removed for this SteamID: [U:1:1730017]; nothing else is modified.
 Proof links come from the Vorobey hackerpolice list and are shown for review only.
 

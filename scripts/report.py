@@ -171,40 +171,47 @@ def _with_removed_table(lines: list[str], steamids: Sequence[str]) -> list[str]:
 def render_closing(changes: Sequence[Change], database: str | None = None) -> str:
     """Build the present-tense closing sentence describing what changed.
 
-    Uses singular/plural-aware phrasing per attribute or entry, followed by
-    "; nothing else is modified." When ``database`` is given, the sentence
-    names the file the changes land in -- exactly once, on the first clause,
-    e.g. "Attributes are changed in `playerlist.garou3299.json` for these
-    SteamIDs: ...; Entry is removed for this SteamID: ...; nothing else is
-    modified." Repeating the file name on every clause just makes the line
-    harder to read.
+    With a database name the file scopes the whole sentence and is named
+    exactly once, up front::
+
+        In `playerlist.garou3299.json`: attributes are changed for these
+        SteamIDs: ...; entry is removed for this SteamID: ...; nothing else
+        is modified.
+
+    Without one (callers that only have the changes) it falls back to the
+    standalone phrasing: "Attribute is changed for this SteamID: ...; Entry
+    is removed from the database for this SteamID: ...; nothing else is
+    modified."
     """
     changed_steamids = [change.steamid for change in changes if (change.kind == "promote") or change.after]
     removed_steamids = [change.steamid for change in changes if (change.kind == "demote") and not change.after]
 
+    def clause(head: str, target: str, steamids: list[str]) -> str:
+        if database is None:
+            head = head[:1].upper() + head[1:]  # standalone sentence starts capitalised
+        return f"{head} for {target}: " + ", ".join(steamids)
+
     parts: list[str] = []
-    named_database = False  # the file is named at most once
-
     if changed_steamids:
-        head = "Attribute is changed" if len(changed_steamids) == 1 else "Attributes are changed"
-        target = "this SteamID" if len(changed_steamids) == 1 else "these SteamIDs"
-        where = f" in `{database}`" if database else ""
-        named_database = bool(database)
-        parts.append(f"{head}{where} for {target}: " + ", ".join(changed_steamids))
-
+        one = len(changed_steamids) == 1
+        parts.append(
+            clause(
+                "attribute is changed" if one else "attributes are changed",
+                "this SteamID" if one else "these SteamIDs",
+                changed_steamids,
+            )
+        )
     if removed_steamids:
-        head = "Entry is removed" if len(removed_steamids) == 1 else "Entries are removed"
-        target = "this SteamID" if len(removed_steamids) == 1 else "these SteamIDs"
-        if database and not named_database:
-            # No attribute clause above: the removal clause names the file.
-            where = f" from `{database}`"
-        elif database:
-            where = ""  # already named by the attribute clause above
-        else:
-            where = " from the database"
-        parts.append(f"{head}{where} for {target}: " + ", ".join(removed_steamids))
+        one = len(removed_steamids) == 1
+        head = "entry is removed" if one else "entries are removed"
+        if database is None:
+            head += " from the database"
+        parts.append(clause(head, "this SteamID" if one else "these SteamIDs", removed_steamids))
 
-    return "; ".join(parts) + "; nothing else is modified."
+    body = "; ".join(parts)
+    if database is not None:
+        body = f"In `{database}`: {body}"
+    return body + "; nothing else is modified."
 
 
 @dataclass(frozen=True)
