@@ -210,14 +210,21 @@ def _too_large(source: str) -> SyncError:
 
 
 def _fetch_bytes(url: str) -> bytes:
-    """GET a URL and return the body bytes VERBATIM, retrying transient failures.
+    """GET an HTTPS URL and return the body bytes VERBATIM, retrying transient failures.
 
     Permanent client errors (4xx other than 429) are not retried -- they
     will fail identically on every attempt, and the caller falls back to
     the next source instead.
+
+    Only ``https://`` is fetched (bytes over plain HTTP are not trustworthy,
+    and this file decides promotions); a local path is the offline option.
     """
-    if not url.startswith(("https://", "http://")):
-        raise SyncError(f"refusing to fetch non-HTTP(S) URL: {redact_url(url)}")
+    if not url.startswith("https://"):
+        # Plain HTTP is refused even when the operator passes the URL
+        # explicitly: this file decides who gets promoted, so its transport is
+        # part of the trust model (a network attacker could otherwise inject
+        # entries). Local mirrors stay supported as a path.
+        raise SyncError(f"refusing to fetch a non-HTTPS URL (use https:// or a local path): {redact_url(url)}")
     last_error: Exception | None = None
     for attempt in range(1, FETCH_ATTEMPTS + 1):
         try:

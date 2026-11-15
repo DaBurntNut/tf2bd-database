@@ -90,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--source",
         action="append",
         metavar="URL_OR_PATH",
-        help="Vorobey hackerpolice list URL or local path; repeat for fallbacks (default: built-in GitHub URLs)",
+        help="Vorobey hackerpolice list HTTPS URL or local path; repeat for fallbacks (default: built-in GitHub URLs)",
     )
     parser.add_argument("--report", metavar="PATH", help="also write the Markdown summary to this file")
     parser.add_argument("--dry-run", action="store_true", help="report what would change without writing the database")

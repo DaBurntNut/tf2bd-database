@@ -299,6 +299,27 @@ class SourceFetchTests(unittest.TestCase):
         with self.assertRaises(SyncError):
             load_first_available_raw(["ftp://example.invalid/list.json"])
 
+    def test_plain_http_source_is_refused(self):
+        """Plain HTTP is refused even when the operator asks for it by hand.
+
+        This file decides who gets promoted, so its transport is part of the
+        trust model: a network attacker must not be able to inject entries by
+        serving the list over HTTP. Local mirrors stay supported as a path.
+        """
+        with self.assertRaises(SyncError) as caught:
+            load_first_available_raw(["http://example.invalid/list.json"])
+        self.assertIn("non-HTTPS", str(caught.exception))
+        self.assertIn("use https:// or a local path", str(caught.exception))
+
+    def test_a_refused_http_source_falls_back_to_the_next_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "list.json"
+            local.write_text(dumps({"players": [{"steamid": "[U:1:7]", "attributes": ["cheater"]}]}), encoding="utf-8")
+            document, source, raw = load_first_available_raw(["http://example.invalid/list.json", str(local)])
+            self.assertEqual(source, str(local))
+            self.assertEqual(raw, local.read_bytes())
+            self.assertEqual(document["players"][0]["steamid"], "[U:1:7]")
+
     def test_unreadable_snapshot_is_an_error_but_missing_one_is_not(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(load_snapshot(Path(tmp) / "absent.json"))
@@ -2679,6 +2700,12 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.run_cli("--snapshot", str(self.database))
         self.assertEqual(code, 2)
         self.assertIn("--snapshot and --database must be different files", stderr)
+
+    def test_plain_http_source_is_a_clean_error(self):
+        code, _, stderr = self.run_cli("--source", "http://example.invalid/list.json")
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to fetch a non-HTTPS URL", stderr)
+        self.assertNotIn("Traceback", stderr)
 
     def test_unwritable_report_path_is_a_clean_error(self):
         report_dir = self.root / "report-dir"
