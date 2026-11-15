@@ -312,6 +312,45 @@ class SourceFetchTests(unittest.TestCase):
         self.assertIn("non-HTTPS", str(caught.exception))
         self.assertIn("use https:// or a local path", str(caught.exception))
 
+    def test_has_usable_steamids(self):
+        """The chain's accept test: one normalisable SteamID is enough."""
+        self.assertFalse(sources._has_usable_steamids({}))
+        self.assertFalse(sources._has_usable_steamids({"players": "nope"}))
+        self.assertFalse(sources._has_usable_steamids({"players": []}))
+        self.assertFalse(sources._has_usable_steamids({"players": ["junk", 7, None]}))
+        self.assertFalse(sources._has_usable_steamids({"players": [{"steamid": "junk"}]}))
+        self.assertTrue(sources._has_usable_steamids({"players": [{"steamid": "junk"}, {"steamid": "[U:1:5]"}]}))
+        self.assertTrue(sources._has_usable_steamids({"players": [{"steamid": 76561197960265733}]}))
+
+    def test_an_empty_list_falls_back_to_the_next_source(self):
+        """A mirror answering 200 with an empty list must not stop the chain.
+
+        The nightly run would otherwise die on a stale or broken mirror while a
+        healthy source was still available.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty.json"
+            good = Path(tmp) / "good.json"
+            empty.write_text(dumps({"players": []}), encoding="utf-8")
+            good.write_text(dumps({"players": [{"steamid": "[U:1:7]", "attributes": ["cheater"]}]}), encoding="utf-8")
+            document, source, raw = load_first_available_raw([str(empty), str(good)])
+            self.assertEqual(source, str(good))
+            self.assertEqual(raw, good.read_bytes())
+            self.assertEqual(document["players"][0]["steamid"], "[U:1:7]")
+
+    def test_every_empty_source_is_named_in_the_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "a.json"
+            second = Path(tmp) / "b.json"
+            for path in (first, second):
+                path.write_text(dumps({"players": [{"steamid": "junk", "attributes": []}]}), encoding="utf-8")
+            with self.assertRaises(SyncError) as caught:
+                load_first_available_raw([str(first), str(second)])
+            message = str(caught.exception)
+            self.assertIn(str(first), message)
+            self.assertIn(str(second), message)
+            self.assertIn("no usable SteamIDs", message)
+
     def test_a_refused_http_source_falls_back_to_the_next_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             local = Path(tmp) / "list.json"
@@ -1872,12 +1911,64 @@ class ReportTests(unittest.TestCase):
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
 
     def test_a_single_enormous_row_is_still_cut_as_the_very_last_resort(self):
-        """One cell too big for any row cap: only then is the body truncated."""
-        change = Change("[U:1:1]", "x" * 70_000, ("suspicious",), ("cheater",))
+        """An unshortenable cell (one absurd URL): only then is the body cut.
+
+        Names and the number of proof links are capped first, so the row caps
+        stay in charge; a URL has to stay whole to remain clickable, which
+        leaves the hard truncation as the final guard.
+        """
+        change = Change("[U:1:1]", "x", ("suspicious",), ("cheater",), ("https://example.invalid/" + "y" * 70_000,))
         report = render_report(self.info([change], removed_upstream=("[U:1:2]",)))
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
         self.assertIn("report truncated to fit the pull request body limit", report)
         report.encode("utf-8")
+
+    def test_an_enormous_name_is_shortened_instead_of_truncating_the_report(self):
+        """A name is data, not a link: cap it and keep the tables and sentence."""
+        changes = [Change(f"[U:1:{1000 + n}]", "名" * 5_000, ("suspicious",), ("cheater",)) for n in range(3)]
+        report = render_report(self.info(changes, removed_upstream=("[U:1:9]",)))
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        self.assertNotIn("report truncated to fit the pull request body limit", report)
+        self.assertIn("; nothing else is modified.", report)
+        self.assertIn("…", report)
+        longest = max(len(line) for line in report.splitlines())
+        self.assertLess(longest, 1_000, "a single row is still enormous")
+        # The cap is applied to the raw name, so no escape sequence is cut in half.
+        self.assertEqual(report.count("| `[U:1:1"), 3)
+
+    def test_the_number_of_proof_links_in_a_row_is_capped(self):
+        """One row may not carry thousands of links: the tables must survive."""
+        links = tuple(f"https://discord.com/channels/1/2/{n}" for n in range(2_000))
+        changes = [Change(f"[U:1:{1000 + n}]", "name", ("suspicious",), ("cheater",), links) for n in range(3)]
+        report = render_report(self.info(changes, removed_upstream=("[U:1:9]",)))
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        self.assertNotIn("report truncated to fit the pull request body limit", report)
+        self.assertIn("; nothing else is modified.", report)
+        # Pin the policy value itself: a test that only compares against the
+        # constant would pass no matter how high the cap were raised.
+        self.assertEqual(report_module.MAX_EVIDENCE_LINKS, 10)
+        row = next(line for line in report.splitlines() if line.startswith("| `[U:1:1000]`"))
+        self.assertEqual(row.count("https://discord.com/channels/1/2/"), 10)
+        self.assertIn("and 1,990 more", row)
+        self.assertNotIn("[and", row, "the overflow note must not look like a link")
+
+    def test_many_huge_proof_lists_still_show_most_of_the_rows(self):
+        """A row must not eat the byte budget: hundreds of changes stay visible."""
+        links = tuple(f"https://discord.com/channels/1/2/{n}" for n in range(2_000))
+        changes = [Change(f"[U:1:{1000 + n}]", "name", ("suspicious",), ("cheater",), links) for n in range(200)]
+        report = render_report(self.info(changes, removed_upstream=tuple(f"[U:1:{9000 + n}]" for n in range(100))))
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        rows = sum(1 for line in report.splitlines() if line.startswith("| `[U:1:1"))
+        self.assertGreaterEqual(rows, 50, f"only {rows} change rows survived the byte budget")
+        self.assertIn("; nothing else is modified.", report)
+
+    def test_ten_or_fewer_proof_links_get_no_overflow_note(self):
+        for count in (0, 1, 10):
+            links = tuple(f"https://discord.com/channels/1/2/{n}" for n in range(count))
+            change = Change("[U:1:1000]", "name", ("suspicious",), ("cheater",), links)
+            report = render_report(self.info([change]))
+            self.assertNotIn(" more", report)
+            self.assertEqual(report.count("https://discord.com/channels/1/2/"), count)
 
     def test_a_report_that_already_fits_is_never_shrunk(self):
         """The reduced caps only kick in when the body really is too big."""
@@ -2750,6 +2841,15 @@ class CliTests(unittest.TestCase):
         policy._write_proof(player, evidence)
         self.assertLess(len(player["proof"][0]), 500)
         self.assertIn("(+995 more, see the pull request)", player["proof"][0])
+
+    def test_load_index_still_refuses_an_empty_index(self):
+        """Backstop: the chain normally filters these out, the guard stays."""
+        with (
+            mock.patch.object(sync_module, "load_first_available_raw", return_value=({"players": []}, "src", b"{}")),
+            self.assertRaises(SyncError) as caught,
+        ):
+            sync_module._load_index(SimpleNamespace(source=["x"]))
+        self.assertIn("no usable SteamIDs", str(caught.exception))
 
     def test_plain_http_source_is_a_clean_error(self):
         code, _, stderr = self.run_cli("--source", "http://example.invalid/list.json")

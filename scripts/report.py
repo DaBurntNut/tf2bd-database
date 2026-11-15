@@ -36,6 +36,8 @@ from sources import SOURCE_REPO_URL, redact_url
 __all__ = [
     "MAX_CHANGE_TABLE_ROWS",
     "MAX_CLOSING_STEAMIDS",
+    "MAX_EVIDENCE_LINKS",
+    "MAX_NAME_CHARS",
     "MAX_REMOVED_TABLE_ROWS",
     "MAX_REPORT_BYTES",
     "RunInfo",
@@ -61,6 +63,16 @@ MAX_CLOSING_STEAMIDS = 150
 # Characters would be the wrong unit: 30,000 Cyrillic player names are half the
 # character budget and twice the byte budget.
 MAX_REPORT_BYTES = 60_000
+# One cell can be as big as the data behind it, and a single enormous row
+# defeats every row cap: the body then gets hard-truncated and the run loses the
+# closing sentence and the removed-SteamID list it exists to publish. Two caps
+# keep one row small enough that the row caps stay in charge:
+#   * proof links shown per row (the pull request is a review list, not an
+#     archive; the list is only ever read a few links at a time),
+#   * player-name characters (Steam names are at most 32 characters, so a much
+#     longer one is abnormal -- the profile link still carries the identity).
+MAX_EVIDENCE_LINKS = 10
+MAX_NAME_CHARS = 80
 
 # Characters that would break a Markdown link target.
 # "|" is percent-encoded too: a raw pipe inside a table cell ends the cell, so a
@@ -166,7 +178,10 @@ def _name_cell(change: Change) -> str:
     # UNKNOWN only when there is genuinely no recorded name; a player
     # actually named "-" (or similar) keeps their name. _cell() escapes the
     # brackets that would otherwise break the link text.
-    label = "UNKNOWN" if not change.name.strip() else _cell(change.name)
+    name = change.name
+    if len(name) > MAX_NAME_CHARS:
+        name = name[:MAX_NAME_CHARS].rstrip() + "…"  # cut BEFORE escaping
+    label = "UNKNOWN" if not name.strip() else _cell(name)
     url = steam_profile_url(change.steamid)
     if url is None:
         return label
@@ -202,12 +217,18 @@ def _evidence_cell(links: Sequence[str]) -> str:
     """
     if not links:
         return "-"
-    single = len(links) == 1
+    shown = links[:MAX_EVIDENCE_LINKS]
+    single = len(shown) == 1
     rendered = [
         _markdown_link(link, "proof" if single else f"proof {position}") if _is_url(link) else _cell(link)
-        for position, link in enumerate(links, start=1)
+        for position, link in enumerate(shown, start=1)
     ]
-    return ", ".join(rendered)
+    cell = ", ".join(rendered)
+    hidden = len(links) - len(shown)
+    if hidden:
+        # Plain text, not a link: it must never look clickable.
+        cell += f", and {_count(hidden)} more"
+    return cell
 
 
 def plural(count: int, singular: str, plural_form: str) -> str:

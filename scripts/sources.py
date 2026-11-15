@@ -387,6 +387,14 @@ def _resolve_indirect_document(document: dict[str, Any], source: str) -> tuple[d
     return None
 
 
+def _has_usable_steamids(document: dict[str, Any]) -> bool:
+    """True when at least one entry carries a SteamID this tool can normalise."""
+    players = document.get("players")
+    if not isinstance(players, list):
+        return False
+    return any(isinstance(entry, dict) and normalize_steamid(entry.get("steamid")) is not None for entry in players)
+
+
 def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], str, bytes]:
     """Return the parsed document, source name, and RAW bytes of the first usable source.
 
@@ -412,6 +420,12 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
                 )
                 continue
             document, raw = resolved
+        if not _has_usable_steamids(document):
+            # A 200 with an empty or all-garbage list is a broken mirror, not
+            # "nobody is listed": try the next source instead of stopping here,
+            # where a healthy fallback could still answer.
+            failures.append(f"{redact_url(source)}: no usable SteamIDs in its 'players' array")
+            continue
         return document, source, raw
 
     raise SyncError("cannot load the Vorobey hackerpolice list:\n  " + "\n  ".join(failures))
