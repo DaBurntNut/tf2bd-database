@@ -4,5 +4,3 @@ __pycache__/
 .mypy_cache/
 .coverage
 .pyright_cache/
-# Review specimens generated while discussing the report layout
-sample-*.md
