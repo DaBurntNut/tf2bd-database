@@ -35,6 +35,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import playerlist as playerlist_module
+import policy
 import report as report_module
 import sources
 import sync_vorobey_hackerpolice as sync_module
@@ -319,6 +320,22 @@ class SourceFetchTests(unittest.TestCase):
             self.assertEqual(source, str(local))
             self.assertEqual(raw, local.read_bytes())
             self.assertEqual(document["players"][0]["steamid"], "[U:1:7]")
+
+    def test_a_byte_order_mark_in_the_database_is_accepted(self):
+        """A BOM is still UTF-8, and the upstream list already tolerates one.
+
+        Refusing it here would mean a file saved by an editor that adds a mark
+        stops the nightly bot with a cryptic JSON error.
+        """
+        document = {"players": [{"steamid": "[U:1:5]", "attributes": ["cheater"]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "playerlist.json"
+            body = dumps(document).encode("utf-8")
+            path.write_bytes(b"\xef\xbb\xbf" + body)
+            loaded, original = load(path)
+            self.assertEqual(loaded, document)
+            self.assertEqual(original, body.decode("utf-8"))
+            self.assertFalse(original.startswith("\ufeff"))
 
     def test_unreadable_snapshot_is_an_error_but_missing_one_is_not(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2700,6 +2717,39 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.run_cli("--snapshot", str(self.database))
         self.assertEqual(code, 2)
         self.assertIn("--snapshot and --database must be different files", stderr)
+
+    def test_a_proof_line_cites_at_most_five_links(self):
+        """An upstream entry may list thousands of links; the database must not.
+
+        The full set is always in the pull request, so the ``[auto]`` line keeps
+        only the first few and says how many it left out.
+        """
+        evidence = tuple(f"https://discord.com/channels/1/2/{index}" for index in range(1, 8))
+        player = {"steamid": "[U:1:5]", "attributes": ["cheater"]}
+        policy._write_proof(player, evidence)
+        line = player["proof"][0]
+        self.assertEqual(line.count("https://discord.com/channels/1/2/"), 5)
+        self.assertIn("(+2 more, see the pull request)", line)
+        policy._write_proof(player, evidence)  # idempotent
+        self.assertEqual(player["proof"], [line])
+        self.assertLessEqual(len(line), 400, "the proof line must stay bounded")
+
+    def test_five_or_fewer_proofs_get_no_overflow_note(self):
+        for count in (0, 1, 5):
+            evidence = tuple(f"https://discord.com/channels/1/2/{index}" for index in range(1, count + 1))
+            player = {"steamid": "[U:1:5]", "attributes": ["cheater"]}
+            policy._write_proof(player, evidence)
+            line = player["proof"][0]
+            self.assertEqual(line.count("https://discord.com/channels/1/2/"), count)
+            self.assertNotIn("more, see the pull request", line)
+            self.assertNotIn("+0 more", line)
+
+    def test_a_thousand_proofs_do_not_grow_the_proof_line(self):
+        evidence = tuple(f"https://discord.com/channels/1/2/{index}" for index in range(1, 1001))
+        player = {"steamid": "[U:1:5]", "attributes": ["cheater"]}
+        policy._write_proof(player, evidence)
+        self.assertLess(len(player["proof"][0]), 500)
+        self.assertIn("(+995 more, see the pull request)", player["proof"][0])
 
     def test_plain_http_source_is_a_clean_error(self):
         code, _, stderr = self.run_cli("--source", "http://example.invalid/list.json")

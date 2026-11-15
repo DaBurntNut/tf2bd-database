@@ -30,6 +30,7 @@ DROPPED_ATTRIBUTE = "suspicious"
 PROMOTED_TO = "cheater"
 
 __all__ = [
+    "MAX_EMBEDDED_PROOFS",
     "RACIST_PROOF_PREFIX",
     "Change",
     "demote",
@@ -111,13 +112,22 @@ def _proofs(player: Player) -> list[str]:
     return [] if proof is None else [str(proof)]
 
 
+# How many proof links the ``[auto]`` line cites. The full set always appears in
+# the pull request; this bound keeps one upstream entry (which could list
+# thousands of links) from growing the database without limit.
+MAX_EMBEDDED_PROOFS = 5
+
+
 def _write_proof(player: Player, evidence: tuple[str, ...]) -> None:
     """Write the ``[auto]`` proof line into a player entry (idempotent)."""
     proof = _proofs(player)
     if not any(isinstance(item, str) and PROOF_MARKER in item for item in proof):
         line = f"{PROOF_MARKER} ({SOURCE_REPO_URL})"
         if evidence:
-            line += " | hackerpolice evidence: " + " ; ".join(evidence)
+            shown = evidence[:MAX_EMBEDDED_PROOFS]
+            line += " | hackerpolice evidence: " + " ; ".join(shown)
+            if len(evidence) > len(shown):
+                line += f" (+{len(evidence) - len(shown)} more, see the pull request)"
         proof.append(line)
     player["proof"] = proof
 

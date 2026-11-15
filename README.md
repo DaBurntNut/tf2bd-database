@@ -47,7 +47,8 @@ the pull request with its profile link, and every table also links each player's
 is yesterday's copy of Vorobey's list — the bot compares against it to know who
 was removed, and updates it in the same pull request. Evidence links stay in the
 pull request; they reach the database only if you run the script yourself with
-`--include-proof`.
+`--include-proof`, which cites the first five (the full list stays in the pull
+request).
 
 ## Safety rails
 

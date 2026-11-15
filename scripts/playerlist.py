@@ -269,10 +269,15 @@ def load(path: Path) -> tuple[PlayerList, str]:
 
     The file must be UTF-8: that is what ``dumps()`` writes, so accepting any
     other encoding here would guarantee a spurious rewrite of a file the run
-    did not otherwise change.
+    did not otherwise change. A leading byte-order mark IS accepted, because
+    it is still UTF-8 (some editors add one) and because the upstream list is
+    read through the same lenient-decoding path -- refusing it in one place
+    and allowing it in the other would be a trap. A rewrite drops the mark,
+    matching what ``dumps()`` writes.
     """
     try:
-        original = path.read_text(encoding="utf-8")
+        # utf-8-sig == utf-8 for files without a mark, and strips it when present.
+        original = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError: the file is not valid UTF-8 -- report it like
         # any other unreadable file instead of crashing with a traceback.
