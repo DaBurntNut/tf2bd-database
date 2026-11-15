@@ -19,8 +19,9 @@ Send a permanent Steam profile link or ID **with video evidence** to
 
 ## What the bot does
 
-Every day at **05:23 UTC** it compares this database with Vorobey's list and
-opens a pull request. **Nothing changes until you merge it.** It can also be run
+Every day at **05:23 UTC** (GitHub can delay the run) it compares this database
+with Vorobey's list and opens a pull request. **Nothing changes until you merge
+it.** It can also be run
 by hand (**Actions → Run workflow**) as a pull request, a direct commit or a dry
 run.
 

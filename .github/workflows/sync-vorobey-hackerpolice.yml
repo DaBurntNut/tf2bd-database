@@ -39,7 +39,10 @@ name: Sync Vorobey hackerpolice
 
 on:
   schedule:
-    # DAILY at 05:23 UTC (GitHub may delay scheduled runs by a few minutes).
+    # DAILY at 05:23 UTC. GitHub may delay a scheduled run (high load at the top
+    # of the hour; measured delays in this project ranged from 40 minutes to 8
+    # hours), and may drop one entirely under heavy load -- which is why the
+    # minute is 23 and not 00.
     # For a WEEKLY run instead, comment the line below and uncomment the next one
     # (Mondays at 05:23 UTC):
     - cron: "23 5 * * *"
