@@ -155,16 +155,36 @@ def account_id(steamid: Any) -> int | None:
     return int(canonical[len(CANONICAL_PREFIX) : -len(CANONICAL_SUFFIX)])
 
 
+def steamid64(steamid: Any) -> int | None:
+    """SteamID64 form of a SteamID, or ``None`` if the SteamID is unusable.
+
+    ``[U:1:269327660]`` -> ``76561198229593388`` (``STEAMID64_BASE`` + account id).
+    Shared by every permalink below, so all of them agree on what is usable.
+    """
+    account = account_id(steamid)
+    return None if account is None else STEAMID64_BASE + account
+
+
 def steam_profile_url(steamid: Any) -> str | None:
     """Steam Community profile permalink for a SteamID, or ``None`` if unusable.
 
-    The permalink is the SteamID64 form: ``STEAMID64_BASE`` + account id,
-    e.g. ``[U:1:269327660]`` -> ``https://steamcommunity.com/profiles/76561198229593388``.
+    The permalink is the SteamID64 form, e.g. ``[U:1:269327660]`` ->
+    ``https://steamcommunity.com/profiles/76561198229593388``.
     """
-    account = account_id(steamid)
-    if account is None:
-        return None
-    return f"https://steamcommunity.com/profiles/{STEAMID64_BASE + account}"
+    id64 = steamid64(steamid)
+    return None if id64 is None else f"https://steamcommunity.com/profiles/{id64}"
+
+
+def steam_history_url(steamid: Any) -> str | None:
+    """SteamHistory profile page for a SteamID, or ``None`` if unusable.
+
+    SteamHistory archives a profile's past names, avatars and bans, so it keeps
+    working after the player renames themselves: ``[U:1:269327660]`` ->
+    ``https://steamhistory.net/id/76561198229593388`` (same SteamID64 as the
+    Steam Community permalink).
+    """
+    id64 = steamid64(steamid)
+    return None if id64 is None else f"https://steamhistory.net/id/{id64}"
 
 
 def player_name(player: Player) -> str:
@@ -249,10 +269,15 @@ def load(path: Path) -> tuple[PlayerList, str]:
 
     The file must be UTF-8: that is what ``dumps()`` writes, so accepting any
     other encoding here would guarantee a spurious rewrite of a file the run
-    did not otherwise change.
+    did not otherwise change. A leading byte-order mark IS accepted, because
+    it is still UTF-8 (some editors add one) and because the upstream list is
+    read through the same lenient-decoding path -- refusing it in one place
+    and allowing it in the other would be a trap. A rewrite drops the mark,
+    matching what ``dumps()`` writes.
     """
     try:
-        original = path.read_text(encoding="utf-8")
+        # utf-8-sig == utf-8 for files without a mark, and strips it when present.
+        original = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError: the file is not valid UTF-8 -- report it like
         # any other unreadable file instead of crashing with a traceback.

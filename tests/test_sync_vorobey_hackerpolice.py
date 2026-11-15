@@ -17,6 +17,7 @@ import io
 import json
 import os
 import random
+import re
 import runpy
 import shutil
 import stat
@@ -34,6 +35,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import playerlist as playerlist_module
+import policy
 import report as report_module
 import sources
 import sync_vorobey_hackerpolice as sync_module
@@ -47,6 +49,7 @@ from playerlist import (
     order_attributes,
     player_name,
     sort_players,
+    steam_history_url,
     steam_profile_url,
     strict_json_loads,
     validate,
@@ -296,6 +299,82 @@ class SourceFetchTests(unittest.TestCase):
     def test_non_http_scheme_is_refused(self):
         with self.assertRaises(SyncError):
             load_first_available_raw(["ftp://example.invalid/list.json"])
+
+    def test_plain_http_source_is_refused(self):
+        """Plain HTTP is refused even when the operator asks for it by hand.
+
+        This file decides who gets promoted, so its transport is part of the
+        trust model: a network attacker must not be able to inject entries by
+        serving the list over HTTP. Local mirrors stay supported as a path.
+        """
+        with self.assertRaises(SyncError) as caught:
+            load_first_available_raw(["http://example.invalid/list.json"])
+        self.assertIn("non-HTTPS", str(caught.exception))
+        self.assertIn("use https:// or a local path", str(caught.exception))
+
+    def test_has_usable_steamids(self):
+        """The chain's accept test: one normalisable SteamID is enough."""
+        self.assertFalse(sources._has_usable_steamids({}))
+        self.assertFalse(sources._has_usable_steamids({"players": "nope"}))
+        self.assertFalse(sources._has_usable_steamids({"players": []}))
+        self.assertFalse(sources._has_usable_steamids({"players": ["junk", 7, None]}))
+        self.assertFalse(sources._has_usable_steamids({"players": [{"steamid": "junk"}]}))
+        self.assertTrue(sources._has_usable_steamids({"players": [{"steamid": "junk"}, {"steamid": "[U:1:5]"}]}))
+        self.assertTrue(sources._has_usable_steamids({"players": [{"steamid": 76561197960265733}]}))
+
+    def test_an_empty_list_falls_back_to_the_next_source(self):
+        """A mirror answering 200 with an empty list must not stop the chain.
+
+        The nightly run would otherwise die on a stale or broken mirror while a
+        healthy source was still available.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty.json"
+            good = Path(tmp) / "good.json"
+            empty.write_text(dumps({"players": []}), encoding="utf-8")
+            good.write_text(dumps({"players": [{"steamid": "[U:1:7]", "attributes": ["cheater"]}]}), encoding="utf-8")
+            document, source, raw = load_first_available_raw([str(empty), str(good)])
+            self.assertEqual(source, str(good))
+            self.assertEqual(raw, good.read_bytes())
+            self.assertEqual(document["players"][0]["steamid"], "[U:1:7]")
+
+    def test_every_empty_source_is_named_in_the_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "a.json"
+            second = Path(tmp) / "b.json"
+            for path in (first, second):
+                path.write_text(dumps({"players": [{"steamid": "junk", "attributes": []}]}), encoding="utf-8")
+            with self.assertRaises(SyncError) as caught:
+                load_first_available_raw([str(first), str(second)])
+            message = str(caught.exception)
+            self.assertIn(str(first), message)
+            self.assertIn(str(second), message)
+            self.assertIn("no usable SteamIDs", message)
+
+    def test_a_refused_http_source_falls_back_to_the_next_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "list.json"
+            local.write_text(dumps({"players": [{"steamid": "[U:1:7]", "attributes": ["cheater"]}]}), encoding="utf-8")
+            document, source, raw = load_first_available_raw(["http://example.invalid/list.json", str(local)])
+            self.assertEqual(source, str(local))
+            self.assertEqual(raw, local.read_bytes())
+            self.assertEqual(document["players"][0]["steamid"], "[U:1:7]")
+
+    def test_a_byte_order_mark_in_the_database_is_accepted(self):
+        """A BOM is still UTF-8, and the upstream list already tolerates one.
+
+        Refusing it here would mean a file saved by an editor that adds a mark
+        stops the nightly bot with a cryptic JSON error.
+        """
+        document = {"players": [{"steamid": "[U:1:5]", "attributes": ["cheater"]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "playerlist.json"
+            body = dumps(document).encode("utf-8")
+            path.write_bytes(b"\xef\xbb\xbf" + body)
+            loaded, original = load(path)
+            self.assertEqual(loaded, document)
+            self.assertEqual(original, body.decode("utf-8"))
+            self.assertFalse(original.startswith("\ufeff"))
 
     def test_unreadable_snapshot_is_an_error_but_missing_one_is_not(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1432,6 +1511,10 @@ class PolicyFuzzTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Report rendering
 # --------------------------------------------------------------------------- #
+# A table separator is a pipe that is not escaped as "\\|" inside a cell.
+_UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+
+
 class ReportTests(unittest.TestCase):
     def info(self, changes=(), *, source="https://example.invalid/list.json", **kwargs):
         return RunInfo(
@@ -1507,6 +1590,41 @@ class ReportTests(unittest.TestCase):
         )
         # The actual URL the bytes were fetched from stays visible for debugging.
         self.assertIn("- Fetched from: https://example.invalid/list.json", report)
+
+    def test_every_change_row_links_the_player_to_steamhistory(self):
+        """Reviewers can open the archived profile (past names, bans) in one click."""
+        promote = Change("[U:1:100]", "a", ("suspicious",), ("cheater",))
+        demote = Change("[U:1:200]", "b", ("cheater",), ("racist",), kind="demote")
+        report = render_report(self.info([promote, demote]))
+        self.assertIn("| SteamHistory |", report)  # column header, in both tables
+        rows = [line for line in report.splitlines() if line.startswith("| `[U:1:")]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[0].endswith("| [SteamHistory](https://steamhistory.net/id/76561197960265828) |"))
+        self.assertTrue(rows[1].endswith("| [SteamHistory](https://steamhistory.net/id/76561197960265928) |"))
+
+    def test_steamhistory_column_is_dash_when_the_steamid_is_unusable(self):
+        change = Change(steamid="nope", name="someone", before=("suspicious",), after=("cheater",))
+        report = render_report(self.info([change]))
+        row = next(line for line in report.splitlines() if line.startswith("| `nope`"))
+        self.assertTrue(row.endswith("| - |"))
+        self.assertNotIn("steamhistory.net/id/None", report)
+
+    def test_every_row_has_exactly_as_many_cells_as_its_header(self):
+        """Adding a column later cannot silently produce a ragged table."""
+        promote = Change("[U:1:100]", "a|b", ("suspicious",), ("cheater",), ("https://example.invalid/x|y",))
+        demote = Change("[U:1:200]", "b", ("cheater",), ("racist",), kind="demote")
+        report = render_report(self.info([promote, demote], removed_upstream=("[U:1:5]",)))
+
+        def cells(line: str) -> int:
+            # An escaped "\\|" is part of a cell, not a separator.
+            return len(_UNESCAPED_PIPE.findall(line)) - 1
+
+        header_cells = None
+        for line in report.splitlines():
+            if line.startswith("| SteamID |"):
+                header_cells = cells(line)
+            elif line.startswith("| `["):
+                self.assertEqual(cells(line), header_cells, line)
 
     def test_unusable_steamid_renders_name_without_a_link(self):
         changes = (Change(steamid="nope", name="someone", before=("suspicious",), after=("cheater",)),)
@@ -1636,7 +1754,7 @@ class ReportTests(unittest.TestCase):
             "| `[U:1:1]` | [cheater \\| with pipe](https://steamcommunity.com/profiles/76561197960265729) |",
             report,
         )
-        self.assertIn(f"[link]({HACKERPOLICE_PROOF})", report)
+        self.assertIn(f"[proof]({HACKERPOLICE_PROOF})", report)
         self.assertIn("Proof link comes from the Vorobey hackerpolice list", report)
 
     def test_name_links_to_the_steam_profile_permalink(self):
@@ -1682,14 +1800,22 @@ class ReportTests(unittest.TestCase):
         with_links = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://x/1", "https://x/2"))
         without_links = Change("[U:1:2]", "b", ("suspicious",), ("cheater",))
         report = render_report(self.info([with_links, without_links]))
-        self.assertIn("[1](https://x/1)<br>[2](https://x/2)", report)
+        self.assertIn("[proof 1](https://x/1), [proof 2](https://x/2)", report)
         self.assertIn("**2 entries promoted to `cheater`.**", report)
+
+    def test_report_never_emits_raw_html(self):
+        """Markdown previews that escape HTML would show the tag as literal text."""
+        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://x/1", "https://x/2"))
+        report = render_report(self.info([change], removed_upstream=("[U:1:2]",)))
+        self.assertNotIn("<br>", report)
+        self.assertNotIn("<br/>", report)
+        self.assertNotIn("<br />", report)
 
     def test_prose_evidence_is_not_turned_into_a_link(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("seen spinbotting",))
         report = render_report(self.info([change]))
         self.assertIn("| seen spinbotting |", report)
-        self.assertNotIn("[link](seen spinbotting)", report)
+        self.assertNotIn("[proof](seen spinbotting)", report)
 
     def test_link_targets_are_escaped(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://example.invalid/a (b)",))
@@ -1712,7 +1838,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("https://example.invalid/a%7Cb", report)
         rows = [line for line in report.splitlines() if line.startswith("| `[U:1:1]`")]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].count("|"), 6)  # five cells, no stray separator
+        self.assertEqual(rows[0].count("|"), 7)  # six cells, no stray separator
 
     def test_no_proof_note_without_evidence_links(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))  # no evidence links
@@ -1744,13 +1870,115 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(len(rows), MAX_CHANGE_TABLE_ROWS)
         self.assertIn("… and 3 more entries not shown here", report)
 
-    def test_report_body_is_hard_capped(self):
-        """Pathological input (very long names) can never break PR creation."""
+    def test_a_huge_report_shrinks_its_tables_instead_of_losing_its_tail(self):
+        """Pathological input must not cut off the closing sentence or the removed list."""
         changes = [Change(f"[U:1:{1000 + n}]", "x" * 900, ("suspicious",), ("cheater",)) for n in range(200)]
         report = render_report(self.info(changes, removed_upstream=tuple(f"[U:1:{5000 + n}]" for n in range(100))))
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        self.assertNotIn("report truncated to fit the pull request body limit", report)
+        # The two lines the pull request exists for are still there, in full.
+        self.assertIn("; nothing else is modified.", report)
+        self.assertIn("100 SteamIDs removed from the Vorobey hackerpolice list", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
+        # Rows beyond the reduced cap are announced rather than silently dropped,
+        # and the removed-SteamID list keeps every row: the change tables shrink
+        # first, because those changes are visible in the PR's own diff too.
+        self.assertIn("more entries not shown here", report)
+        self.assertEqual(report.count("| [Profile]("), 100)
+        report.encode("utf-8")
+
+    def test_the_report_drops_the_fewest_rows_that_fit(self):
+        """Shrinking must not throw away more rows than the budget requires."""
+        changes = [Change(f"[U:1:{1000 + n}]", "x" * 900, ("suspicious",), ("cheater",)) for n in range(200)]
+        info = self.info(changes, removed_upstream=tuple(f"[U:1:{5000 + n}]" for n in range(100)))
+        report = render_report(info)
+        shown = sum(1 for line in report.splitlines() if line.startswith("| `[U:1:1"))
+        caps = (MAX_CHANGE_TABLE_ROWS, 100, 50, 25, 10, 5, 1)
+        largest_that_fits = next(
+            cap
+            for cap in caps
+            if len(report_module._render_body(info, cap, MAX_REMOVED_TABLE_ROWS).encode("utf-8")) <= MAX_REPORT_BYTES
+        )
+        self.assertEqual(shown, largest_that_fits)
+
+    def test_a_huge_demotion_table_shrinks_like_the_promotion_one(self):
+        changes = [Change(f"[U:1:{2000 + n}]", "y" * 900, ("cheater",), (), kind="demote") for n in range(200)]
+        report = render_report(self.info(changes))
+        shown = sum(1 for line in report.splitlines() if line.startswith("| `[U:1:2"))
+        self.assertLess(shown, len(changes))
+        self.assertIn("more entries not shown here", report)
+        self.assertIn("; nothing else is modified.", report)
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+
+    def test_a_single_enormous_row_is_still_cut_as_the_very_last_resort(self):
+        """An unshortenable cell (one absurd URL): only then is the body cut.
+
+        Names and the number of proof links are capped first, so the row caps
+        stay in charge; a URL has to stay whole to remain clickable, which
+        leaves the hard truncation as the final guard.
+        """
+        change = Change("[U:1:1]", "x", ("suspicious",), ("cheater",), ("https://example.invalid/" + "y" * 70_000,))
+        report = render_report(self.info([change], removed_upstream=("[U:1:2]",)))
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
         self.assertIn("report truncated to fit the pull request body limit", report)
         report.encode("utf-8")
+
+    def test_an_enormous_name_is_shortened_instead_of_truncating_the_report(self):
+        """A name is data, not a link: cap it and keep the tables and sentence."""
+        changes = [Change(f"[U:1:{1000 + n}]", "名" * 5_000, ("suspicious",), ("cheater",)) for n in range(3)]
+        report = render_report(self.info(changes, removed_upstream=("[U:1:9]",)))
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        self.assertNotIn("report truncated to fit the pull request body limit", report)
+        self.assertIn("; nothing else is modified.", report)
+        self.assertIn("…", report)
+        longest = max(len(line) for line in report.splitlines())
+        self.assertLess(longest, 1_000, "a single row is still enormous")
+        # The cap is applied to the raw name, so no escape sequence is cut in half.
+        self.assertEqual(report.count("| `[U:1:1"), 3)
+
+    def test_the_number_of_proof_links_in_a_row_is_capped(self):
+        """One row may not carry thousands of links: the tables must survive."""
+        links = tuple(f"https://discord.com/channels/1/2/{n}" for n in range(2_000))
+        changes = [Change(f"[U:1:{1000 + n}]", "name", ("suspicious",), ("cheater",), links) for n in range(3)]
+        report = render_report(self.info(changes, removed_upstream=("[U:1:9]",)))
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        self.assertNotIn("report truncated to fit the pull request body limit", report)
+        self.assertIn("; nothing else is modified.", report)
+        # Pin the policy value itself: a test that only compares against the
+        # constant would pass no matter how high the cap were raised.
+        self.assertEqual(report_module.MAX_EVIDENCE_LINKS, 10)
+        row = next(line for line in report.splitlines() if line.startswith("| `[U:1:1000]`"))
+        self.assertEqual(row.count("https://discord.com/channels/1/2/"), 10)
+        self.assertIn("and 1,990 more", row)
+        self.assertNotIn("[and", row, "the overflow note must not look like a link")
+
+    def test_many_huge_proof_lists_still_show_most_of_the_rows(self):
+        """A row must not eat the byte budget: hundreds of changes stay visible."""
+        links = tuple(f"https://discord.com/channels/1/2/{n}" for n in range(2_000))
+        changes = [Change(f"[U:1:{1000 + n}]", "name", ("suspicious",), ("cheater",), links) for n in range(200)]
+        report = render_report(self.info(changes, removed_upstream=tuple(f"[U:1:{9000 + n}]" for n in range(100))))
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        rows = sum(1 for line in report.splitlines() if line.startswith("| `[U:1:1"))
+        self.assertGreaterEqual(rows, 50, f"only {rows} change rows survived the byte budget")
+        self.assertIn("; nothing else is modified.", report)
+
+    def test_ten_or_fewer_proof_links_get_no_overflow_note(self):
+        for count in (0, 1, 10):
+            links = tuple(f"https://discord.com/channels/1/2/{n}" for n in range(count))
+            change = Change("[U:1:1000]", "name", ("suspicious",), ("cheater",), links)
+            report = render_report(self.info([change]))
+            self.assertNotIn(" more", report)
+            self.assertEqual(report.count("https://discord.com/channels/1/2/"), count)
+
+    def test_a_report_that_already_fits_is_never_shrunk(self):
+        """The reduced caps only kick in when the body really is too big."""
+        changes = [Change(f"[U:1:{1000 + n}]", f"n{n}", ("suspicious",), ("cheater",)) for n in range(5)]
+        info = self.info(changes, removed_upstream=("[U:1:9]",))
+        self.assertEqual(
+            render_report(info),
+            report_module._render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS),
+        )
+        self.assertNotIn("more entries not shown here", render_report(info))
 
     def test_dry_run_and_include_proof_notes(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))
@@ -1766,7 +1994,7 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
     """The PR body lists EVERY SteamID that disappeared from the Vorobey list.
 
     The Vorobey list stores no player names, so the table is exactly
-    ``| SteamID | Profile Link |`` and every link is the Steam profile
+    ``| SteamID | Profile Link | SteamHistory |`` and every link is a SteamID64
     permalink (SteamID64 URL), never a vanity URL or a last-seen name.
     """
 
@@ -1785,10 +2013,11 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
             "**1 SteamID removed from the Vorobey hackerpolice list since the previous snapshot.**",
             report,
         )
-        self.assertIn("| SteamID | Profile Link |", report)
-        self.assertIn("| --- | --- |", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
+        self.assertIn("| --- | --- | --- |", report)
         self.assertIn(
-            "| `[U:1:269327660]` | [Profile](https://steamcommunity.com/profiles/76561198229593388) |",
+            "| `[U:1:269327660]` | [Profile](https://steamcommunity.com/profiles/76561198229593388) "
+            "| [SteamHistory](https://steamhistory.net/id/76561198229593388) |",
             report,
         )
 
@@ -1799,7 +2028,8 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         # No explanatory filler above the table either: heading, then the table.
         self.assertNotIn("stores no player names", report)
         self.assertLess(
-            report.index("removed from the Vorobey hackerpolice list"), report.index("| SteamID | Profile Link |")
+            report.index("removed from the Vorobey hackerpolice list"),
+            report.index("| SteamID | Profile Link | SteamHistory |"),
         )
 
     def test_plural_count_and_numeric_order(self):
@@ -1809,8 +2039,14 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         self.assertEqual(
             rows,
             [
-                "| `[U:1:3]` | [Profile](https://steamcommunity.com/profiles/76561197960265731) |",
-                "| `[U:1:20]` | [Profile](https://steamcommunity.com/profiles/76561197960265748) |",
+                (
+                    "| `[U:1:3]` | [Profile](https://steamcommunity.com/profiles/76561197960265731) "
+                    "| [SteamHistory](https://steamhistory.net/id/76561197960265731) |"
+                ),
+                (
+                    "| `[U:1:20]` | [Profile](https://steamcommunity.com/profiles/76561197960265748) "
+                    "| [SteamHistory](https://steamhistory.net/id/76561197960265748) |"
+                ),
             ],
         )
 
@@ -1834,7 +2070,7 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         self.assertIn("Proof link", lines[-1])
         self.assertIn("nothing else is modified.", lines[-2])
         # The removed table sits above the closing sentence, not below it.
-        self.assertLess(report.index("| Profile Link |"), report.index("nothing else is modified."))
+        self.assertLess(report.index("| Profile Link | SteamHistory |"), report.index("nothing else is modified."))
 
     def test_closing_sentence_names_the_database_that_changed(self):
         change = Change("[U:1:400]", "a", ("suspicious",), ("cheater",))
@@ -1981,6 +2217,25 @@ class ClosingMessageTests(unittest.TestCase):
 
     def test_no_changes(self):
         self.assertEqual(render_closing([]), "; nothing else is modified.")
+
+    def test_closing_sentence_is_bounded_for_a_huge_run(self):
+        limit = report_module.MAX_CLOSING_STEAMIDS
+        at_limit = [Change(f"[U+{n}]", "n", ("suspicious",), ("cheater",)) for n in range(limit)]
+        over = [Change(f"[U+{n}]", "n", ("suspicious",), ("cheater",)) for n in range(limit + 25)]
+        # Exactly at the cap: every ID is named, no "more" suffix.
+        at_cap = render_closing(at_limit, database="db.json")
+        self.assertNotIn("more", at_cap)
+        self.assertIn(f"[U+{limit - 1}]", at_cap)  # the last one is not dropped
+        closing = render_closing(over, database="db.json")
+        self.assertIn(" and 25 more", closing)
+        self.assertIn(f"[U+{limit - 1}]", closing)  # everything up to the cap is named
+        self.assertNotIn(f"[U+{limit}]", closing)  # and nothing past it
+        self.assertLess(len(closing), 4_000)
+
+    def test_closing_sentence_counts_hidden_ids_with_thousands_separators(self):
+        changes = [Change(f"[U+{n}]", "n", ("cheater",), (), kind="demote") for n in range(1_200)]
+        closing = render_closing(changes, database="db.json")
+        self.assertIn("and 1,050 more", closing)
 
 
 # --------------------------------------------------------------------------- #
@@ -2238,7 +2493,7 @@ class CliTests(unittest.TestCase):
 
     def test_report_lists_every_removed_steamid_with_its_permalink(self):
         """Every ID gone from the list since the snapshot appears in the
-        ``| SteamID | Profile Link |`` table -- including ones that were not
+        ``| SteamID | Profile Link | SteamHistory |`` table -- including ones that were not
         demoted because they were never cheaters here, and ones that were
         never in this database at all."""
         self.database.write_text(
@@ -2265,7 +2520,7 @@ class CliTests(unittest.TestCase):
         report = report_file.read_text(encoding="utf-8")
         self.assertEqual(report, stdout)
         self.assertIn("**3 SteamIDs removed from the Vorobey hackerpolice list since the previous snapshot.**", report)
-        self.assertIn("| SteamID | Profile Link |", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
         for account in (300, 400, 500):
             steamid64 = 76561197960265728 + account
             self.assertIn(
@@ -2553,6 +2808,73 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.run_cli("--snapshot", str(self.database))
         self.assertEqual(code, 2)
         self.assertIn("--snapshot and --database must be different files", stderr)
+
+    def test_a_proof_line_cites_at_most_five_links(self):
+        """An upstream entry may list thousands of links; the database must not.
+
+        The full set is always in the pull request, so the ``[auto]`` line keeps
+        only the first few and says how many it left out.
+        """
+        evidence = tuple(f"https://discord.com/channels/1/2/{index}" for index in range(1, 8))
+        player = {"steamid": "[U:1:5]", "attributes": ["cheater"]}
+        policy._write_proof(player, evidence)
+        line = player["proof"][0]
+        self.assertEqual(line.count("https://discord.com/channels/1/2/"), 5)
+        self.assertIn("(+2 more, see the pull request)", line)
+        policy._write_proof(player, evidence)  # idempotent
+        self.assertEqual(player["proof"], [line])
+        self.assertLessEqual(len(line), 400, "the proof line must stay bounded")
+
+    def test_five_or_fewer_proofs_get_no_overflow_note(self):
+        for count in (0, 1, 5):
+            evidence = tuple(f"https://discord.com/channels/1/2/{index}" for index in range(1, count + 1))
+            player = {"steamid": "[U:1:5]", "attributes": ["cheater"]}
+            policy._write_proof(player, evidence)
+            line = player["proof"][0]
+            self.assertEqual(line.count("https://discord.com/channels/1/2/"), count)
+            self.assertNotIn("more, see the pull request", line)
+            self.assertNotIn("+0 more", line)
+
+    def test_a_thousand_proofs_do_not_grow_the_proof_line(self):
+        evidence = tuple(f"https://discord.com/channels/1/2/{index}" for index in range(1, 1001))
+        player = {"steamid": "[U:1:5]", "attributes": ["cheater"]}
+        policy._write_proof(player, evidence)
+        self.assertLess(len(player["proof"][0]), 500)
+        self.assertIn("(+995 more, see the pull request)", player["proof"][0])
+
+    def test_load_index_still_refuses_an_empty_index(self):
+        """Backstop: the chain normally filters these out, the guard stays."""
+        with (
+            mock.patch.object(sync_module, "load_first_available_raw", return_value=({"players": []}, "src", b"{}")),
+            self.assertRaises(SyncError) as caught,
+        ):
+            sync_module._load_index(SimpleNamespace(source=["x"]))
+        self.assertIn("no usable SteamIDs", str(caught.exception))
+
+    def test_a_cancelled_write_leaves_no_temp_file(self):
+        """Ctrl-C mid-write must not leave junk in the repository."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "playerlist.json"
+            target.write_text("original\n", encoding="utf-8")
+            with mock.patch("os.fsync", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+                sync_module._atomic_write_bytes(target, b"new\n")
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+            self.assertEqual(os.listdir(tmp), ["playerlist.json"])
+
+    def test_a_failed_write_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "playerlist.json"
+            target.write_text("original\n", encoding="utf-8")
+            with mock.patch("os.fsync", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                sync_module._atomic_write_bytes(target, b"new\n")
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+            self.assertEqual(os.listdir(tmp), ["playerlist.json"])
+
+    def test_plain_http_source_is_a_clean_error(self):
+        code, _, stderr = self.run_cli("--source", "http://example.invalid/list.json")
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to fetch a non-HTTPS URL", stderr)
+        self.assertNotIn("Traceback", stderr)
 
     def test_unwritable_report_path_is_a_clean_error(self):
         report_dir = self.root / "report-dir"
@@ -2990,6 +3312,24 @@ class NormalizeSteamIdTests(unittest.TestCase):
         self.assertIsNone(steam_profile_url("nope"))
         self.assertIsNone(steam_profile_url(None))
 
+    def test_absurdly_long_steamid_is_refused_without_parsing_it(self):
+        """Thousands of digits would trip Python's int-parsing limit and crash.
+
+        The ASCII + 10-digit guard rejects them before int() is ever called, so
+        a corrupted or hostile file cannot take the run down.
+        """
+        self.assertIsNone(normalize_steamid("[U:1:" + "9" * 5_000 + "]"))
+        self.assertIsNone(normalize_steamid("9" * 5_000))
+        self.assertIsNone(normalize_steamid(int("9" * 400)))
+
+    def test_steam_history_url(self):
+        # Same SteamID64 as the Steam Community permalink, on SteamHistory's /id/ page.
+        self.assertEqual(steam_history_url("[U:1:269327660]"), "https://steamhistory.net/id/76561198229593388")
+        self.assertEqual(steam_history_url("STEAM_0:1:865008"), "https://steamhistory.net/id/76561197961995745")
+        self.assertEqual(steam_history_url(76561198229593388), "https://steamhistory.net/id/76561198229593388")
+        self.assertIsNone(steam_history_url("nope"))
+        self.assertIsNone(steam_history_url(None))
+
 
 class PluralTests(unittest.TestCase):
     def test_singular(self):
@@ -3045,6 +3385,17 @@ class SerialisationTests(unittest.TestCase):
         self.assertNotIn("н", rendered)
         self.assertEqual(json.loads(rendered), database)
         self.assertEqual(dumps(json.loads(rendered)), rendered)
+
+    def test_keys_are_written_in_sorted_order(self):
+        """The committed file is key-sorted; an unsorted dump would rewrite it.
+
+        Nothing else pins this down: dict equality ignores order, so a dump that
+        kept insertion order would still round-trip and still parse.
+        """
+        rendered = dumps({"z": 1, "players": [], "a": {"y": 2, "b": 3}})
+        self.assertLess(rendered.index('"a"'), rendered.index('"players"'))
+        self.assertLess(rendered.index('"players"'), rendered.index('"z"'))
+        self.assertLess(rendered.index('"b"'), rendered.index('"y"'))
 
     def test_load_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -210,14 +210,21 @@ def _too_large(source: str) -> SyncError:
 
 
 def _fetch_bytes(url: str) -> bytes:
-    """GET a URL and return the body bytes VERBATIM, retrying transient failures.
+    """GET an HTTPS URL and return the body bytes VERBATIM, retrying transient failures.
 
     Permanent client errors (4xx other than 429) are not retried -- they
     will fail identically on every attempt, and the caller falls back to
     the next source instead.
+
+    Only ``https://`` is fetched (bytes over plain HTTP are not trustworthy,
+    and this file decides promotions); a local path is the offline option.
     """
-    if not url.startswith(("https://", "http://")):
-        raise SyncError(f"refusing to fetch non-HTTP(S) URL: {redact_url(url)}")
+    if not url.startswith("https://"):
+        # Plain HTTP is refused even when the operator passes the URL
+        # explicitly: this file decides who gets promoted, so its transport is
+        # part of the trust model (a network attacker could otherwise inject
+        # entries). Local mirrors stay supported as a path.
+        raise SyncError(f"refusing to fetch a non-HTTPS URL (use https:// or a local path): {redact_url(url)}")
     last_error: Exception | None = None
     for attempt in range(1, FETCH_ATTEMPTS + 1):
         try:
@@ -380,6 +387,14 @@ def _resolve_indirect_document(document: dict[str, Any], source: str) -> tuple[d
     return None
 
 
+def _has_usable_steamids(document: dict[str, Any]) -> bool:
+    """True when at least one entry carries a SteamID this tool can normalise."""
+    players = document.get("players")
+    if not isinstance(players, list):
+        return False
+    return any(isinstance(entry, dict) and normalize_steamid(entry.get("steamid")) is not None for entry in players)
+
+
 def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], str, bytes]:
     """Return the parsed document, source name, and RAW bytes of the first usable source.
 
@@ -405,6 +420,12 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
                 )
                 continue
             document, raw = resolved
+        if not _has_usable_steamids(document):
+            # A 200 with an empty or all-garbage list is a broken mirror, not
+            # "nobody is listed": try the next source instead of stopping here,
+            # where a healthy fallback could still answer.
+            failures.append(f"{redact_url(source)}: no usable SteamIDs in its 'players' array")
+            continue
         return document, source, raw
 
     raise SyncError("cannot load the Vorobey hackerpolice list:\n  " + "\n  ".join(failures))

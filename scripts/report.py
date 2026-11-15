@@ -10,11 +10,14 @@ untrusted-output as well as untrusted-input territory:
   pipes and newlines cannot break the table, brackets cannot forge a link,
   angle brackets cannot inject HTML, and ``@`` cannot trigger a mention;
 * every table is row-capped, and the whole body has a hard length guard,
-  because GitHub rejects pull request bodies over 65,536 characters;
+  because GitHub rejects pull request bodies over 65,536 characters. A report
+  that would exceed the budget drops more rows (announced with an "and N more"
+  note) instead of being cut off, so the closing sentence and the removed
+  SteamIDs always survive;
 * the closing sentence names the database that changed exactly once.
 
 Order of the body: header bullets, promotions, demotions, the SteamIDs
-removed from the upstream list (``| SteamID | Profile Link |``), and
+removed from the upstream list (``| SteamID | Profile Link | SteamHistory |``), and
 finally the closing sentence + proof note.
 """
 
@@ -26,12 +29,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from playerlist import account_id, steam_profile_url
+from playerlist import account_id, steam_history_url, steam_profile_url
 from policy import Change
 from sources import SOURCE_REPO_URL, redact_url
 
 __all__ = [
     "MAX_CHANGE_TABLE_ROWS",
+    "MAX_CLOSING_STEAMIDS",
+    "MAX_EVIDENCE_LINKS",
+    "MAX_NAME_CHARS",
     "MAX_REMOVED_TABLE_ROWS",
     "MAX_REPORT_BYTES",
     "RunInfo",
@@ -42,16 +48,31 @@ __all__ = [
 ]
 
 # GitHub rejects a pull request body longer than 65,536 characters. Change
-# tables are capped, the removed table is capped, and the finished body is
-# hard-truncated as a last resort, so publishing the PR can never fail on
-# size -- however big a single run turns out to be.
+# tables are capped, the removed table is capped, an oversized body is
+# re-rendered with smaller caps (see _SHRINK_STEPS), and a hard truncation is
+# the last resort, so publishing the PR can never fail on size -- however big a
+# single run turns out to be.
 MAX_CHANGE_TABLE_ROWS = 150
 MAX_REMOVED_TABLE_ROWS = 100
+# The closing sentence names the changed SteamIDs too. A run with thousands of
+# changes would spend the whole byte budget there (and stop being readable), so
+# each clause names at most this many and says how many follow.
+MAX_CLOSING_STEAMIDS = 150
 # GitHub rejects a pull request body over 65,536 BYTES, and the body doubles
 # as the job summary, so the budget is measured in bytes with room to spare.
 # Characters would be the wrong unit: 30,000 Cyrillic player names are half the
 # character budget and twice the byte budget.
 MAX_REPORT_BYTES = 60_000
+# One cell can be as big as the data behind it, and a single enormous row
+# defeats every row cap: the body then gets hard-truncated and the run loses the
+# closing sentence and the removed-SteamID list it exists to publish. Two caps
+# keep one row small enough that the row caps stay in charge:
+#   * proof links shown per row (the pull request is a review list, not an
+#     archive; the list is only ever read a few links at a time),
+#   * player-name characters (Steam names are at most 32 characters, so a much
+#     longer one is abnormal -- the profile link still carries the identity).
+MAX_EVIDENCE_LINKS = 10
+MAX_NAME_CHARS = 80
 
 # Characters that would break a Markdown link target.
 # "|" is percent-encoded too: a raw pipe inside a table cell ends the cell, so a
@@ -85,9 +106,9 @@ _CODE_ESCAPES = str.maketrans({"\\": "\\\\", "|": "\\|", "`": "\\`"})
 # (it is serialised with ensure_ascii, which re-escapes them losslessly).
 _SURROGATES_RE = re.compile(r"[\ud800-\udfff]")
 
-PROMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "Hackerpolice proof")
-DEMOTION_HEADER = ("SteamID", "Last known name", "Before", "After")
-REMOVED_HEADER = ("SteamID", "Profile Link")
+PROMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "Hackerpolice proof", "SteamHistory")
+DEMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "SteamHistory")
+REMOVED_HEADER = ("SteamID", "Profile Link", "SteamHistory")
 
 # Display default only: the CLI always passes the real --snapshot path in
 # RunInfo, so a custom path is reported correctly instead of the default.
@@ -157,7 +178,10 @@ def _name_cell(change: Change) -> str:
     # UNKNOWN only when there is genuinely no recorded name; a player
     # actually named "-" (or similar) keeps their name. _cell() escapes the
     # brackets that would otherwise break the link text.
-    label = "UNKNOWN" if not change.name.strip() else _cell(change.name)
+    name = change.name
+    if len(name) > MAX_NAME_CHARS:
+        name = name[:MAX_NAME_CHARS].rstrip() + "…"  # cut BEFORE escaping
+    label = "UNKNOWN" if not name.strip() else _cell(name)
     url = steam_profile_url(change.steamid)
     if url is None:
         return label
@@ -183,14 +207,28 @@ def _markdown_link(url: str, label: str) -> str:
 
 
 def _evidence_cell(links: Sequence[str]) -> str:
-    """Proof column: real links where possible, escaped text otherwise."""
+    """Proof column: real links where possible, escaped text otherwise.
+
+    Each link is labelled "proof" (or "proof 1", "proof 2" when there are
+    several) so it is obvious what clicking it opens; several are listed side
+    by side rather than separated by an HTML ``<br>``, because the report never
+    emits raw HTML -- a cell then renders the same in a pull request, in a job
+    summary and in any plain Markdown preview, where a tag would show as text.
+    """
     if not links:
         return "-"
+    shown = links[:MAX_EVIDENCE_LINKS]
+    single = len(shown) == 1
     rendered = [
-        _markdown_link(link, "link" if len(links) == 1 else str(position)) if _is_url(link) else _cell(link)
-        for position, link in enumerate(links, start=1)
+        _markdown_link(link, "proof" if single else f"proof {position}") if _is_url(link) else _cell(link)
+        for position, link in enumerate(shown, start=1)
     ]
-    return "<br>".join(rendered)
+    cell = ", ".join(rendered)
+    hidden = len(links) - len(shown)
+    if hidden:
+        # Plain text, not a link: it must never look clickable.
+        cell += f", and {_count(hidden)} more"
+    return cell
 
 
 def plural(count: int, singular: str, plural_form: str) -> str:
@@ -219,6 +257,11 @@ def _capped(rows: Sequence[str], limit: int, singular: str, plural_form: str) ->
     return list(rows[:limit]), note
 
 
+def _row(cells: Sequence[str]) -> str:
+    """Render one table row from already-escaped cells (one string per column)."""
+    return "| " + " | ".join(cells) + " |"
+
+
 def _table(header: Sequence[str], rows: Sequence[str], overflow_note: str | None = None) -> list[str]:
     """Render a Markdown table, plus an optional overflow note underneath."""
     lines = [
@@ -242,34 +285,53 @@ def _sorted_steamids(steamids: Sequence[str]) -> list[str]:
     return sorted(steamids, key=_steamid_sort_key)
 
 
+def _steamid_list(steamids: Sequence[str], limit: int = MAX_CLOSING_STEAMIDS) -> str:
+    """Comma-separated SteamIDs, shortened with ``and N more`` past ``limit``."""
+    if len(steamids) <= limit:
+        return ", ".join(steamids)
+    return ", ".join(steamids[:limit]) + f" and {_count(len(steamids) - limit)} more"
+
+
 def _change_sort_key(change: Change) -> tuple[bool, int]:
     """Order report rows by numeric SteamID."""
     return _steamid_sort_key(change.steamid)
 
 
+def _permalink_cell(url: str | None, label: str) -> str:
+    """A Markdown link to ``url``, or ``-`` when it cannot be built."""
+    return "-" if url is None else _markdown_link(url, label)
+
+
 def _profile_cell(steamid: str) -> str:
     """Steam profile permalink for one SteamID, or ``-`` if it cannot be built."""
-    url = steam_profile_url(steamid)
-    if url is None:
-        return "-"
-    return _markdown_link(url, "Profile")
+    return _permalink_cell(steam_profile_url(steamid), "Profile")
 
 
-def render_removed_table(steamids: Sequence[str]) -> list[str]:
+def _steam_history_cell(steamid: str) -> str:
+    """SteamHistory page for one SteamID, or ``-`` if it cannot be built.
+
+    SteamHistory keeps a profile's history (past names, avatars, bans), so the
+    reviewer can see who a demoted or promoted player is even after a rename.
+    """
+    return _permalink_cell(steam_history_url(steamid), "SteamHistory")
+
+
+def render_removed_table(steamids: Sequence[str], limit: int = MAX_REMOVED_TABLE_ROWS) -> list[str]:
     """Render the "removed from the Vorobey list" table as Markdown lines.
 
-    Vorobey's list records no player names, so the table is exactly
-    ``| SteamID | Profile Link |``: the SteamID in canonical ``[U:1:x]``
-    form and the Steam Community profile *permalink* (the SteamID64 URL),
-    which keeps working even when the player renames themselves.
+    Vorobey's list records no player names, so the table is
+    ``| SteamID | Profile Link | SteamHistory |``: the SteamID in canonical
+    ``[U:1:x]`` form, the Steam Community profile *permalink* and the
+    SteamHistory page (both SteamID64 URLs, so they keep working even when the
+    player renames themselves).
     """
     if not steamids:
         return []
 
     ordered = _sorted_steamids(steamids)
     count = len(ordered)
-    rows = [f"| {_steamid_cell(steamid)} | {_profile_cell(steamid)} |" for steamid in ordered]
-    rows, overflow = _capped(rows, MAX_REMOVED_TABLE_ROWS, "SteamID", "SteamIDs")
+    rows = [_row((_steamid_cell(steamid), _profile_cell(steamid), _steam_history_cell(steamid))) for steamid in ordered]
+    rows, overflow = _capped(rows, limit, "SteamID", "SteamIDs")
     headline = (
         f"**{_count(count)} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey hackerpolice list "
         "since the previous snapshot.**"
@@ -282,9 +344,9 @@ def render_removed_table(steamids: Sequence[str]) -> list[str]:
     ]
 
 
-def _with_removed_table(lines: list[str], steamids: Sequence[str]) -> list[str]:
+def _with_removed_table(lines: list[str], steamids: Sequence[str], limit: int = MAX_REMOVED_TABLE_ROWS) -> list[str]:
     """Append the removed table to an already rendered report body."""
-    table = render_removed_table(steamids)
+    table = render_removed_table(steamids, limit)
     if not table:
         return lines
     while lines and not lines[-1].strip():
@@ -319,7 +381,7 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
     def clause(head: str, target: str, steamids: list[str]) -> str:
         if database is None:
             head = head[:1].upper() + head[1:]  # standalone sentence starts capitalised
-        return f"{head} for {target}: " + ", ".join(steamids)
+        return f"{head} for {target}: " + _steamid_list(steamids)
 
     parts: list[str] = []
     if changed_steamids:
@@ -435,14 +497,22 @@ def _header_lines(info: RunInfo) -> list[str]:
     return lines
 
 
-def _promotion_lines(promotions: Sequence[Change]) -> list[str]:
+def _promotion_lines(promotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS) -> list[str]:
     """Render the "promoted to cheater" table block."""
     rows = [
-        f"| {_steamid_cell(change.steamid)} | {_name_cell(change)} | {_attributes_cell(change.before)} "
-        f"| {_attributes_cell(change.after)} | {_evidence_cell(change.evidence)} |"
+        _row(
+            (
+                _steamid_cell(change.steamid),
+                _name_cell(change),
+                _attributes_cell(change.before),
+                _attributes_cell(change.after),
+                _evidence_cell(change.evidence),
+                _steam_history_cell(change.steamid),
+            )
+        )
         for change in promotions
     ]
-    rows, overflow = _capped(rows, MAX_CHANGE_TABLE_ROWS, "entry", "entries")
+    rows, overflow = _capped(rows, limit, "entry", "entries")
     count = len(promotions)
     return [
         f"**{_count(count)} {plural(count, 'entry', 'entries')} promoted to `cheater`.**",
@@ -452,14 +522,21 @@ def _promotion_lines(promotions: Sequence[Change]) -> list[str]:
     ]
 
 
-def _demotion_lines(demotions: Sequence[Change]) -> list[str]:
+def _demotion_lines(demotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS) -> list[str]:
     """Render the "demoted" table block."""
     rows = [
-        f"| {_steamid_cell(change.steamid)} | {_name_cell(change)} | {_attributes_cell(change.before)} "
-        f"| {_attributes_cell(change.after) or 'entry removed'} |"
+        _row(
+            (
+                _steamid_cell(change.steamid),
+                _name_cell(change),
+                _attributes_cell(change.before),
+                _attributes_cell(change.after) or "entry removed",
+                _steam_history_cell(change.steamid),
+            )
+        )
         for change in demotions
     ]
-    rows, overflow = _capped(rows, MAX_CHANGE_TABLE_ROWS, "entry", "entries")
+    rows, overflow = _capped(rows, limit, "entry", "entries")
     count = len(demotions)
     headline = (
         f"**{_count(count)} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
@@ -507,8 +584,8 @@ def _fit_body(text: str) -> str:
     return (keep[:cut] if cut > 0 else keep) + note
 
 
-def render_report(info: RunInfo) -> str:
-    """Render the PR body / job summary as Markdown."""
+def _render_body(info: RunInfo, change_limit: int, removed_limit: int) -> str:
+    """Render the body with at most ``change_limit``/``removed_limit`` rows per table."""
     lines = _header_lines(info)
 
     # Numeric SteamID order: the same run always renders the same table, and
@@ -521,16 +598,16 @@ def render_report(info: RunInfo) -> str:
             lines += ["**No database changes** (snapshot refresh only).", ""]
         else:
             lines += ["**No changes.**", ""]
-        return _safe(_fit_body("\n".join(_with_removed_table(lines, info.removed_upstream))))
+        return "\n".join(_with_removed_table(lines, info.removed_upstream, removed_limit))
 
     if promotions:
-        lines += _promotion_lines(promotions)
+        lines += _promotion_lines(promotions, change_limit)
     if demotions:
-        lines += _demotion_lines(demotions)
+        lines += _demotion_lines(demotions, change_limit)
 
     # Upstream removals first: the closing sentence and the proof note that
     # follow are always the last thing in the report.
-    lines = _with_removed_table(lines, info.removed_upstream)
+    lines = _with_removed_table(lines, info.removed_upstream, removed_limit)
 
     closing = render_closing(info.changes, database=info.database_name)
 
@@ -556,4 +633,39 @@ def render_report(info: RunInfo) -> str:
         )
         lines.append(note)
     lines.append("")
-    return _safe(_fit_body("\n".join(lines)))
+    return "\n".join(lines)
+
+
+# Tried in order when a report would exceed MAX_REPORT_BYTES. Rows are dropped
+# (each drop is announced with an "and N more" note) instead of the body being
+# cut off, because the closing sentence and the removed-SteamID list are what
+# the pull request exists to communicate. The change tables shrink first --
+# the same changes are visible in the PR's own diff -- and the removed list
+# only after them; the last resort is one row per table, and _fit_body() after
+# that for a single row that is itself enormous.
+_SHRINK_STEPS: tuple[tuple[int, int], ...] = (
+    (100, MAX_REMOVED_TABLE_ROWS),
+    (50, MAX_REMOVED_TABLE_ROWS),
+    (25, MAX_REMOVED_TABLE_ROWS),
+    (10, MAX_REMOVED_TABLE_ROWS),
+    (5, MAX_REMOVED_TABLE_ROWS),
+    (1, MAX_REMOVED_TABLE_ROWS),
+    (1, 50),
+    (1, 10),
+    (1, 1),
+)
+
+
+def render_report(info: RunInfo) -> str:
+    """Render the PR body / job summary as Markdown.
+
+    Tables are capped, and a report that would still exceed the byte budget is
+    re-rendered with fewer rows rather than truncated, so it always ends with
+    its closing sentence.
+    """
+    text = _render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS)
+    for change_limit, removed_limit in _SHRINK_STEPS:
+        if _utf8_len(text) <= MAX_REPORT_BYTES:
+            break
+        text = _render_body(info, change_limit, removed_limit)
+    return _safe(_fit_body(text))

@@ -20,8 +20,9 @@ mass-demotion guard -- because advancing it would forget those removals.
 
 The report (pull request body / job summary) lists every SteamID that
 disappeared from the upstream list since the previous snapshot, as a
-``| SteamID | Profile Link |`` table -- the upstream list stores no player
-names, so each ID is shown with its Steam profile permalink.
+``| SteamID | Profile Link | SteamHistory |`` table -- the upstream list
+stores no player names, so each ID is shown with its Steam profile
+permalink and its SteamHistory page.
 
 Usage:
     python3 scripts/sync_vorobey_hackerpolice.py --dry-run
@@ -89,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--source",
         action="append",
         metavar="URL_OR_PATH",
-        help="Vorobey hackerpolice list URL or local path; repeat for fallbacks (default: built-in GitHub URLs)",
+        help="Vorobey hackerpolice list HTTPS URL or local path; repeat for fallbacks (default: built-in GitHub URLs)",
     )
     parser.add_argument("--report", metavar="PATH", help="also write the Markdown summary to this file")
     parser.add_argument("--dry-run", action="store_true", help="report what would change without writing the database")
@@ -204,9 +205,14 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         tmp.chmod(stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o644)
         tmp.replace(target)
         _fsync_directory(target.parent)  # make the rename itself durable
-    except OSError:
-        tmp.unlink(missing_ok=True)  # never leave a stale .tmp file behind
-        raise
+    finally:
+        # Runs on success as well, where the rename already moved the file and
+        # this is a no-op. Any other outcome -- OSError, Ctrl-C, SystemExit --
+        # deletes the temp file, so an interrupted run cannot leave a stray
+        # .tmp file in the repository. (SIGTERM has no Python handler: the
+        # process dies at once. The runners are ephemeral and both git add calls
+        # name their paths, so nothing is committed from such a run.)
+        tmp.unlink(missing_ok=True)
 
 
 def write_database(path: Path, rendered: str | PlayerList, original: str, *, dry_run: bool) -> bool:
@@ -430,8 +436,11 @@ def run(args: argparse.Namespace) -> int:
         )
     )
     if args.report:
+        # Written atomically, like the database and the snapshot: this same file
+        # is the pull request body, so a crash or a full disk must never leave a
+        # half-written report for the next step to publish.
         try:
-            Path(args.report).write_text(report + "\n", encoding="utf-8")
+            _atomic_write_bytes(Path(args.report), (report + "\n").encode("utf-8"))
         except OSError as exc:
             raise SyncError(f"cannot write report {args.report}: {exc}") from exc
     print(report)

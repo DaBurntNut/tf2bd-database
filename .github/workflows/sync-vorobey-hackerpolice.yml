@@ -15,8 +15,8 @@ name: Sync Vorobey hackerpolice
 # links are shown in the pull request only - they are never written into
 # playerlist.garou3299.json.
 # The pull request also lists EVERY SteamID removed from the hackerpolice list
-# since the previous snapshot (| SteamID | Profile Link | with the Steam
-# profile permalink), because that list stores no player names.
+# since the previous snapshot (| SteamID | Profile Link | SteamHistory |, with
+# the Steam profile permalink), because that list stores no player names.
 # The snapshot is only advanced when the removals it found were applied: a run
 # without --demote, or one vetoed by the mass-demotion guard, keeps the old
 # baseline so those removals stay demotion candidates. The snapshot is refreshed to the current list in the SAME
@@ -39,7 +39,10 @@ name: Sync Vorobey hackerpolice
 
 on:
   schedule:
-    # DAILY at 05:23 UTC (GitHub may delay scheduled runs by a few minutes).
+    # DAILY at 05:23 UTC. GitHub may delay a scheduled run (high load at the top
+    # of the hour; measured delays in this project ranged from 40 minutes to 8
+    # hours), and may drop one entirely under heavy load -- which is why the
+    # minute is 23 and not 00.
     # For a WEEKLY run instead, comment the line below and uncomment the next one
     # (Mondays at 05:23 UTC):
     - cron: "23 5 * * *"
@@ -77,10 +80,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-
-concurrency:
-  group: sync-vorobey-hackerpolice
-  cancel-in-progress: false
 
 jobs:
   # Read-only sibling of the sync job: runs the same lint + test steps on a
@@ -127,6 +126,13 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Only sync runs share a group: two of them must never write the database
+    # at once. This sits on the JOB, not on the workflow: a workflow-level
+    # group would make pull-request check runs queue behind the nightly sync,
+    # which is exactly what the `checks` job's own group exists to avoid.
+    concurrency:
+      group: sync-vorobey-hackerpolice
+      cancel-in-progress: false
     env:
       DATABASE: playerlist.garou3299.json
       SNAPSHOT: snapshot/playerlist.vorobey-hackerpolice.json
@@ -165,14 +171,18 @@ jobs:
         env:
           DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
           ALLOW_MASS_DEMOTION: ${{ inputs.allow_mass_demotion && '--allow-mass-demotion' || '' }}
-        run: >
-          python3 scripts/sync_vorobey_hackerpolice.py
-          --database "$DATABASE"
-          --snapshot "$SNAPSHOT"
-          --report "$RUNNER_TEMP/hackerpolice-sync-report.md"
-          $DRY_RUN
-          $ALLOW_MASS_DEMOTION
-          --demote
+        run: |
+          # $DRY_RUN / $ALLOW_MASS_DEMOTION are deliberately UNQUOTED: they are
+          # either a flag or empty, and an empty-but-quoted "$DRY_RUN" would be
+          # passed to the script as an empty argument, which argparse rejects.
+          # shellcheck disable=SC2086
+          python3 scripts/sync_vorobey_hackerpolice.py \
+            --database "$DATABASE" \
+            --snapshot "$SNAPSHOT" \
+            --report "$RUNNER_TEMP/hackerpolice-sync-report.md" \
+            $DRY_RUN \
+            $ALLOW_MASS_DEMOTION \
+            --demote
 
       - name: Show report in the job summary
         if: always()
@@ -207,6 +217,10 @@ jobs:
 
       - name: Push branch and link a manual pull request
         if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE != 'commit' && steps.pr.outcome == 'failure'
+        env:
+          # Never interpolate an expression straight into a shell line: pass it
+          # through the environment and let the shell quote it.
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -225,7 +239,7 @@ jobs:
           git fetch --quiet origin "$BOT_BRANCH" || true
           git push --force-with-lease --set-upstream origin "$BOT_BRANCH"
 
-          compare_url="https://github.com/${{ github.repository }}/compare/$BASE_BRANCH...$BOT_BRANCH?expand=1"
+          compare_url="https://github.com/$REPOSITORY/compare/$BASE_BRANCH...$BOT_BRANCH?expand=1"
           {
             echo ""
             echo "### Pull request could not be created automatically"

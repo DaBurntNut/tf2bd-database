@@ -19,8 +19,9 @@ Send a permanent Steam profile link or ID **with video evidence** to
 
 ## What the bot does
 
-Every day at **05:23 UTC** it compares this database with Vorobey's list and
-opens a pull request. **Nothing changes until you merge it.** It can also be run
+Every day at **05:23 UTC** (GitHub can delay the run) it compares this database
+with Vorobey's list and opens a pull request. **Nothing changes until you merge
+it.** It can also be run
 by hand (**Actions → Run workflow**) as a pull request, a direct commit or a dry
 run.
 
@@ -37,13 +38,18 @@ run.
 | `cheater` + `racist` | `racist` kept; `cheater` and its proofs removed |
 | `cheater` + any other tag | entry removed |
 
+The bot only ever edits entries that are already in the database: a SteamID that
+is on Vorobey's list but missing here is **not** added.
+
 Only players who were in the previous snapshot and are gone now are demoted, so
 **cheaters added by hand are never touched**. Every removed SteamID is listed in
-the pull request with its profile link. `snapshot/playerlist.vorobey-hackerpolice.json`
+the pull request with its profile link, and every table also links each player's
+[SteamHistory](https://steamhistory.net/) page. `snapshot/playerlist.vorobey-hackerpolice.json`
 is yesterday's copy of Vorobey's list — the bot compares against it to know who
 was removed, and updates it in the same pull request. Evidence links stay in the
 pull request; they reach the database only if you run the script yourself with
-`--include-proof`.
+`--include-proof`, which cites the first five (the full list stays in the pull
+request).
 
 ## Safety rails
 
