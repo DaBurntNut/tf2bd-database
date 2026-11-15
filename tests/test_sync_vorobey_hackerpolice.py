@@ -1810,6 +1810,29 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report.count("| [Profile]("), 100)
         report.encode("utf-8")
 
+    def test_the_report_drops_the_fewest_rows_that_fit(self):
+        """Shrinking must not throw away more rows than the budget requires."""
+        changes = [Change(f"[U:1:{1000 + n}]", "x" * 900, ("suspicious",), ("cheater",)) for n in range(200)]
+        info = self.info(changes, removed_upstream=tuple(f"[U:1:{5000 + n}]" for n in range(100)))
+        report = render_report(info)
+        shown = sum(1 for line in report.splitlines() if line.startswith("| `[U:1:1"))
+        caps = (MAX_CHANGE_TABLE_ROWS, 100, 50, 25, 10, 5, 1)
+        largest_that_fits = next(
+            cap
+            for cap in caps
+            if len(report_module._render_body(info, cap, MAX_REMOVED_TABLE_ROWS).encode("utf-8")) <= MAX_REPORT_BYTES
+        )
+        self.assertEqual(shown, largest_that_fits)
+
+    def test_a_huge_demotion_table_shrinks_like_the_promotion_one(self):
+        changes = [Change(f"[U:1:{2000 + n}]", "y" * 900, ("cheater",), (), kind="demote") for n in range(200)]
+        report = render_report(self.info(changes))
+        shown = sum(1 for line in report.splitlines() if line.startswith("| `[U:1:2"))
+        self.assertLess(shown, len(changes))
+        self.assertIn("more entries not shown here", report)
+        self.assertIn("; nothing else is modified.", report)
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+
     def test_a_single_enormous_row_is_still_cut_as_the_very_last_resort(self):
         """One cell too big for any row cap: only then is the body truncated."""
         change = Change("[U:1:1]", "x" * 70_000, ("suspicious",), ("cheater",))
@@ -2071,9 +2094,13 @@ class ClosingMessageTests(unittest.TestCase):
         at_limit = [Change(f"[U+{n}]", "n", ("suspicious",), ("cheater",)) for n in range(limit)]
         over = [Change(f"[U+{n}]", "n", ("suspicious",), ("cheater",)) for n in range(limit + 25)]
         # Exactly at the cap: every ID is named, no "more" suffix.
-        self.assertNotIn("more", render_closing(at_limit, database="db.json"))
+        at_cap = render_closing(at_limit, database="db.json")
+        self.assertNotIn("more", at_cap)
+        self.assertIn(f"[U+{limit - 1}]", at_cap)  # the last one is not dropped
         closing = render_closing(over, database="db.json")
         self.assertIn(" and 25 more", closing)
+        self.assertIn(f"[U+{limit - 1}]", closing)  # everything up to the cap is named
+        self.assertNotIn(f"[U+{limit}]", closing)  # and nothing past it
         self.assertLess(len(closing), 4_000)
 
     def test_closing_sentence_counts_hidden_ids_with_thousands_separators(self):
@@ -3089,6 +3116,16 @@ class NormalizeSteamIdTests(unittest.TestCase):
         self.assertIsNone(steam_profile_url("nope"))
         self.assertIsNone(steam_profile_url(None))
 
+    def test_absurdly_long_steamid_is_refused_without_parsing_it(self):
+        """Thousands of digits would trip Python's int-parsing limit and crash.
+
+        The ASCII + 10-digit guard rejects them before int() is ever called, so
+        a corrupted or hostile file cannot take the run down.
+        """
+        self.assertIsNone(normalize_steamid("[U:1:" + "9" * 5_000 + "]"))
+        self.assertIsNone(normalize_steamid("9" * 5_000))
+        self.assertIsNone(normalize_steamid(int("9" * 400)))
+
     def test_steam_history_url(self):
         # Same SteamID64 as the Steam Community permalink, on SteamHistory's /id/ page.
         self.assertEqual(steam_history_url("[U:1:269327660]"), "https://steamhistory.net/id/76561198229593388")
@@ -3152,6 +3189,17 @@ class SerialisationTests(unittest.TestCase):
         self.assertNotIn("н", rendered)
         self.assertEqual(json.loads(rendered), database)
         self.assertEqual(dumps(json.loads(rendered)), rendered)
+
+    def test_keys_are_written_in_sorted_order(self):
+        """The committed file is key-sorted; an unsorted dump would rewrite it.
+
+        Nothing else pins this down: dict equality ignores order, so a dump that
+        kept insertion order would still round-trip and still parse.
+        """
+        rendered = dumps({"z": 1, "players": [], "a": {"y": 2, "b": 3}})
+        self.assertLess(rendered.index('"a"'), rendered.index('"players"'))
+        self.assertLess(rendered.index('"players"'), rendered.index('"z"'))
+        self.assertLess(rendered.index('"b"'), rendered.index('"y"'))
 
     def test_load_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
