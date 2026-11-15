@@ -2851,6 +2851,25 @@ class CliTests(unittest.TestCase):
             sync_module._load_index(SimpleNamespace(source=["x"]))
         self.assertIn("no usable SteamIDs", str(caught.exception))
 
+    def test_a_cancelled_write_leaves_no_temp_file(self):
+        """Ctrl-C mid-write must not leave junk in the repository."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "playerlist.json"
+            target.write_text("original\n", encoding="utf-8")
+            with mock.patch("os.fsync", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+                sync_module._atomic_write_bytes(target, b"new\n")
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+            self.assertEqual(os.listdir(tmp), ["playerlist.json"])
+
+    def test_a_failed_write_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "playerlist.json"
+            target.write_text("original\n", encoding="utf-8")
+            with mock.patch("os.fsync", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                sync_module._atomic_write_bytes(target, b"new\n")
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+            self.assertEqual(os.listdir(tmp), ["playerlist.json"])
+
     def test_plain_http_source_is_a_clean_error(self):
         code, _, stderr = self.run_cli("--source", "http://example.invalid/list.json")
         self.assertEqual(code, 2)

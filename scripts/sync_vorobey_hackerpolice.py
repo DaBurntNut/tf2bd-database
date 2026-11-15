@@ -205,9 +205,14 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         tmp.chmod(stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o644)
         tmp.replace(target)
         _fsync_directory(target.parent)  # make the rename itself durable
-    except OSError:
-        tmp.unlink(missing_ok=True)  # never leave a stale .tmp file behind
-        raise
+    finally:
+        # Runs on success as well, where the rename already moved the file and
+        # this is a no-op. Any other outcome -- OSError, Ctrl-C, SystemExit --
+        # deletes the temp file, so an interrupted run cannot leave a stray
+        # .tmp file in the repository. (SIGTERM has no Python handler: the
+        # process dies at once. The runners are ephemeral and both git add calls
+        # name their paths, so nothing is committed from such a run.)
+        tmp.unlink(missing_ok=True)
 
 
 def write_database(path: Path, rendered: str | PlayerList, original: str, *, dry_run: bool) -> bool:
