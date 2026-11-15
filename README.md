@@ -37,6 +37,9 @@ run.
 | `cheater` + `racist` | `racist` kept; `cheater` and its proofs removed |
 | `cheater` + any other tag | entry removed |
 
+The bot only ever edits entries that are already in the database: a SteamID that
+is on Vorobey's list but missing here is **not** added.
+
 Only players who were in the previous snapshot and are gone now are demoted, so
 **cheaters added by hand are never touched**. Every removed SteamID is listed in
 the pull request with its profile link, and every table also links each player's
