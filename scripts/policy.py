@@ -7,6 +7,10 @@ are removed entirely -- but ONLY for SteamIDs explicitly handed to
 snapshot, gone from the current one). A SteamID that was never on the
 hackerpolice list is never demoted: most ``cheater`` entries in this
 database were added manually and must survive every sync.
+
+No proof is ever written by this module. The evidence links the hackerpolice
+list records are carried in the ``Change`` records and published in the pull
+request only, so a promotion can never add a proof line to an entry.
 """
 
 from __future__ import annotations
@@ -23,14 +27,13 @@ from playerlist import (
     player_name,
     sort_players,
 )
-from sources import PROOF_MARKER, SOURCE_REPO_URL, HackerpoliceIndex
+from sources import HackerpoliceIndex
 
 PROMOTABLE_ATTRIBUTES = frozenset({"suspicious", "racist"})
 DROPPED_ATTRIBUTE = "suspicious"
 PROMOTED_TO = "cheater"
 
 __all__ = [
-    "MAX_EMBEDDED_PROOFS",
     "RACIST_PROOF_PREFIX",
     "Change",
     "demote",
@@ -44,19 +47,39 @@ __all__ = [
 # ``cheater`` + ``racist`` entry is demoted (player removed from the Vorobey
 # list as a false positive), every proof that does not start with this exact
 # prefix belonged to the cheating accusation and must go with the tag.
-RACIST_PROOF_PREFIX = "[auto] automatically marked: Racist | reason:"
+#
+# The trailing quote is part of the prefix on purpose: TF2BD writes the reason
+# as a quoted string ("[auto] automatically marked: Racist | reason: \"...\""),
+# so requiring it keeps only a complete, canonical auto line -- a truncated or
+# hand-mangled one ("... | reason:" with nothing after it) is not the machine
+# record that justifies a racist tag, and it goes with the rest.
+RACIST_PROOF_PREFIX = '[auto] automatically marked: Racist | reason: "'
 
 
 def is_racist_proof(proof: str) -> bool:
     """True if a proof line is one of the automatic ``Racist`` chat-log lines.
 
-    Matching is forgiving on purpose: leading/trailing whitespace and letter
-    case are ignored, so a future tool that writes ``[AUTO] Automatically
-    marked: RACIST`` still protects the line. Anything else -- a video link,
-    "Silent Aim & ESP", a hand-written "Racist behavior..." note -- is NOT a
-    racist proof and is dropped when the cheater tag goes away.
+    The line must start with the full ``RACIST_PROOF_PREFIX`` -- including the
+    opening quote of the reason -- which is how TF2BD writes it::
+
+        [auto] automatically marked: Racist | reason: "<the chat line>"
+
+    Matching is forgiving about the ends only: leading/trailing whitespace and
+    letter case are ignored, so a future tool that writes ``[AUTO]
+    Automatically marked: RACIST`` still protects the line. Anything else -- a
+    video link, "Silent Aim & ESP", a hand-written "Racist behavior..." note, or
+    an auto line whose reason is missing/unquoted -- is NOT a racist proof and
+    is dropped when the cheater tag goes away.
     """
-    return proof.strip().casefold().startswith(RACIST_PROOF_PREFIX.casefold())
+    text = proof.strip().casefold()
+    prefix = RACIST_PROOF_PREFIX.casefold()
+    if not text.startswith(prefix):
+        return False
+    # The prefix already consumed the OPENING quote, so a complete line still
+    # has its closing quote after it. Requiring one is what makes the sentence
+    # above true: a line that stops at the opening quote has no reason at all,
+    # and used to be accepted as a machine record anyway.
+    return '"' in text[len(prefix) :]
 
 
 def _filter_racist_proofs(proofs: Any) -> list[str]:
@@ -100,44 +123,16 @@ def _evidence_links(entry: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(links))
 
 
-def _proofs(player: Player) -> list[str]:
-    """The entry's proof list, tolerating a malformed value.
-
-    ``validate()`` rejects a non-list proof before anything is written, so
-    this only has to keep the policy itself crash-free while it runs.
-    """
-    proof = player.get("proof")
-    if isinstance(proof, list):
-        return list(proof)
-    return [] if proof is None else [str(proof)]
-
-
-# How many proof links the ``[auto]`` line cites. The full set always appears in
-# the pull request; this bound keeps one upstream entry (which could list
-# thousands of links) from growing the database without limit.
-MAX_EMBEDDED_PROOFS = 5
-
-
-def _write_proof(player: Player, evidence: tuple[str, ...]) -> None:
-    """Write the ``[auto]`` proof line into a player entry (idempotent)."""
-    proof = _proofs(player)
-    if not any(isinstance(item, str) and PROOF_MARKER in item for item in proof):
-        line = f"{PROOF_MARKER} ({SOURCE_REPO_URL})"
-        if evidence:
-            shown = evidence[:MAX_EMBEDDED_PROOFS]
-            line += " | hackerpolice evidence: " + " ; ".join(shown)
-            if len(evidence) > len(shown):
-                line += f" (+{len(evidence) - len(shown)} more, see the pull request)"
-        proof.append(line)
-    player["proof"] = proof
-
-
-def promote(database: PlayerList, index: HackerpoliceIndex, *, include_proof: bool = False) -> list[Change]:
+def promote(database: PlayerList, index: HackerpoliceIndex) -> list[Change]:
     """Apply the promotion policy in place and return what changed.
 
     ``suspicious`` and/or ``racist`` entries with a hackerpolice match gain
     ``cheater``: ``suspicious`` is removed (a cheater list settles it) while
     ``racist`` is kept. Everything else is left untouched.
+
+    Membership is the entire test. The upstream list is cheater-only by
+    definition, so its attributes are never read: an ID that is listed is a
+    cheater even if its upstream entry said nothing at all.
 
     The database is NOT sorted here; call ``sync()`` to sort once after all
     changes are applied.
@@ -175,8 +170,6 @@ def promote(database: PlayerList, index: HackerpoliceIndex, *, include_proof: bo
         player["attributes"] = list(after)
 
         evidence = _evidence_links(entry)
-        if include_proof:
-            _write_proof(player, evidence)
 
         changes.append(
             Change(
@@ -238,9 +231,17 @@ def _demoted_entry(player: Player, removed: frozenset[str]) -> tuple[bool, Chang
 
     # Drop every proof except the "[auto] ... Racist" lines: the cheater tag
     # was a false positive, so its evidence must not stay behind pretending to
-    # justify the remaining racist tag.
+    # justify the remaining racist tag. When nothing survives the filter the
+    # KEY goes too: this database (and TF2BD) spells "no proof" as an absent
+    # key -- not one of the 456 entries carries an empty array -- so leaving
+    # ``"proof": []`` behind would put a shape in the file that nothing else
+    # in it has.
     if "proof" in player:
-        player["proof"] = _filter_racist_proofs(player.get("proof"))
+        kept_proofs = _filter_racist_proofs(player.get("proof"))
+        if kept_proofs:
+            player["proof"] = kept_proofs
+        else:
+            del player["proof"]
 
     return True, Change(
         steamid=canonical,
@@ -290,7 +291,6 @@ def sync(
     database: PlayerList,
     index: HackerpoliceIndex,
     *,
-    include_proof: bool = False,
     enable_demote: bool = False,
     removed_ids: Collection[str] = (),
 ) -> list[Change]:
@@ -312,7 +312,7 @@ def sync(
     entry in one run.
     """
     changes: list[Change] = []
-    changes.extend(promote(database, index, include_proof=include_proof))
+    changes.extend(promote(database, index))
 
     if enable_demote:
         still_listed = index.by_steamid

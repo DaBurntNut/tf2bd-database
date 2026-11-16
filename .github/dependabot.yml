@@ -1,0 +1,28 @@
+# Keeps the workflow's dependencies current without anyone having to remember.
+#
+# The workflow pins every action to a full commit SHA (see the header of
+# .github/workflows/sync-vorobey-hackerpolice.yml for why). Dependabot is the
+# maintenance half of that trade: it understands the "uses: owner/action@<sha>
+# # vX.Y.Z" form, so each update pull request moves the SHA AND the comment
+# together, and a reviewer sees which release it means.
+#
+# Nothing else is watched: the scripts have no runtime dependencies (standard
+# library only) and the tooling versions (ruff, mypy) are pinned in the
+# workflow's own `env:` block, where a bump is a visible one-line change.
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      # Reads as "ci: bump actions/checkout from v7.0.0 to v7.0.1".
+      prefix: "ci"
+    # One pull request per week for all of them, not one per action: these are
+    # pins in a single file, and reviewing them together is the point.
+    groups:
+      github-actions:
+        patterns:
+          - "*"

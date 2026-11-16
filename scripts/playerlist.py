@@ -8,6 +8,7 @@ hackerpolice list.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -16,6 +17,14 @@ from typing import Any, TypedDict, cast
 
 STEAMID64_BASE = 76561197960265728
 MAX_ACCOUNT_ID = 2**32
+
+# Sanity cap on a playerlist file this tool reads. The real database is ~110 kB
+# and the upstream list ~1.9 MB, so this is far beyond anything legitimate --
+# but without it a 4 GB file (or a device that never ends) would be read
+# straight into memory and the run would die with a MemoryError traceback
+# instead of a clean refusal. The download path has always had this limit
+# (``sources.MAX_SOURCE_BYTES``); the local reads did not.
+MAX_FILE_BYTES = 64 * 1024 * 1024
 
 CANONICAL_PREFIX = "[U:1:"
 CANONICAL_SUFFIX = "]"
@@ -38,6 +47,58 @@ _U_INSTANCE_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):{_ACCOUNT_ID_RE
 _STEAM2_RE = re.compile(rf"^STEAM_[0-5]:([01]):({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE)
 _STEAMID64_RE = re.compile(r"^[0-9]{17}$")
 _PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/([0-9]{17})", re.IGNORECASE)
+
+
+# How much of an arbitrary value a validation message quotes. These messages go
+# to a terminal and to the CI log, and the value comes from the file, so it can
+# be anything the file contains: an entry whose "steamid" is a 3 MB string used
+# to print a single 3,000,038-character line, which buries the error it is meant
+# to explain (and every other error after it, once GitHub truncates the log).
+MAX_SHOWN_VALUE_CHARS = 120
+
+
+def _shown(value: Any) -> str:
+    """``repr()`` of an arbitrary value, clipped so one bad entry cannot flood the log.
+
+    ``repr`` rather than ``str`` because these values are untrusted: a newline
+    would start a fake log line and an ESC sequence would repaint the terminal.
+    """
+    text = repr(value)
+    return text if len(text) <= MAX_SHOWN_VALUE_CHARS else text[:MAX_SHOWN_VALUE_CHARS] + "…"
+
+
+# How much of a path is ever printed. A path comes from the command line or a
+# workflow variable, and a very long one would push the actual reason off the
+# end of the message.
+MAX_SHOWN_PATH_CHARS = 200
+
+
+def display_path(path: Any) -> str:
+    """A path as it should appear in a message: one line, printable, bounded.
+
+    The path is operator input, so it can hold a newline (which would start a
+    second, operator-chosen log line) or an ESC sequence (which would repaint
+    the terminal that runs ``cat`` on the log). Control characters are shown as
+    escapes rather than dropped, so the message still names the file exactly;
+    ``str`` keeps it readable where ``repr`` would add quotes as well.
+    """
+    shown = "".join(
+        char if char.isprintable() and char not in "\u2028\u2029" else char.encode("unicode_escape").decode("ascii")
+        for char in str(path)
+    )
+    return shown if len(shown) <= MAX_SHOWN_PATH_CHARS else shown[:MAX_SHOWN_PATH_CHARS] + "…"
+
+
+def error_reason(exc: BaseException) -> str:
+    """The human half of an OS error, without it repeating the path we just named.
+
+    ``str(OSError)`` is ``[Errno 2] No such file or directory: '<the whole
+    path>'``, so a 100,000-character path would land in the message twice --
+    once clipped by ``display_path`` and once at full length here. ``strerror``
+    is the part that explains what went wrong; anything without one (a
+    ``ValueError`` from an unencodable path, say) falls back to ``str``.
+    """
+    return getattr(exc, "strerror", None) or str(exc)
 
 
 class PlayerListError(Exception):
@@ -188,11 +249,20 @@ def steam_history_url(steamid: Any) -> str | None:
 
 
 def player_name(player: Player) -> str:
-    """Last known player name, or an empty string when the entry has none."""
+    """Last known player name, or an empty string when the entry has none.
+
+    Only a string or an integer counts as a name. TF2BD writes a string, so a
+    JSON object or array in that position is malformed -- and ``str()`` of one
+    would put Python syntax (``{'a': 1}``) in the review table, where the
+    UNKNOWN placeholder is the honest answer.
+    """
     last_seen = player.get("last_seen")
     if not isinstance(last_seen, dict):
         return ""
-    return str(last_seen.get("player_name") or "")
+    value = last_seen.get("player_name")
+    if isinstance(value, bool) or not isinstance(value, (str, int)):  # bool is an int subclass
+        return ""
+    return str(value)
 
 
 def _player_sort_key(player: Player) -> tuple[bool, int]:
@@ -238,6 +308,23 @@ def _reject_constant(name: str) -> Any:
     raise _StrictJSONError(f"{name} is not valid JSON (only standard JSON numbers are accepted)")
 
 
+def _reject_out_of_range_float(text: str) -> float:
+    """Refuse a number that overflows a double into infinity.
+
+    ``1e999`` is valid JSON *syntax* and ``json`` quietly turns it into ``inf``
+    -- which is not a number this tool can write back out (``dumps`` refuses
+    it, exactly as TF2BD's strict parser would). Such a file could never be
+    round-tripped, and the failure surfaced as an uncaught ``ValueError`` deep
+    inside the writer, i.e. as a traceback. Refusing it here names the file
+    instead. The literal is quoted through ``_shown``: it can be as long as the
+    file, and this message goes to a terminal.
+    """
+    value = float(text)
+    if not math.isfinite(value):
+        raise _StrictJSONError(f"{_shown(text)} is out of range for a JSON number")
+    return value
+
+
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Refuse an object that defines the same key twice.
 
@@ -248,7 +335,7 @@ def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     seen: dict[str, Any] = {}
     for key, value in pairs:
         if key in seen:
-            raise _StrictJSONError(f"duplicate key {key!r} in the same object")
+            raise _StrictJSONError(f"duplicate key {_shown(key)} in the same object")
         seen[key] = value
     return seen
 
@@ -256,12 +343,18 @@ def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def strict_json_loads(raw: str | bytes) -> Any:
     """Parse JSON, refusing what the standard library accepts silently.
 
-    Three things a lenient parse lets through, each of which this tool would
+    Four things a lenient parse lets through, each of which this tool would
     otherwise publish back to disk: ``NaN``/``Infinity`` (a file no strict
-    parser -- including TF2BD's -- can read), and duplicate keys (silent data
-    loss). Everything else behaves exactly like ``json.loads``.
+    parser -- including TF2BD's -- can read), a number that overflows into
+    infinity (the same hazard, spelled ``1e999``), and duplicate keys (silent
+    data loss). Everything else behaves exactly like ``json.loads``.
     """
-    return json.loads(raw, parse_constant=_reject_constant, object_pairs_hook=_reject_duplicates)
+    return json.loads(
+        raw,
+        parse_constant=_reject_constant,
+        parse_float=_reject_out_of_range_float,
+        object_pairs_hook=_reject_duplicates,
+    )
 
 
 def load(path: Path) -> tuple[PlayerList, str]:
@@ -276,20 +369,34 @@ def load(path: Path) -> tuple[PlayerList, str]:
     matching what ``dumps()`` writes.
     """
     try:
+        # Read at most one byte past the limit: a special file (a device, a
+        # fifo) reports no size at all, so the budget is enforced on the bytes
+        # actually read, exactly like the download path.
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_FILE_BYTES + 1)
+    except (OSError, ValueError) as exc:
+        # ValueError covers a path the operating system cannot even encode (an
+        # embedded NUL, a lone surrogate): "this file cannot be read",
+        # reported like any other unreadable file instead of a traceback.
+        raise PlayerListError(f"cannot read {display_path(path)}: {error_reason(exc)}") from exc
+    if len(raw) > MAX_FILE_BYTES:
+        limit = MAX_FILE_BYTES // (1024 * 1024)
+        raise PlayerListError(f"{display_path(path)} is larger than the {limit} MiB safety limit")
+    try:
         # utf-8-sig == utf-8 for files without a mark, and strips it when present.
-        original = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError) as exc:
-        # UnicodeDecodeError: the file is not valid UTF-8 -- report it like
-        # any other unreadable file instead of crashing with a traceback.
-        raise PlayerListError(f"cannot read {path}: {exc}") from exc
+        original = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        # The file is not valid UTF-8. Report it like any other unreadable
+        # file instead of crashing with a traceback.
+        raise PlayerListError(f"cannot read {display_path(path)}: {error_reason(exc)}") from exc
     try:
         database = strict_json_loads(original)
     except (json.JSONDecodeError, RecursionError, ValueError) as exc:
         # ValueError: e.g. a JSON number with more digits than Python's
         # int-parsing limit -- invalid input, not a crash.
-        raise PlayerListError(f"{path} is not valid JSON: {exc}") from exc
+        raise PlayerListError(f"{display_path(path)} is not valid JSON: {exc}") from exc
     if not isinstance(database, dict):
-        raise PlayerListError(f"{path} does not contain a JSON object")
+        raise PlayerListError(f"{display_path(path)} does not contain a JSON object")
     return cast("PlayerList", database), original
 
 
@@ -322,32 +429,39 @@ def validate(database: PlayerList) -> ValidationResult:
         steamid = player.get("steamid")
         canonical = normalize_steamid(steamid)
         if canonical is None:
-            result.errors.append(f"players[{position}] has an unusable steamid: {steamid!r}")
-        elif canonical in seen:
-            result.errors.append(f"duplicate steamid {canonical}")
+            # A value that reached this point is arbitrary input, and these
+            # messages are printed to a terminal and to the CI log: str() would
+            # let a newline start a fake log line and an ESC sequence repaint
+            # the screen, so it is quoted with repr -- and clipped, because it
+            # can be as large as the file. Every later message about this entry
+            # reuses `shown`, so they are all bounded too.
+            result.errors.append(f"players[{position}] has an unusable steamid: {_shown(steamid)}")
+            shown = _shown(steamid)
         else:
-            seen.add(canonical)
+            shown = canonical
+            if canonical in seen:
+                result.errors.append(f"duplicate steamid {canonical}")
+            else:
+                seen.add(canonical)
 
         attributes = player.get("attributes")
         if not isinstance(attributes, list) or not attributes:
-            result.errors.append(f"players[{position}] ({steamid}) has no attributes")
+            result.errors.append(f"players[{position}] ({shown}) has no attributes")
             continue
         if not all(isinstance(attribute, str) for attribute in attributes):
             # Also guards the set() below against unhashable attribute values.
-            result.errors.append(f"players[{position}] ({steamid}) has a non-string attribute")
+            result.errors.append(f"players[{position}] ({shown}) has a non-string attribute")
             continue
         if len(set(attributes)) != len(attributes):
-            result.errors.append(f"players[{position}] ({steamid}) has duplicate attributes")
+            result.errors.append(f"players[{position}] ({shown}) has duplicate attributes")
         for attribute in attributes:
             if attribute not in KNOWN_ATTRIBUTES:
-                result.warnings.append(f"players[{position}] ({steamid}) uses unknown attribute {attribute!r}")
+                result.warnings.append(f"players[{position}] ({shown}) uses unknown attribute {_shown(attribute)}")
 
         # The sync policy rewrites `proof` when demoting, so its shape is an
         # invariant this tool relies on: an array of strings, if present.
         proof = player.get("proof")
         if proof is not None and (not isinstance(proof, list) or not all(isinstance(item, str) for item in proof)):
-            result.errors.append(
-                f"players[{position}] ({steamid}) has a malformed 'proof' (must be an array of strings)"
-            )
+            result.errors.append(f"players[{position}] ({shown}) has a malformed 'proof' (must be an array of strings)")
 
     return result

@@ -10,10 +10,14 @@ Modules under test:
 
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import copy
+import fnmatch
+import http.client
 import io
+import itertools
 import json
 import os
 import random
@@ -21,6 +25,7 @@ import re
 import runpy
 import shutil
 import stat
+import string
 import subprocess
 import sys
 import tempfile
@@ -32,6 +37,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+# A GitHub Actions step always exports GITHUB_OUTPUT, and a successful run
+# appends its own outputs to whatever that variable points at. Inheriting it
+# made the suite write 294 lines into the RUNNER's real output file: the tests
+# then depend on their environment, and a step that later reads its own outputs
+# would be reading values produced by the test run. Tests that exercise the
+# output file point the variable at a file of their own instead.
+os.environ.pop("GITHUB_OUTPUT", None)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import playerlist as playerlist_module
@@ -40,9 +53,14 @@ import report as report_module
 import sources
 import sync_vorobey_hackerpolice as sync_module
 from playerlist import (
+    ATTRIBUTE_ORDER,
+    KNOWN_ATTRIBUTES,
+    MAX_SHOWN_PATH_CHARS,
+    MAX_SHOWN_VALUE_CHARS,
     PlayerListError,
     ValidationResult,
     account_id,
+    display_path,
     dumps,
     load,
     normalize_steamid,
@@ -56,16 +74,21 @@ from playerlist import (
 )
 from policy import Change, demote, is_racist_proof, promote, sync
 from report import (
+    MAX_ATTRIBUTE_CELLS,
+    MAX_ATTRIBUTE_CHARS,
     MAX_CHANGE_TABLE_ROWS,
+    MAX_EVIDENCE_LINK_CHARS,
     MAX_REMOVED_TABLE_ROWS,
     MAX_REPORT_BYTES,
     RunInfo,
+    _demotion_lines,
+    _promotion_lines,
+    _shorten,
     plural,
     render_closing,
     render_report,
 )
 from sources import (
-    PROOF_MARKER,
     HackerpoliceIndex,
     SyncError,
     added_steamids,
@@ -73,7 +96,7 @@ from sources import (
     load_snapshot,
     removed_steamids,
 )
-from sync_vorobey_hackerpolice import DEFAULT_SNAPSHOT, build_parser, main, write_database
+from sync_vorobey_hackerpolice import DEFAULT_SNAPSHOT, build_parser, main
 
 HACKERPOLICE_PROOF = "https://discord.com/channels/1/2"
 
@@ -133,7 +156,7 @@ class _FakeResponse:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *_exc: object) -> bool:
         return False
 
     def read(self, size=-1):
@@ -182,6 +205,18 @@ class SourceFetchTests(unittest.TestCase):
                 load_first_available_raw([self.URL])
             self.assertEqual(urlopen.call_count, 1)  # only the envelope itself was fetched
 
+    def test_a_non_string_download_url_is_ignored(self):
+        """download_url is response data: it can be any JSON type, not just text."""
+        for value in (42, None, {"url": "https://example.invalid/x"}, ["https://example.invalid/x"], True):
+            envelope = json.dumps({"encoding": "none", "content": "", "download_url": value}).encode("utf-8")
+            with (
+                mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(envelope)]) as urlopen,
+                mock.patch("sources.time.sleep"),
+                self.assertRaises(SyncError),
+            ):
+                load_first_available_raw([self.URL])
+            self.assertEqual(urlopen.call_count, 1, value)  # nothing else was fetched
+
     def test_large_file_envelope_falls_back_to_download_url(self):
         envelope = json.dumps(
             {"encoding": "none", "content": "", "download_url": "https://example.invalid/raw.json"}
@@ -195,6 +230,221 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(sources.redact_url("https://u:secret@h.example/x?y=1"), "https://h.example/x?y=1")
         self.assertEqual(sources.redact_url("https://h.example:8443/x"), "https://h.example:8443/x")
         self.assertEqual(sources.redact_url("playerlist.garou3299.json"), "playerlist.garou3299.json")
+
+    def test_redact_url_hides_a_token_carried_in_the_query_string(self):
+        """This URL is published in the pull request body: ?token=... must not be."""
+        redacted = sources.redact_url("https://example.invalid/list.json?token=ghp_SECRET&ref=main")
+        self.assertIn("token=REDACTED", redacted)
+        self.assertNotIn("ghp_SECRET", redacted)
+        # A harmless parameter keeps its value, so the line still identifies
+        # what was fetched.
+        self.assertIn("ref=main", redacted)
+
+    def test_redact_url_hides_presigned_s3_credentials(self):
+        url = (
+            "https://bucket.example/list.json?X-Amz-Credential=AKIAEXAMPLE"
+            "&X-Amz-Signature=deadbeef&X-Amz-Security-Token=session"
+        )
+        redacted = sources.redact_url(url)
+        for secret in ("AKIAEXAMPLE", "deadbeef", "session"):
+            self.assertNotIn(secret, redacted)
+        self.assertIn("X-Amz-Signature=REDACTED", redacted)
+
+    def test_every_credential_named_parameter_is_redacted_not_just_the_common_few(self):
+        """An exact-name list leaked private_token, refresh_token, pass, bearer.
+
+        Any of these can appear in a --source URL, and the URL is printed in the
+        public pull request body, so a leak cannot be undone -- over-redacting a
+        harmless parameter costs a reader nothing.
+        """
+        for name in (
+            "token",
+            "private_token",
+            "refresh_token",
+            "auth_token",
+            "access_token",
+            "id_token",
+            "api_key",
+            "apikey",
+            "secret",
+            "client_secret",
+            "secret_key",
+            "password",
+            "passwd",
+            "pass",
+            "authorization",
+            "bearer",
+            "credential",
+            "credentials",
+            "session",
+            "session_id",
+            "sig",
+            "signature",
+            "X-Amz-Signature",
+            "X-Goog-Credential",
+            "jwt",
+            "nonce",
+            "ticket",
+            "code",
+        ):
+            with self.subTest(name=name):
+                redacted = sources.redact_url(f"https://example.invalid/x?{name}=SECRET")
+                self.assertNotIn("SECRET", redacted)
+                self.assertIn("REDACTED", redacted)
+
+    def test_a_harmless_parameter_keeps_its_value(self):
+        for name in ("ref", "dl", "y", "client_id", "path", "download", "branch"):
+            with self.subTest(name=name):
+                url = f"https://example.invalid/x?{name}=visible"
+                self.assertIn(f"{name}=visible", sources.redact_url(url))
+
+    def test_the_published_report_carries_no_credential_from_the_source_url(self):
+        """The report is the pull request body, so this is the line that matters."""
+        info = RunInfo(
+            database_path=Path("db.json"),
+            source="https://example.invalid/list.json?private_token=SUPERSECRET&ref=main",
+            source_total=0,
+            source_skipped=0,
+            dry_run=True,
+        )
+        report = render_report(info)
+        self.assertNotIn("SUPERSECRET", report)
+        self.assertIn("private\\_token=REDACTED", report)  # "_" is markdown-escaped
+        self.assertIn("ref=main", report)
+
+    def test_redact_url_matches_a_secret_parameter_name_case_insensitively(self):
+        self.assertIn("REDACTED", sources.redact_url("https://example.invalid/x?Token=abc"))
+        self.assertIn("REDACTED", sources.redact_url("https://example.invalid/x?API_KEY=abc"))
+
+    def test_redact_url_hides_a_credential_carried_in_the_fragment(self):
+        """OAuth's implicit flow puts tokens after the ``#``.
+
+        The query string was handled and the fragment was not, so
+        ``https://host/callback#access_token=...`` published the token
+        verbatim in the pull request body.
+        """
+        redacted = sources.redact_url("https://h/callback#access_token=s3cret&state=xyz")
+        self.assertNotIn("s3cret", redacted)
+        self.assertIn("access_token=REDACTED", redacted)
+        self.assertIn("state=xyz", redacted)
+
+    def test_redact_url_leaves_an_ordinary_fragment_alone(self):
+        # "= in the fragment" is not enough to redact: a pair whose name is not
+        # secret-looking must keep its value, exactly like the query string.
+        for url in (
+            "https://h/x#L10",
+            "https://h/x#section-2",
+            "https://h/x#",
+            "https://h/x",
+            "https://h/x#tab=1&line=20",
+            "https://h/x#comment=hello",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(sources.redact_url(url), url)
+
+    def test_redact_url_leaves_a_harmless_query_completely_alone(self):
+        url = "https://example.invalid/list.json?ref=main&page=2"
+        self.assertEqual(sources.redact_url(url), url)
+
+    def test_redact_url_bounds_an_absurdly_long_url(self):
+        """A 100 kB URL used to truncate the whole report; logs too."""
+        shown = sources.redact_url("https://example.invalid/" + "a" * 100_000)
+        self.assertEqual(len(shown), sources.MAX_URL_DISPLAY_CHARS + 1)
+        self.assertTrue(shown.endswith("…"))
+
+    def test_redact_url_survives_a_malformed_port(self):
+        """redact_url runs on error paths: it must never raise there."""
+        redacted = sources.redact_url("https://user:secret@example.invalid:notaport/list.json")
+        self.assertNotIn("secret", redacted)
+        self.assertIn("example.invalid", redacted)
+
+    def test_redact_url_survives_an_undecodable_url(self):
+        """argv decodes invalid UTF-8 with surrogateescape.
+
+        So ``--source $'https://h/?token=\xff'`` reaches this function holding
+        a lone surrogate, which ``urlencode`` refuses to encode. Redaction runs
+        on every error path, so raising there would replace a clean refusal
+        with a traceback.
+        """
+        for url in (
+            "https://example.invalid/x?token=\udcff",
+            "https://example.invalid/\ud800/x?api_key=abc",
+            "https://\udcff@example.invalid/x",
+            "https://example.invalid/\udfff/x?ref=main",
+        ):
+            redacted = sources.redact_url(url)
+            redacted.encode("utf-8")  # the report writes UTF-8: must not raise
+            self.assertNotIn("abc", redacted)
+            self.assertIn("example.invalid", redacted)
+
+    def test_an_oversized_database_is_refused_not_read_into_memory(self):
+        """A 4 GB file must be a clean refusal, not a MemoryError traceback."""
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "big.json"
+            path.write_bytes(b"{}" + b" " * 32)
+            with (
+                mock.patch.object(playerlist_module, "MAX_FILE_BYTES", 16),
+                self.assertRaises(PlayerListError) as raised,
+            ):
+                load(path)
+        self.assertIn("larger than the", str(raised.exception))
+
+    def test_an_oversized_snapshot_is_refused_not_read_into_memory(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "big-snapshot.json"
+            path.write_bytes(b"{}" + b" " * 32)
+            with (
+                mock.patch.object(sources, "MAX_FILE_BYTES", 16),
+                self.assertRaises(sources.SyncError) as raised,
+            ):
+                sources.load_snapshot(path)
+        self.assertIn("larger than the", str(raised.exception))
+
+    def test_an_unrepresentable_path_is_refused_cleanly(self):
+        """A path the OS cannot even encode must not escape as ValueError.
+
+        ``os`` raises ValueError (not OSError) for an embedded NUL or a lone
+        surrogate, and every reader here documents "raises PlayerListError /
+        SyncError". One ValueError percolating out of a path helper would turn
+        a clean refusal into a traceback.
+        """
+        bad = "a\x00b.json"
+        with self.assertRaises(PlayerListError):
+            load(Path(bad))
+        with self.assertRaises(sources.SyncError):
+            sources._read_bytes(bad)
+        # "no snapshot" is the honest answer for a path that cannot exist
+        self.assertIsNone(sources.load_snapshot(Path("x\ud800.json")))
+        self.assertFalse(sync_module._same_file(Path(bad), Path("x")))
+
+    def test_redact_url_keeps_a_url_on_one_line(self):
+        """A --source can contain any byte; a printed URL must stay one line.
+
+        A raw newline in a log line forges a second one, and U+2028 splits a
+        table row. Both are percent-encoded instead of being printed raw.
+        """
+        for url in (
+            "https://example.invalid/x?y=\nforged",
+            "https://example.invalid/a\u2028b",
+            "https://example.invalid/a\x85b",
+            "https://example.invalid/a\x00b",
+            "https://[::1\nforged",  # urlsplit() itself refuses this one
+        ):
+            shown = sources.redact_url(url)
+            self.assertEqual(len(shown.splitlines()), 1)
+            self.assertNotIn("\n", shown)
+
+    def test_http_scheme_is_case_insensitive_and_blank_for_a_local_path(self):
+        """RFC 3986 schemes are case-insensitive, and urllib agrees."""
+        self.assertEqual(sources.http_scheme("https://example.invalid/x"), "https")
+        self.assertEqual(sources.http_scheme("HTTPS://example.invalid/x"), "https")
+        self.assertEqual(sources.http_scheme("HTTP://example.invalid/x"), "http")
+        self.assertEqual(sources.http_scheme("playerlist.garou3299.json"), "")
+        self.assertEqual(sources.http_scheme("https://[::1/x"), "")  # malformed, never raises
+
+    def test_an_uppercase_https_source_is_fetched_instead_of_treated_as_a_path(self):
+        with mock.patch("sources._OPENER.open", return_value=_FakeResponse(b'{"players": []}')):
+            self.assertEqual(sources._read_bytes("HTTPS://example.invalid/list.json"), b'{"players": []}')
 
     def test_parse_errors_redact_credentials(self):
         """A --source may carry a token; a bad document must not print it."""
@@ -521,6 +771,13 @@ class SourceFetchTests(unittest.TestCase):
             load_first_available_raw([self.URL])
         self.assertEqual(opener.call_count, sources.FETCH_ATTEMPTS)
         self.assertEqual(sleep.call_count, sources.FETCH_ATTEMPTS - 1)
+        # The DELAY matters, not just the number of attempts: retrying a
+        # rate-limited server with a zero backoff is a hammer, and the delays
+        # must grow instead of repeating.
+        backoffs = [call.args[0] for call in sleep.call_args_list]
+        self.assertTrue(all(delay > 0 for delay in backoffs), backoffs)
+        self.assertEqual(backoffs, sorted(backoffs))
+        self.assertEqual(backoffs[-1], sources.RETRY_BACKOFF_SECONDS * (sources.FETCH_ATTEMPTS - 1))
 
     def test_local_source_exactly_at_the_limit_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -545,6 +802,44 @@ class SourceFetchTests(unittest.TestCase):
                     with self.assertRaises(SyncError):
                         load_first_available_raw([self.URL])
                     self.assertEqual(response.read_count, 0)  # rejected before download
+
+    def test_a_body_shorter_than_its_declared_length_is_retried(self):
+        """A connection that dies mid-body must not hand back partial bytes."""
+        short = _FakeResponse(self.BODY[:10], {"Content-Length": str(len(self.BODY))})
+        (document, _, raw), calls = self.fetch([short, _FakeResponse(self.BODY)])
+        self.assertEqual(raw, self.BODY)
+        self.assertEqual(len(document["players"]), 1)
+        self.assertEqual(calls, 2)
+
+    def test_a_permanently_short_body_fails_after_every_attempt(self):
+        short = _FakeResponse(self.BODY[:10], {"Content-Length": str(len(self.BODY))})
+        with (
+            mock.patch("sources._OPENER.open", side_effect=lambda *_, **__: short) as urlopen,
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError) as caught,
+        ):
+            load_first_available_raw([self.URL])
+        self.assertEqual(urlopen.call_count, sources.FETCH_ATTEMPTS)
+        self.assertIn("received 10 of", str(caught.exception))
+
+    def test_a_chunked_body_that_ends_early_is_retried(self):
+        broken = http.client.IncompleteRead(partial=self.BODY[:10], expected=len(self.BODY))
+        (document, _, raw), calls = self.fetch([broken, _FakeResponse(self.BODY)])
+        self.assertEqual(raw, self.BODY)
+        self.assertEqual(len(document["players"]), 1)
+        self.assertEqual(calls, 2)
+
+    def test_a_permanently_truncated_chunked_body_fails_after_every_attempt(self):
+        """The final attempt has no backoff left: it must still raise, not hang."""
+        broken = http.client.IncompleteRead(partial=self.BODY[:10], expected=len(self.BODY))
+        with (
+            mock.patch("sources._OPENER.open", side_effect=broken) as urlopen,
+            mock.patch("sources.time.sleep") as sleep,
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
+        self.assertEqual(urlopen.call_count, sources.FETCH_ATTEMPTS)
+        self.assertEqual(sleep.call_count, sources.FETCH_ATTEMPTS - 1)
 
     def test_server_errors_are_retried_and_client_errors_are_not(self):
         for code, expected_attempts in (
@@ -790,7 +1085,7 @@ class UntouchedPathTests(unittest.TestCase):
         ):
             runpy.run_module("sync_vorobey_hackerpolice", run_name="__main__")
         self.assertEqual(caught.exception.code, 0)
-        self.assertIn("--include-proof", output.getvalue())
+        self.assertNotIn("--include-proof", output.getvalue())
 
     def test_envelope_with_non_string_content_is_not_unwrapped(self):
         # encoding says base64 but content is not text: b64decode would raise,
@@ -839,6 +1134,23 @@ class UntouchedPathTests(unittest.TestCase):
             self.assertRaises(SyncError),
         ):
             load_first_available_raw([SourceFetchTests.API_URL])
+
+    def test_an_empty_username_still_hides_the_token(self):
+        """``https://:TOKEN@host/`` is a real basic-auth form (empty user name).
+
+        ``urlsplit`` reports the user name as ``""`` there, and ``""`` is
+        falsy: a truthiness test instead of ``is not None`` would leave the
+        token in the URL, and this URL is published in the pull request.
+        """
+        self.assertEqual(
+            sources.redact_url("https://:ghp_secret@example.invalid/list.json"),
+            "https://example.invalid/list.json",
+        )
+        # The same form with a port, and with both halves empty apart from the password.
+        self.assertEqual(
+            sources.redact_url("https://:s3cret@example.invalid:8443/x"),
+            "https://example.invalid:8443/x",
+        )
 
     def test_redact_url_keeps_the_port_and_drops_the_credentials(self):
         self.assertEqual(
@@ -923,7 +1235,7 @@ class UntouchedPathTests(unittest.TestCase):
             mock.patch.object(Path, "replace", side_effect=OSError("disk full")),
             self.assertRaises(SyncError) as caught,
         ):
-            sync_module.write_database(target, {"players": []}, "different", dry_run=False)
+            sync_module.write_database(target, dumps({"players": []}), "different", dry_run=False)
         message = str(caught.exception)
         self.assertIn(str(target), message)
         self.assertIn("disk full", message)
@@ -941,10 +1253,19 @@ class UntouchedPathTests(unittest.TestCase):
         self.assertIn("disk full", message)
         self.assertNotIn(".tmp", message)
 
-    def test_write_creates_a_missing_parent_directory(self):
+    def test_write_does_not_invent_a_missing_parent_directory(self):
+        """A writer must not *create* state the operator never asked for.
+
+        It used to ``mkdir -p`` for any target, so a typo'd ``--snapshot``
+        silently produced a fresh baseline in a brand-new tree -- and a fresh
+        baseline can never prove a removal, so ``--demote`` would quietly do
+        nothing forever. The CLI refuses such a path up front (by name); the
+        writer itself must not paper over it either.
+        """
         nested = self.root / "a" / "b" / "list.json"
-        sync_module._atomic_write_bytes(nested, b"{}\n")
-        self.assertEqual(nested.read_bytes(), b"{}\n")
+        with self.assertRaises(OSError):
+            sync_module._atomic_write_bytes(nested, b"{}\n")
+        self.assertFalse((self.root / "a").exists())
 
     def test_write_into_an_existing_directory_keeps_the_existing_mode(self):
         target = self.root / "list.json"
@@ -953,6 +1274,34 @@ class UntouchedPathTests(unittest.TestCase):
         sync_module._atomic_write_bytes(target, b"new\n")
         self.assertEqual(target.read_bytes(), b"new\n")
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)  # mode preserved
+
+    def test_a_new_file_takes_the_umask_not_a_hardcoded_0644(self):
+        """``chmod(0o644)`` overrode the operator's umask.
+
+        Under ``umask 077`` -- "only I may read this" -- the snapshot and the
+        report used to be created world-readable, which on a shared machine is
+        a silent exposure of the database and the review page.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "new.json"
+            previous = os.umask(0o077)
+            try:
+                sync_module._atomic_write_bytes(target, b"x\n")
+            finally:
+                os.umask(previous)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            self.assertEqual(target.read_bytes(), b"x\n")
+
+    def test_a_new_file_under_a_permissive_umask_is_still_group_readable(self):
+        """The other side of it: do not over-correct into 0600 for everyone."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "new.json"
+            previous = os.umask(0o022)
+            try:
+                sync_module._atomic_write_bytes(target, b"x\n")
+            finally:
+                os.umask(previous)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
 
     def test_same_file_sees_two_hard_links_to_one_file(self):
         first = self.root / "a.json"
@@ -968,6 +1317,39 @@ class UntouchedPathTests(unittest.TestCase):
         with mock.patch("os.path.samefile", side_effect=OSError("no such file")):
             self.assertFalse(sync_module._same_file(first, second))
         self.assertTrue(sync_module._same_file(first, first))
+
+    def test_same_file_treats_a_symlink_loop_as_different_files(self):
+        """pathlib raises RuntimeError -- not OSError -- when resolving a loop.
+
+        Both resolutions happen inside _same_file, so an uncaught RuntimeError
+        escaped as a traceback for every one of the four paths.
+        """
+        loop = self.root / "loop.json"
+        os.symlink(loop, loop)
+        self.assertFalse(sync_module._same_file(loop, self.root / "other.json"))
+        self.assertFalse(sync_module._same_file(self.root / "other.json", loop))
+
+    def test_a_symlink_loop_on_any_path_is_never_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = root / "loop.json"
+            os.symlink(loop, loop)
+            (root / "up.json").write_text(dumps({"players": [player("[U:1:1]", ["cheater"])]}), encoding="utf-8")
+            (root / "db.json").write_text(dumps({"players": []}), encoding="utf-8")
+            for flag in ("--database", "--snapshot", "--report", "--source"):
+                with self.subTest(path=flag):
+                    argv = {
+                        "--database": str(root / "db.json"),
+                        "--snapshot": str(root / "s.json"),
+                        "--source": str(root / "up.json"),
+                        "--report": str(root / "r.md"),
+                        "-q": None,
+                    }
+                    argv[flag] = str(loop)
+                    flat = [item for pair in argv.items() for item in pair if item is not None]
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = main(flat)  # must not raise
+                    self.assertIn(code, (0, 2))
 
     def test_database_that_fails_validation_after_sync_is_not_written(self):
         database = self.root / "list.json"
@@ -1071,21 +1453,35 @@ class PromoteTests(unittest.TestCase):
         database, _ = self.promote([player("[U:1:300]", ["racist", "suspicious"])])
         self.assertEqual(database["players"][0]["attributes"], ["cheater", "racist"])
 
-    def test_include_proof_is_opt_in_and_idempotent(self):
-        database, _ = self.promote([player("[U:1:100]", ["suspicious"])], include_proof=True)
-        proof = database["players"][0]["proof"]
-        self.assertEqual(len(proof), 1)
-        self.assertIn(PROOF_MARKER, proof[0])
-        self.assertIn(HACKERPOLICE_PROOF, proof[0])
+    def test_promotion_cannot_write_a_proof_at_all(self):
+        """The capability is gone, not merely switched off.
 
-        _, changes = self.promote(database["players"], include_proof=True)
-        self.assertEqual(changes, [])
-        self.assertEqual(len(database["players"][0]["proof"]), 1)
+        ``--include-proof`` was removed so a promotion can never add a proof
+        line: the parameter does not exist, and passing it is a TypeError.
+        """
+        with self.assertRaises(TypeError):
+            policy.promote({"players": []}, index_of(), include_proof=True)
+        self.assertFalse(hasattr(policy, "_write_proof"))
+        self.assertFalse(hasattr(policy, "MAX_EMBEDDED_PROOFS"))
 
-    def test_existing_proof_is_kept_and_extended_once(self):
-        database, _ = self.promote([player("[U:1:100]", ["suspicious"], proof=["manual note"])], include_proof=True)
-        self.assertEqual(database["players"][0]["proof"][0], "manual note")
-        self.assertEqual(len(database["players"][0]["proof"]), 2)
+    def test_membership_alone_decides_regardless_of_upstream_attributes(self):
+        """The Vorobey list is cheater-only and always will be.
+
+        Because of that, the policy never reads an upstream entry's
+        attributes: being listed is the whole signal. A missing, empty or
+        unexpected attribute list changes nothing -- the ID is promoted.
+        """
+        for attributes in (["cheater"], [], ["cheater", "racist"], None, ["something-unexpected"]):
+            entry = {"steamid": "[U:1:100]", "last_seen": {"time": 1}}
+            if attributes is not None:
+                entry["attributes"] = attributes
+            database = {"players": [player("[U:1:100]", ["suspicious"])]}
+            promote(database, index_of(entry))
+            self.assertEqual(
+                database["players"][0]["attributes"],
+                ["cheater"],
+                f"upstream attributes {attributes!r} changed the verdict",
+            )
 
     def test_already_cheater_is_untouched(self):
         database, changes = self.promote([player("[U:1:400]", ["cheater", "racist"], proof=["keep me"])])
@@ -1195,7 +1591,9 @@ class DemoteTests(unittest.TestCase):
                 )
             ]
         )
-        self.assertEqual(database["players"][0]["proof"], [])
+        # Not "proof": [] -- no entry in the database spells it that way, and the
+        # demotion must not invent a shape the rest of the file does not use.
+        self.assertNotIn("proof", database["players"][0])
 
     def test_cheater_and_racist_keeps_only_auto_racist_prefixed_proofs(self):
         """Multiple proofs: ONLY lines starting with the exact
@@ -1231,22 +1629,64 @@ class DemoteTests(unittest.TestCase):
         database, _ = self.demote([player("[U:1:200]", ["cheater", "racist"], proof=[kept, "Silent Aim & ESP"])])
         self.assertEqual(database["players"][0]["proof"], [kept])
 
+    def test_a_truncated_auto_line_is_not_a_machine_record(self):
+        """The reason has to be quoted shut; the docstring always said so.
+
+        A line that stops at the opening quote ("... | reason: \"") was
+        accepted as a racist proof, so a demotion kept text that justifies
+        nothing. TF2BD always closes the quote.
+        """
+        self.assertFalse(is_racist_proof('[auto] automatically marked: Racist | reason: "'))
+        self.assertFalse(is_racist_proof("[auto] automatically marked: Racist | reason:"))
+        # an empty but CLOSED reason is a complete line, and therefore stays
+        self.assertTrue(is_racist_proof('[auto] automatically marked: Racist | reason: ""'))
+
     def test_is_racist_proof(self):
         self.assertTrue(is_racist_proof('[auto] automatically marked: Racist | reason: "x"'))
-        self.assertTrue(is_racist_proof("  [AUTO] automatically marked: RACIST | reason:"))
+        # whitespace at the ends and letter case are still forgiven
+        self.assertTrue(is_racist_proof('  [AUTO] Automatically marked: RACIST | reason: "x"  '))
         for value in (
             '[auto] automatically marked: Cheater | reason: "aimbot"',
             "https://youtu.be/x",
             "Racist behavior in voice chat",
             "[auto] automatically marked: Racist",
             "",
+            # The quote is part of the prefix: an auto line whose reason is
+            # missing, unquoted or differently spaced is NOT the machine record.
+            "[auto] automatically marked: Racist | reason:",
+            "[auto] automatically marked: Racist | reason: no quotes here",
+            '[auto] automatically marked: Racist | reason:"x"',
         ):
             self.assertFalse(is_racist_proof(value), value)
+
+    def test_demotion_keeps_only_proofs_starting_with_the_full_racist_prefix(self):
+        """Owner's rule: the tag goes, and so does every proof that is not a
+        complete ``[auto] automatically marked: Racist | reason: "..."`` line."""
+        kept = '[auto] automatically marked: Racist | reason: "slur in chat"'
+        database, changes = self.demote(
+            [
+                player(
+                    "[U:1:200]",
+                    ["cheater", "racist"],
+                    proof=[
+                        kept,
+                        "https://youtu.be/cheating-video",
+                        "Silent Aim & ESP",
+                        "Racist behavior in voice chat",
+                        "[auto] automatically marked: Racist | reason:",  # truncated
+                        "[auto] automatically marked: Racist | reason: no quotes",
+                    ],
+                )
+            ]
+        )
+        self.assertEqual(database["players"][0]["attributes"], ["racist"])
+        self.assertEqual(database["players"][0]["proof"], [kept])
+        self.assertEqual([change.kind for change in changes], ["demote"])
 
     def test_cheater_and_racist_with_non_list_proof_drops_the_proof(self):
         database, _ = self.demote([player("[U:1:200]", ["cheater", "racist"], proof="Silent Aim & ESP")])
         self.assertEqual(database["players"][0]["attributes"], ["racist"])
-        self.assertEqual(database["players"][0]["proof"], [])
+        self.assertNotIn("proof", database["players"][0])
 
     def test_cheater_only_removes_whole_entry(self):
         database, changes = self.demote([player("[U:1:200]", ["cheater"])])
@@ -1279,6 +1719,17 @@ class DemoteTests(unittest.TestCase):
         self.assertEqual(sync(database, self.index, enable_demote=True), [])
         self.assertEqual(len(database["players"]), 1)
 
+    def test_sync_never_demotes_when_the_caller_forgets_enable_demote(self):
+        """Defence in depth: removals without the flag demote nobody.
+
+        The CLI never gets here (it empties the set when --demote is off), but a
+        future caller that hands over removed_ids and forgets the flag must not
+        be able to delete entries by accident.
+        """
+        database = {"$schema": "x", "file_info": {"title": "t"}, "players": [player("[U:1:200]", ["cheater"])]}
+        self.assertEqual(sync(database, self.index, removed_ids={"[U:1:200]"}), [])
+        self.assertEqual(database["players"][0]["attributes"], ["cheater"])
+
     def test_not_a_cheater_is_untouched(self):
         database, changes = self.demote([player("[U:1:200]", ["suspicious"])])
         self.assertEqual(database["players"][0]["attributes"], ["suspicious"])
@@ -1307,6 +1758,25 @@ class DemoteTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Policy invariants over randomised inputs (seeded: fully deterministic)
 # --------------------------------------------------------------------------- #
+class MalformedProofTests(unittest.TestCase):
+    """``_filter_racist_proofs`` promises an empty list for a non-list proof."""
+
+    def test_a_malformed_proof_is_dropped_rather_than_iterated(self):
+        """A public entry point keeps its documented contract.
+
+        ``validate()`` refuses such a file before a real run reaches here, but
+        ``demote`` is exported and the docstring promises this: without the
+        guard an int proof raised TypeError and a dict proof iterated its keys.
+        """
+        for proof in (5, 5.5, {"a": 1}, "a string", None, True):
+            with self.subTest(proof=proof):
+                player = {"steamid": "[U:1:1]", "attributes": ["cheater", "racist"], "proof": proof}
+                changes = policy.demote({"players": [player]}, ["[U:1:1]"])
+                self.assertEqual(player["attributes"], ["racist"])
+                self.assertNotIn("proof", player)  # nothing survived, so the key goes
+                self.assertEqual([change.kind for change in changes], ["demote"])
+
+
 class PolicyPropertyTests(unittest.TestCase):
     """Seeded property test over arbitrary databases and upstream states.
 
@@ -1315,7 +1785,7 @@ class PolicyPropertyTests(unittest.TestCase):
     from churning the file.
     """
 
-    RACIST_LINE = "[auto] automatically marked: Racist | reason: whatever"
+    RACIST_LINE = '[auto] automatically marked: Racist | reason: "whatever"'
 
     def test_random_databases_satisfy_the_rules(self):
         rng = random.Random(20261114)
@@ -1357,18 +1827,27 @@ class PolicyPropertyTests(unittest.TestCase):
                     # Still listed: never demoted, even if also in removed_ids.
                     self.assertEqual(entry, original)
                 elif steamid in listed and was & {"suspicious", "racist"}:
-                    # Promoted: cheater added, suspicious settled, everything else kept.
+                    # Promoted: cheater added, suspicious settled, everything else kept
+                    # -- proofs included: a promotion never adds or rewrites one.
                     self.assertEqual(entry["attributes"], order_attributes((was | {"cheater"}) - {"suspicious"}))
                     self.assertEqual(entry["last_seen"], original["last_seen"])
+                    self.assertEqual(entry.get("proof"), original.get("proof"), "promotion changed the proofs")
                 elif steamid in removed and has and "racist" not in was:
                     # Removed upstream without a racist tag: the entry is gone.
                     self.assertIsNone(entry)
                 elif steamid in removed and has:
-                    # Only the cheater tag goes (other tags survive); every proof
-                    # that is not an [auto] racist line is dropped with it.
+                    # Only the cheater tag goes (other tags survive); the proofs that
+                    # remain are exactly the [auto] racist lines -- nothing else
+                    # (no video link, no hand-written note, no gibberish) survives.
                     self.assertEqual(entry["attributes"], order_attributes(was - {"cheater"}))
                     if "proof" in original:
-                        self.assertTrue(all(is_racist_proof(line) for line in entry["proof"]))
+                        kept = [line for line in original["proof"] if isinstance(line, str) and is_racist_proof(line)]
+                        if kept:
+                            self.assertEqual(entry["proof"], kept)
+                        else:
+                            self.assertNotIn(
+                                "proof", entry, "an empty proof array is not how this file says 'no proof'"
+                            )
                 else:
                     self.assertEqual(entry, original, "an unrelated entry was modified")
 
@@ -1442,19 +1921,12 @@ class MalformedEntryTests(unittest.TestCase):
         self.assertEqual(promote({}, index_of()), [])
         self.assertEqual(demote({}, {"[U:1:1]"}), [])
 
-    def test_include_proof_is_idempotent_and_keeps_evidence(self):
+    def test_promotion_never_touches_an_existing_proof(self):
         index = index_of(hackerpolice_entry("[U:1:100]", [HACKERPOLICE_PROOF, "  "]))
-        database = {"players": [player("[U:1:100]", ["suspicious"])]}
-        promote(database, index, include_proof=True)
-        first = list(database["players"][0]["proof"])
-        self.assertEqual(len(first), 1)
-        self.assertIn(PROOF_MARKER, first[0])
-        self.assertIn(HACKERPOLICE_PROOF, first[0])
-        # Re-running (e.g. a second sync, or the same player promoted again)
-        # must never duplicate the line this tool owns.
-        database["players"][0]["attributes"] = ["suspicious"]
-        promote(database, index, include_proof=True)
-        self.assertEqual(database["players"][0]["proof"], first)
+        database = {"players": [player("[U:1:100]", ["suspicious"], proof=["manual note"])]}
+        promote(database, index)
+        self.assertEqual(database["players"][0]["attributes"], ["cheater"])
+        self.assertEqual(database["players"][0]["proof"], ["manual note"])
 
 
 class PolicyFuzzTests(unittest.TestCase):
@@ -1495,7 +1967,7 @@ class PolicyFuzzTests(unittest.TestCase):
                     self.assertNotIn("cheater", got["attributes"])
                     self.assertIn("racist", got["attributes"])
                     for proof in got.get("proof", []):
-                        self.assertTrue(proof.startswith("[auto] automatically marked: Racist | reason:"))
+                        self.assertTrue(proof.startswith('[auto] automatically marked: Racist | reason: "'))
                 elif (
                     steamid in current_ids
                     and "cheater" not in before["attributes"]
@@ -1515,6 +1987,35 @@ class PolicyFuzzTests(unittest.TestCase):
 _UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
 
 
+def _code_span_ranges(text):
+    """(start, end) of every Markdown code span, delimited by a run of exactly N.
+
+    A proper scan (not a regex): a two-backtick fence may contain single
+    backticks, which is exactly what a naive non-greedy pattern gets wrong.
+    """
+    ranges = []
+    position = 0
+    while position < len(text):
+        if text[position] != "`":
+            position += 1
+            continue
+        start = position
+        while position < len(text) and text[position] == "`":
+            position += 1
+        fence = position - start
+        search_from = position
+        while True:
+            match = re.compile(r"`+").search(text, search_from)
+            if match is None or len(match.group()) == fence:
+                break
+            search_from = match.end()
+        if match is None:
+            continue
+        ranges.append((start, match.end()))
+        position = match.end()
+    return ranges
+
+
 class ReportTests(unittest.TestCase):
     def info(self, changes=(), *, source="https://example.invalid/list.json", **kwargs):
         return RunInfo(
@@ -1532,6 +2033,32 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("\x1b", report)
         self.assertIn("RED", report)  # the name itself is still readable
 
+    def test_a_directory_name_cannot_forge_a_link_in_the_demotion_note(self):
+        """The demotion note embeds the snapshot PATH -- data, not code.
+
+        A directory called "a[x](https://evil.example)" used to render as a live,
+        clickable link inside the bot's own pull request: the escaping applied to
+        the tables never reached the header notes, which are built in another
+        module and carry a path.
+        """
+        note = "skipped - no snapshot at /tmp/a[x](https://evil.example)/s.json yet"
+        report = render_report(self.info(demotion_note=note))
+        line = next(line for line in report.splitlines() if line.startswith("- Demotion:"))
+        self.assertIn("\\[x\\]", line)  # escaped, so it renders as literal text
+        self.assertNotIn("[x](https://evil.example)", line)  # never a link
+
+    def test_the_snapshot_note_keeps_its_own_markdown(self):
+        """Unlike the demotion note, this one is authored in code.
+
+        It says "**not refreshed**" and names `--demote` in a code span; those
+        markers must render, so the note must NOT be escaped as data.
+        """
+        note = "**not refreshed** - demotion is disabled (`--demote`) so removals stay candidates"
+        report = render_report(self.info(snapshot_note=note))
+        line = next(line for line in report.splitlines() if line.startswith("- Snapshot: **"))
+        self.assertIn("**not refreshed**", line)
+        self.assertIn("`--demote`", line)
+
     def test_bidi_overrides_cannot_reverse_the_rest_of_the_line(self):
         """U+202E would display "abcDEF" as "abcFED" and flip the next column."""
         change = Change("[U:1:100]", "abc\u202eDEF", ("suspicious",), ("cheater",))
@@ -1539,6 +2066,36 @@ class ReportTests(unittest.TestCase):
         for character in ("\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069"):
             self.assertNotIn(character, report)
         self.assertIn("\ufffd", report)
+
+    def test_invisible_format_characters_cannot_make_two_names_look_alike(self):
+        """A zero-width space, a word joiner or a tag character hides itself.
+
+        Two different names would then render identically in the review table,
+        and Unicode tag characters are a known way to hide text outright. Only
+        the bidi set was neutralised, so these sailed into the pull request body.
+        """
+        for character in (
+            "\u200b",  # zero-width space
+            "\u2060",  # word joiner
+            "\ufeff",  # zero-width no-break space / BOM
+            "\u00ad",  # soft hyphen
+            "\u061c",  # Arabic letter mark
+            "\u180e",  # Mongolian vowel separator
+            "\U000e0041",  # Unicode tag character
+            "\ufff9",  # interlinear annotation anchor
+        ):
+            with self.subTest(character=f"U+{ord(character):04X}"):
+                change = Change("[U:1:100]", f"Pla{character}yer", ("suspicious",), ("cheater",))
+                report = render_report(self.info([change]))
+                self.assertNotIn(character, report)
+                self.assertIn("\ufffd", report)
+
+    def test_joiners_that_carry_meaning_are_kept(self):
+        """ZWNJ and ZWJ are invisible but real: Persian/Indic text, emoji family."""
+        change = Change("[U:1:100]", "می\u200cخواهم", ("suspicious",), ("cheater",))
+        report = render_report(self.info([change]))
+        self.assertIn("\u200c", report)
+        self.assertNotIn("\ufffd", report)
 
     def test_bell_and_backspace_cannot_hide_what_was_written(self):
         change = Change("[U:1:100]", "good\x07\x08BAD", ("suspicious",), ("cheater",))
@@ -1574,6 +2131,51 @@ class ReportTests(unittest.TestCase):
         report = render_report(self.info([change]))
         self.assertNotIn("\x1b", report)
 
+    def test_an_enormous_proof_link_cannot_collapse_the_report(self):
+        """Regression: ten 6,000-character links used to hard-truncate the body.
+
+        The body collapsed to 494 bytes -- header, table header and "report
+        truncated" -- losing the closing sentence and the removed-SteamID table
+        the report exists to publish.
+        """
+        long_url = "https://example.invalid/" + "a" * 6000
+        change = Change("[U:1:100]", "n", ("suspicious",), ("cheater",), evidence=tuple([long_url] * 10))
+        report = render_report(self.info([change], removed_upstream=("[U:1:300]",)))
+        self.assertNotIn("report truncated", report)
+        self.assertIn("nothing else is modified.", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
+        self.assertLessEqual(len(report.encode()), MAX_REPORT_BYTES)
+
+    def test_an_enormous_attribute_list_cannot_collapse_the_report(self):
+        """Same regression through the database side of the report."""
+        attributes = tuple(f"attr{position}-" + "z" * 5900 for position in range(20))
+        report = render_report(
+            self.info([Change("[U:1:100]", "n", attributes, ("cheater",))], removed_upstream=("[U:1:300]",))
+        )
+        self.assertNotIn("report truncated", report)
+        self.assertIn("nothing else is modified.", report)
+
+    def test_a_proof_link_too_long_to_show_is_text_not_a_broken_link(self):
+        """A cut link would look clickable and go somewhere else."""
+        long_url = "https://example.invalid/" + "a" * 6000
+        report = render_report(
+            self.info([Change("[U:1:100]", "n", ("suspicious",), ("cheater",), evidence=(long_url,))])
+        )
+        self.assertIn("…", report)
+        self.assertNotIn(f"]({long_url})", report)
+        self.assertNotIn("a" * (MAX_EVIDENCE_LINK_CHARS + 10), report)
+
+    def test_an_attribute_list_is_capped_and_counts_what_it_hides(self):
+        hidden = 3
+        attributes = tuple(f"attribute{position}" for position in range(MAX_ATTRIBUTE_CELLS + hidden))
+        report = render_report(self.info([Change("[U:1:100]", "n", attributes, ("cheater",))]))
+        self.assertIn(f"and {hidden} more", report)
+
+    def test_an_absurdly_long_attribute_is_shortened(self):
+        report = render_report(self.info([Change("[U:1:100]", "n", ("x" * 5000,), ("cheater",))]))
+        self.assertIn("…", report)
+        self.assertNotIn("x" * (MAX_ATTRIBUTE_CHARS + 10), report)
+
     def test_no_changes_message(self):
         report = render_report(self.info())
         self.assertIn("**No changes.**", report)
@@ -1590,6 +2192,17 @@ class ReportTests(unittest.TestCase):
         )
         # The actual URL the bytes were fetched from stays visible for debugging.
         self.assertIn("- Fetched from: https://example.invalid/list.json", report)
+
+    def test_the_fetch_line_never_publishes_a_credential(self):
+        """The same line is the public pull request body's fetch record."""
+        report = render_report(
+            self.info(source="https://user:secret@example.invalid/list.json?token=ghp_SECRET&ref=main")
+        )
+        # "&" and "_" are markdown-escaped in running text (they render as
+        # themselves; the escape is what stops a URL from forging emphasis).
+        self.assertIn("- Fetched from: https://example.invalid/list.json?token=REDACTED&amp;ref=main", report)
+        self.assertNotIn("secret", report)
+        self.assertNotIn("ghp_SECRET", report)
 
     def test_every_change_row_links_the_player_to_steamhistory(self):
         """Reviewers can open the archived profile (past names, bans) in one click."""
@@ -1658,7 +2271,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("- Snapshot: `mirror/vorobey.json` updated to an exact copy", report)
         self.assertNotIn("snapshot/playerlist.vorobey-hackerpolice.json", report)
 
-    def test_proof_note_is_the_last_line_even_with_include_proof(self):
+    def test_proof_note_is_the_last_line(self):
         changes = (
             Change(
                 steamid="[U:1:100]",
@@ -1668,13 +2281,36 @@ class ReportTests(unittest.TestCase):
                 evidence=("https://example.invalid/p",),
             ),
         )
-        report = render_report(self.info(changes, include_proof=True))
+        report = render_report(self.info(changes))
         lines = [line for line in report.splitlines() if line.strip()]
         self.assertEqual(
             lines[-1],
             "Proof link comes from the Vorobey hackerpolice list and is shown for review only.",
         )
-        self.assertIn("`--include-proof` was enabled", report)
+
+    def test_normalised_file_is_reported_instead_of_no_changes(self):
+        """The sync always writes entries in canonical form.
+
+        A hand-appended entry is re-sorted without any tag changing: the file
+        in the pull request differs, so the body must not claim "No changes".
+        """
+        report = render_report(self.info(database_changed=True))
+        self.assertIn("**No player changes** (the database file was normalised:", report)
+        self.assertNotIn("**No changes.**", report)
+        self.assertNotIn("**No database changes**", report)
+
+        both = render_report(self.info(database_changed=True, snapshot_changed=True))
+        self.assertIn("the snapshot was refreshed too", both)
+
+        # A dry run writes nothing, so the sentence must be conditional there.
+        dry = render_report(self.info(database_changed=True, snapshot_changed=True, dry_run=True))
+        self.assertIn("would be normalised", dry)
+        self.assertIn("the snapshot would be refreshed too", dry)
+        self.assertNotIn("was normalised", dry)
+
+        # A snapshot-only run keeps its existing wording.
+        snapshot_only = render_report(self.info(snapshot_changed=True))
+        self.assertIn("**No database changes** (snapshot refresh only).", snapshot_only)
 
     def test_snapshot_diff_shows_added_removed_and_net(self):
         report = render_report(
@@ -1721,6 +2357,16 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("<script", report)
         self.assertIn("&lt;script&gt;", report)
 
+    def test_a_url_cannot_ping_a_user_from_the_report(self):
+        """``@handle`` in the body is a mention: it notifies a stranger.
+
+        The fetch line carries a URL from --source, or from a document's
+        download_url -- which comes from someone else's server.
+        """
+        report = render_report(self.info(source="https://example.invalid/@octocat/playerlist.json"))
+        self.assertIn("&#64;octocat", report)
+        self.assertNotIn("@octocat", report)
+
     def test_fetch_url_credentials_are_redacted(self):
         """A --source may carry a token; the PR body is public to the repo."""
         info = RunInfo(
@@ -1749,7 +2395,7 @@ class ReportTests(unittest.TestCase):
             evidence=(HACKERPOLICE_PROOF,),
         )
         report = render_report(self.info([change]))
-        self.assertIn("**1 entry promoted to `cheater`.**", report)
+        self.assertIn("**1 entry promoted to `cheater` in the Garou3299 database:**", report)
         self.assertIn(
             "| `[U:1:1]` | [cheater \\| with pipe](https://steamcommunity.com/profiles/76561197960265729) |",
             report,
@@ -1801,7 +2447,148 @@ class ReportTests(unittest.TestCase):
         without_links = Change("[U:1:2]", "b", ("suspicious",), ("cheater",))
         report = render_report(self.info([with_links, without_links]))
         self.assertIn("[proof 1](https://x/1), [proof 2](https://x/2)", report)
-        self.assertIn("**2 entries promoted to `cheater`.**", report)
+        self.assertIn("**2 entries promoted to `cheater` in the Garou3299 database:**", report)
+
+    def test_database_proofs_are_never_published_in_the_report(self):
+        """The report is public; the proofs in the database are not printable.
+
+        A ``racist`` entry's proof is the chat line TF2BD auto-marked it with --
+        ``[auto] automatically marked: Racist | reason: "..."`` -- i.e. actual
+        slur text. The report shows SteamIDs, names, attributes and the UPSTREAM
+        evidence links only, so it must never echo a database proof: that is
+        what keeps the pull request body publishable.
+        """
+        marker = "SLUR-MARKER-DO-NOT-PUBLISH"
+        line = f'[auto] automatically marked: Racist | reason: "{marker}"'
+        database = {
+            "$schema": "x",
+            "file_info": {},
+            "players": [player("[U:1:200]", ["cheater", "racist"], proof=[line])],
+        }
+        changes = demote(database, ["[U:1:200]"])
+        report = render_report(self.info(changes, removed_upstream=("[U:1:200]",)))
+        # the proof itself survives in the database ...
+        self.assertEqual(database["players"][0]["proof"], [line])
+        # ... and never appears in the report
+        self.assertNotIn(marker, report)
+        self.assertNotIn("[auto] automatically marked", report)
+
+    def test_line_terminators_cannot_split_a_table_row(self):
+        """U+2028/U+2029/U+0085 break lines in CSS and in str.splitlines().
+
+        A player name is attacker-controlled, so one containing a line
+        terminator must not be able to end a table row early and start a new
+        one. Everything that ends a line is neutralised, not just \n and \r.
+        """
+        name = "evil\u2028name\u2029other\x85nel\nlf\rcr\x0bvt\x0cff"
+        change = Change("[U:1:1]", name, ("suspicious",), ("cheater",))
+        report = render_report(self.info([change]))
+        for terminator in ("\u2028", "\u2029", "\x85", "\x0b", "\x0c"):
+            self.assertNotIn(terminator, report)
+        # splitlines() must see exactly the same lines as a plain split: any
+        # extra break would mean an unneutralised terminator survived.
+        self.assertEqual(len(report.rstrip("\n").split("\n")), len(report.splitlines()))
+        row = next(line for line in report.split("\n") if line.startswith("| `[U:1:1]`"))
+        self.assertIn("evil name other nel lf cr vt ff", row)
+
+    def test_a_backslash_cannot_neutralise_the_escape_that_follows_it(self):
+        """``_text`` must escape the backslash before anything else.
+
+        "a\\`b" used to become "a\\\\`b": the doubled backslash is a literal
+        backslash, so the backtick after it opened a code span that ran on
+        into the next line of the report.
+        """
+        report = render_report(self.info(source="https://host/a\\`b"))
+        spans = _code_span_ranges(report)
+        for start, end in spans:
+            self.assertNotIn("\n", report[start:end])
+        outside = "".join(
+            character for index, character in enumerate(report) if not any(start <= index < end for start, end in spans)
+        )
+        # Outside code spans every backtick must still be escaped: strip the
+        # "\\<punct>" escapes, then nothing may be left to open a span.
+        stripped = re.sub(r"\\" + "[" + re.escape(string.punctuation) + "]", "", outside)
+        self.assertNotIn("`", stripped)
+
+    def test_a_backtick_in_a_proof_url_cannot_start_a_code_span(self):
+        """A raw backtick in a link target opens a span before the link exists."""
+        change = Change("[U:1:1]", "n", ("suspicious",), ("cheater",), ("https://e/x`y",))
+        report = render_report(self.info([change]))
+        for start, end in _code_span_ranges(report):
+            self.assertNotIn("\n", report[start:end])
+        self.assertIn("https://e/x%60y", report)
+
+    def test_a_stray_backtick_cannot_swallow_the_rest_of_a_row(self):
+        """Outside a code span a backtick OPENS one.
+
+        A player name such as "tick` here" left the report with an odd number
+        of backticks: the span opened inside the name cell ran on to the next
+        backtick, so the profile link stopped being a link and the rest of the
+        row was rendered as code.
+        """
+        change = Change("[U:1:1]", "tick` here", ("suspicious",), ("cheater",), ("proof`text",))
+        report = render_report(self.info([change]))
+        spans = _code_span_ranges(report)
+        self.assertTrue(spans)
+        for start, end in spans:
+            self.assertNotIn("\n", report[start:end], "a code span ran past the end of its line")
+        row = next(line for line in report.split("\n") if line.startswith("| `[U:1:1]`"))
+        self.assertEqual(row.count("|"), 7)  # six cells, still six
+        self.assertIn("[SteamHistory](", row)
+        self.assertIn("tick\\` here", row)
+
+    def test_a_backtick_cannot_break_out_of_a_code_span(self):
+        """A backslash does not escape a backtick inside a code span.
+
+        So the fence has to grow past the longest backtick run in the value.
+        Escaping it the old way closed the span early, and the tail of the
+        value was then parsed as Markdown (``x` and **bold** ` `` rendered its
+        "bold" as bold in the page, outside the code).
+        """
+        for value in ("plain", "a`b", "`start", "end`", "a``b", "x` and **bold** `", "`"):
+            rendered = report_module._code(value)
+            fence = len(rendered) - len(rendered.lstrip("`"))
+            self.assertGreaterEqual(fence, 1)
+            self.assertTrue(rendered.endswith("`" * fence))
+            content = rendered[fence:-fence]
+            inner = max((len(run) for run in re.findall(r"`+", content)), default=0)
+            self.assertLess(inner, fence, f"{value!r} -> {rendered!r} closes its own span")
+            self.assertIn(value, content)
+
+    def test_the_database_label_cannot_inject_markup(self):
+        """The headline names the database file, so it is data too.
+
+        A database called ``<b>x.json`` (or one holding ``[c](https://evil)``)
+        must not open an HTML tag or a link in the pull request.
+        """
+        for name in ("<b>x.json", "[c](https://elsewhere.example).json", "a|b.json"):
+            change = Change("[U:1:1]", "n", ("suspicious",), ("cheater",))
+            info = report_module.RunInfo(
+                database_path=Path("/tmp") / name,
+                source="https://example.invalid/list.json",
+                source_total=10,
+                source_skipped=0,
+                dry_run=False,
+                changes=(change,),
+            )
+            report = render_report(info)
+            # Code spans are literal, so only the text OUTSIDE them matters.
+            outside_code = re.sub(r"`+[^`]*`+", "", report)
+            self.assertNotIn("<", outside_code)
+            self.assertNotIn("](https://elsewhere.example)", outside_code)
+            headline = next(line for line in report.split("\n") if "promoted to" in line)
+            self.assertIn("database:**", headline)
+
+    def test_a_url_cannot_inject_a_link_into_the_fetch_line(self):
+        """The "Fetched from" line carries a URL, which can come from upstream.
+
+        A URL holding "[click](https://elsewhere.example)" must render as
+        literal text, not as a clickable link in a bot-authored pull request.
+        """
+        report = render_report(self.info(source="https://host/[click](https://elsewhere.example)/x"))
+        line = next(line for line in report.split("\n") if "Fetched from" in line)
+        self.assertIn("\\[click\\]", line)
+        self.assertNotIn("[click](https://elsewhere.example)", report)
 
     def test_report_never_emits_raw_html(self):
         """Markdown previews that escape HTML would show the tag as literal text."""
@@ -1816,6 +2603,17 @@ class ReportTests(unittest.TestCase):
         report = render_report(self.info([change]))
         self.assertIn("| seen spinbotting |", report)
         self.assertNotIn("[proof](seen spinbotting)", report)
+
+    def test_invisible_characters_are_percent_encoded_in_link_targets(self):
+        """A proof URL is a link target too, so it gets the same treatment.
+
+        A zero-width space in a URL is invisible; two different targets then
+        look identical, and the raw character lands in the published body.
+        """
+        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://youtu.be/\u200babc",))
+        report = render_report(self.info([change]))
+        self.assertIn("%E2%80%8B", report)
+        self.assertNotIn("\u200b", report)
 
     def test_link_targets_are_escaped(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://example.invalid/a (b)",))
@@ -1845,6 +2643,30 @@ class ReportTests(unittest.TestCase):
         report = render_report(self.info([change]))
         self.assertNotIn("Proof links come from", report)
 
+    def test_a_demotions_proof_never_raises_the_note(self):
+        """Only the promotion table has a proof column, so only it needs the note.
+
+        A demoted entry can still carry the ``[auto] ... Racist`` proof it kept,
+        but the demotion table never renders it -- annotating a link that is not
+        on the page would be the same defect as the capped-table case.
+        """
+        change = Change(
+            "[U:1:1]",
+            "a",
+            ("cheater", "racist"),
+            ("racist",),
+            ("https://proof.example/1",),
+            kind="demote",
+        )
+        # The exact shape that raised the question: no promotion table at all,
+        # a demotion table and the removed-from-the-list table.
+        report = render_report(self.info([change], removed_upstream=("[U:1:2]",)))
+        self.assertNotIn("promoted to", report)
+        self.assertIn("demoted", report)
+        self.assertIn("removed from the Vorobey hackerpolice list", report)
+        self.assertNotIn("Hackerpolice proof", report)
+        self.assertNotIn("Proof link", report)
+
     def test_name_and_proof_cells_cannot_inject_html_or_mentions(self):
         change = Change(
             "[U:1:1]",
@@ -1859,6 +2681,64 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("@everyone", report)
         self.assertNotIn("<b>", report)
         self.assertIn("&lt;b&gt;this&lt;/b&gt;", report)  # rendered literally, not as HTML
+
+    def test_the_table_and_the_running_text_share_one_escape_policy(self):
+        """Two hand-maintained lists is how a hole gets missed.
+
+        The entity spelling of a character got past BOTH the table escaping and
+        the running-text escaping, because each was a separate list; the fix
+        needed two edits, and missing either would have left the hole open.
+        They are now derived from one map, and this pins that they stay so.
+        """
+        for character, replacement in report_module._ESCAPES.items():
+            with self.subTest(character=character):
+                if character.isspace():
+                    # Both turn a line break into a space; the cell then trims
+                    # it away and falls back to its "-" placeholder.
+                    self.assertEqual(report_module._text(character), " ")
+                    self.assertEqual(report_module._cell(character), "-")
+                    continue
+                self.assertNotEqual(replacement, character)  # actually an escape
+                self.assertEqual(report_module._text(character), replacement)
+                self.assertEqual(report_module._cell(character), replacement)
+        # The one intentional difference: a pipe ends a table cell.
+        self.assertNotIn("|", report_module._ESCAPES)
+        self.assertNotEqual(report_module._cell("|"), report_module._text("|"))
+
+    def test_a_name_cannot_render_emphasis_in_the_pull_request(self):
+        """The report is markdown that a human APPROVES.
+
+        A player name is data from the database (and, upstream, from whoever
+        wrote it). Unescaped, "**Approved by admin**" rendered as bold text, and
+        "~~cheater~~ trusted" as struck-through text, inside the bot's own pull
+        request -- formatting the reviewer never asked for, in the one column a
+        reader takes at face value.
+        """
+        for name, marker in (
+            ("**Approved by admin**", "\\*\\*Approved by admin\\*\\*"),
+            ("__under__", "\\_\\_under\\_\\_"),
+            ("~~cheater~~ trusted", "\\~\\~cheater\\~\\~ trusted"),
+        ):
+            with self.subTest(name=name):
+                cell = report_module._cell(name)
+                self.assertEqual(cell, marker)
+                # and an ordinary underscore survives, visibly unchanged:
+                self.assertEqual(report_module._cell("a_b_c"), "a\\_b\\_c")
+
+    def test_a_name_cannot_smuggle_an_html_entity_past_the_guards(self):
+        """The entity SPELLING defeated every character-level defence.
+
+        ``&#x202E;`` is not a bidi character, so the bidi scrub let it through,
+        and the renderer turned it into U+202E -- a right-to-left override in
+        the review table. ``&#8203;`` did the same with a zero-width space, and
+        ``&#64;admin`` rendered ``@admin``: a mention ping from the bot's own
+        pull request, which the ``@`` -> ``&#64;`` escape exists to prevent.
+        """
+        for name in ("&#x202E;evil", "&#8203;hidden", "&#64;admin"):
+            with self.subTest(name=name):
+                cell = report_module._cell(name)
+                self.assertNotIn("&#", cell.replace("&#64;", "").replace("&amp;", ""))
+                self.assertIn("&amp;#", cell)  # the entity spelling is now inert text
 
     def test_change_tables_are_capped(self):
         changes = [
@@ -1910,18 +2790,123 @@ class ReportTests(unittest.TestCase):
         self.assertIn("; nothing else is modified.", report)
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
 
-    def test_a_single_enormous_row_is_still_cut_as_the_very_last_resort(self):
-        """An unshortenable cell (one absurd URL): only then is the body cut.
+    def test_a_single_enormous_row_is_shortened_instead_of_truncated(self):
+        """An absurd URL is shortened, so the body never needs the last resort.
 
-        Names and the number of proof links are capped first, so the row caps
-        stay in charge; a URL has to stay whole to remain clickable, which
-        leaves the hard truncation as the final guard.
+        This used to be the ONE unshortenable cell: a URL had to stay whole to
+        remain clickable, so the whole body was hard-truncated -- header, table
+        header and a truncation note, with the closing sentence and the removed
+        SteamIDs gone. A link that long is not usable anyway, so it is now
+        shown as shortened text and everything else survives.
         """
         change = Change("[U:1:1]", "x", ("suspicious",), ("cheater",), ("https://example.invalid/" + "y" * 70_000,))
         report = render_report(self.info([change], removed_upstream=("[U:1:2]",)))
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
-        self.assertIn("report truncated to fit the pull request body limit", report)
-        report.encode("utf-8")
+        self.assertNotIn("report truncated", report)
+        self.assertIn("nothing else is modified.", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
+        report.encode("utf-8")  # always UTF-8 encodable
+
+    def test_a_body_that_would_be_too_long_shrinks_its_tables_instead(self):
+        """150 rows of maximal cells overflow the budget: drop rows, never cut.
+
+        Row caps alone are not enough when every cell is at its own limit
+        (10 proof links of 500 characters each), so the report is re-rendered
+        with smaller tables. What must survive is the closing sentence, the
+        removed-SteamID list, and an honest "and N more" note.
+        """
+        link = "https://example.invalid/" + "x" * 476
+        changes = tuple(
+            Change(f"[U:1:{number}]", "名" * 80, ("suspicious",), ("cheater",), tuple(link for _ in range(10)))
+            for number in range(1, 151)
+        )
+        report = render_report(
+            self.info(changes=changes, removed_upstream=tuple(f"[U:1:{number}]" for number in range(151, 251)))
+        )
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        self.assertNotIn("report truncated to fit the pull request body limit", report)
+        self.assertIn("; nothing else is modified.", report)
+        self.assertIn("not shown here", report)
+        self.assertIn("removed from the Vorobey hackerpolice list", report)
+
+    def test_the_last_resort_cut_still_works_when_the_budget_is_tiny(self):
+        """Every cell is bounded, so the nine shrink steps always fit in practice.
+
+        This forces the budget below a single row to prove the tenth step -- a
+        hard cut on a line boundary -- is still in working order for the day a
+        future change adds a cell without a bound.
+        """
+        changes = tuple(
+            Change(f"[U:1:{number}]", "name", ("suspicious",), ("cheater",), ("https://example.invalid/p",))
+            for number in range(1, 6)
+        )
+        budget = 700  # below one shrunken row plus the header
+        with mock.patch.object(report_module, "MAX_REPORT_BYTES", budget):
+            report = report_module.render_report(self.info(changes=changes))
+        self.assertLessEqual(len(report.encode("utf-8")), budget)
+        self.assertTrue(report.endswith("… report truncated to fit the pull request body limit."))
+        self.assertTrue(report.startswith("## Vorobey hackerpolice sync"))
+        self.assertNotIn("\ufffd", report)
+
+    def test_the_report_never_has_a_double_blank_line(self):
+        """Markdown quality: blocks are separated by exactly one blank line."""
+        changes = (
+            Change("[U:1:1]", "a", ("suspicious",), ("cheater",)),
+            Change("[U:1:2]", "b", ("cheater", "racist"), ("racist",), kind="demote"),
+            Change("[U:1:3]", "c", ("cheater",), (), kind="demote"),
+        )
+        report = render_report(self.info(changes=changes, removed_upstream=("[U:1:9]",)))
+        self.assertNotIn("\n\n\n", report)
+        self.assertIn("; nothing else is modified.", report)
+        last_block = report.split("\n\n")[-1]
+        self.assertTrue(last_block.startswith("In the Garou3299 database:"), last_block)
+
+    def test_a_demoted_entry_that_loses_every_tag_says_entry_removed(self):
+        """With no attributes left the After cell must not be blank."""
+        change = Change("[U:1:1]", "name", ("cheater",), (), kind="demote")
+        report = render_report(self.info(changes=(change,)))
+        self.assertIn("entry removed", report)
+        self.assertIn("| `cheater` | entry removed |", report)
+
+    def test_an_unusable_steamid_sorts_last_in_the_removed_table(self):
+        """Numeric order, with anything unusable trailing (stably)."""
+        table = report_module.render_removed_table(["[U:1:20]", "nope", "[U:1:3]"])
+        rows = [line for line in table if line.startswith("| `")]
+        self.assertEqual(len(rows), 3)
+        self.assertIn("[U:1:3]", rows[0])
+        self.assertIn("[U:1:20]", rows[1])
+        self.assertIn("nope", rows[2])
+
+    def test_an_absurd_database_path_is_clipped_instead_of_truncating_the_report(self):
+        """A 100,000-character path can no longer blow the body budget.
+
+        The path is operator input and used to be the last way to overflow the
+        body from inside the header. It is clipped now, so the header -- and
+        every line of it -- stays readable; ``_fit_body`` remains as defence in
+        depth and is tested directly (ReportBoundaryTests).
+        """
+        absurd = Path("/tmp/" + "d" * 100_000 + ".json")
+        info = RunInfo(
+            database_path=absurd,
+            source="https://example.invalid/list.json",
+            source_total=10,
+            source_skipped=0,
+            dry_run=False,
+            # A change matters here: the path reaches the promotion HEADLINE as
+            # well as the header bullet, and the headline is what used to push
+            # the body past its budget and drop the closing sentence.
+            changes=(Change("[U:1:1]", "name", ("suspicious",), ("cheater",)),),
+        )
+        report = render_report(info)
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+        self.assertNotIn("report truncated to fit the pull request body limit", report)
+        self.assertIn("; nothing else is modified.", report)
+        self.assertIn("…", report)  # the path itself is the thing clipped
+        self.assertTrue(report.startswith("## Vorobey hackerpolice sync"))
+        database_line = next(line for line in report.splitlines() if line.startswith("- Database:"))
+        self.assertLessEqual(len(database_line), 300)
+        self.assertLessEqual(max(len(line) for line in report.splitlines()), 400)
+        self.assertNotIn("\ufffd", report)
 
     def test_an_enormous_name_is_shortened_instead_of_truncating_the_report(self):
         """A name is data, not a link: cap it and keep the tables and sentence."""
@@ -1980,11 +2965,10 @@ class ReportTests(unittest.TestCase):
         )
         self.assertNotIn("more entries not shown here", render_report(info))
 
-    def test_dry_run_and_include_proof_notes(self):
+    def test_dry_run_note(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))
-        report = render_report(self.info([change], dry_run=True, include_proof=True))
+        report = render_report(self.info([change], dry_run=True))
         self.assertIn("**dry run**", report)
-        self.assertIn("`--include-proof` was enabled", report)
 
 
 # --------------------------------------------------------------------------- #
@@ -2010,7 +2994,7 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
     def test_table_lists_the_steamid_and_its_permalink(self):
         report = render_report(self.info(removed_upstream=("[U:1:269327660]",)))
         self.assertIn(
-            "**1 SteamID removed from the Vorobey hackerpolice list since the previous snapshot.**",
+            "**1 SteamID removed from the Vorobey hackerpolice list since the previous snapshot:**",
             report,
         )
         self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
@@ -2063,6 +3047,36 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
             report.index("promoted to `cheater`"), report.index("removed from the Vorobey hackerpolice list")
         )
 
+    def test_the_three_tables_always_come_in_promote_demote_removed_order(self):
+        """The body never reorders the tables, whether one, two or three are present."""
+        promote = Change("[U:1:400]", "a", ("suspicious",), ("cheater",), kind="promote")
+        demote = Change("[U:1:300]", "b", ("cheater", "racist"), ("racist",), kind="demote")
+        markers = (
+            "promoted to `cheater`",
+            "demoted (present in the previous snapshot",
+            "removed from the Vorobey hackerpolice list since the previous snapshot",
+        )
+        cases = {
+            "all three": {"changes": (demote, promote), "removed_upstream": ("[U:1:300]", "[U:1:500]")},
+            "promote + removed": {"changes": (promote,), "removed_upstream": ("[U:1:500]",)},
+            "demote + removed": {"changes": (demote,), "removed_upstream": ("[U:1:300]",)},
+            "promote only": {"changes": (promote,), "removed_upstream": ()},
+            "removed only": {"changes": (), "removed_upstream": ("[U:1:500]",)},
+        }
+        for title, kwargs in cases.items():
+            with self.subTest(title):
+                report = render_report(self.info(**kwargs))
+                present = [marker for marker in markers if marker in report]
+                self.assertEqual(
+                    [report.index(marker) for marker in present],
+                    sorted(report.index(marker) for marker in present),
+                    f"{title}: {present}",
+                )
+                # A demotion is an upstream removal the database still contains,
+                # so the raw removed table is always printed with it.
+                if "demoted (present" in report:
+                    self.assertIn(markers[2], report)
+
     def test_closing_sentence_and_proof_note_are_always_last(self):
         change = Change("[U:1:400]", "a", ("suspicious",), ("cheater",), ("https://x/1",))
         report = render_report(self.info(changes=(change,), removed_upstream=("[U:1:5]",)))
@@ -2077,11 +3091,11 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         other = Change("[U:1:401]", "c", ("suspicious",), ("cheater",))
         removed_entry = Change("[U:1:500]", "b", ("cheater",), (), kind="demote")
         report = render_report(self.info(changes=(change, other, removed_entry)))
-        self.assertIn("In `playerlist.garou3299.json`: attributes are changed for these SteamIDs", report)
+        self.assertIn("In the Garou3299 database: attributes are changed for these SteamIDs", report)
         self.assertIn("entry is removed for this SteamID: [U:1:500]", report)
         # ... and only that once (the header bullet is a separate line):
         closing = next(line for line in report.splitlines() if "nothing else is modified" in line)
-        self.assertEqual(closing.count("`playerlist.garou3299.json`"), 1)
+        self.assertEqual(closing.count("Garou3299"), 1)
         # Only the file name -- never an absolute/temporary path.
         self.assertNotIn(str(Path("playerlist.garou3299.json").resolve()), report)
 
@@ -2108,8 +3122,16 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         self.assertIn("| `nonsense` | - |", report)
 
     def test_report_stays_utf8_encodable(self):
+        """A report must always encode: the CLI writes it with UTF-8.
+
+        Lone surrogates are legal in a JSON database and impossible to encode,
+        so this asserts the bytes really are produced -- not merely that no
+        exception escaped.
+        """
         report = render_report(self.info(removed_upstream=("[U:1:1]",), previous_source_total=10))
-        report.encode("utf-8")
+        encoded = report.encode("utf-8")
+        self.assertTrue(encoded)
+        self.assertIn(b"removed from the Vorobey hackerpolice list", encoded)
 
 
 # --------------------------------------------------------------------------- #
@@ -2157,28 +3179,25 @@ class ClosingMessageTests(unittest.TestCase):
             "Attribute is changed for this SteamID: [U:1:200]; nothing else is modified.",
         )
 
-    def test_database_name_is_included_when_given(self):
+    def test_database_label_scopes_the_sentence(self):
         promote_change = Change("[U:1:400]", "a", ("suspicious",), ("cheater",), kind="promote")
         demote_change = Change("[U:1:300]", "b", ("cheater",), (), kind="demote")
-        # The file scopes the whole sentence and is named exactly once.
+        # The label scopes the whole sentence and is named exactly once.
         self.assertEqual(
-            render_closing([promote_change], database="playerlist.garou3299.json"),
-            "In `playerlist.garou3299.json`: attribute is changed for this SteamID: [U:1:400]; "
-            "nothing else is modified.",
+            render_closing([promote_change], database="Garou3299"),
+            "In the Garou3299 database: attribute is changed for this SteamID: [U:1:400]; nothing else is modified.",
         )
         self.assertEqual(
-            render_closing([demote_change], database="playerlist.garou3299.json"),
-            "In `playerlist.garou3299.json`: entry is removed for this SteamID: [U:1:300]; nothing else is modified.",
+            render_closing([demote_change], database="Garou3299"),
+            "In the Garou3299 database: entry is removed for this SteamID: [U:1:300]; nothing else is modified.",
         )
         self.assertEqual(
-            render_closing([promote_change, demote_change], database="playerlist.garou3299.json"),
-            "In `playerlist.garou3299.json`: attribute is changed for this SteamID: [U:1:400]; "
+            render_closing([promote_change, demote_change], database="Garou3299"),
+            "In the Garou3299 database: attribute is changed for this SteamID: [U:1:400]; "
             "entry is removed for this SteamID: [U:1:300]; nothing else is modified.",
         )
         self.assertEqual(
-            render_closing([promote_change, demote_change], database="playerlist.garou3299.json").count(
-                "playerlist.garou3299.json"
-            ),
+            render_closing([promote_change, demote_change], database="Garou3299").count("Garou3299"),
             1,
         )
 
@@ -2190,20 +3209,63 @@ class ClosingMessageTests(unittest.TestCase):
             Change("[U:1:301]", "d", ("cheater",), (), kind="demote"),
         ]
         self.assertEqual(
-            render_closing(changes, database="playerlist.garou3299.json"),
-            "In `playerlist.garou3299.json`: attributes are changed for these SteamIDs: [U:1:400], [U:1:401]; "
+            render_closing(changes, database="Garou3299"),
+            "In the Garou3299 database: attributes are changed for these SteamIDs: [U:1:400], [U:1:401]; "
             "entries are removed for these SteamIDs: [U:1:300], [U:1:301]; nothing else is modified.",
         )
 
-    def test_database_name_is_the_file_name_only(self):
-        info = RunInfo(
-            database_path=Path("/tmp/some/dir/playerlist.garou3299.json"),
-            source="https://example.invalid/list.json",
-            source_total=1,
-            source_skipped=0,
-            dry_run=False,
+    def test_database_label_is_derived_from_the_file_name(self):
+        cases = {
+            "playerlist.garou3299.json": "Garou3299",
+            "/tmp/some/dir/playerlist.garou3299.json": "Garou3299",
+            "mylist.json": "Mylist",
+            "playerlist.json": "Playerlist",
+            # A file whose owner part is empty falls back to the whole stem.
+            "playerlist.2024.json": "2024",
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                info = RunInfo(
+                    database_path=Path(path),
+                    source="https://example.invalid/list.json",
+                    source_total=1,
+                    source_skipped=0,
+                    dry_run=False,
+                )
+                self.assertEqual(info.database_label, expected)
+
+    def test_headlines_name_the_database_and_read_as_sentences(self):
+        promote = Change("[U:1:400]", "a", ("suspicious",), ("cheater",), kind="promote")
+        demote = Change("[U:1:300]", "b", ("cheater", "racist"), ("racist",), kind="demote")
+        rendered = render_report(
+            RunInfo(
+                database_path=Path("playerlist.garou3299.json"),
+                source="https://example.invalid/list.json",
+                source_total=1,
+                source_skipped=0,
+                dry_run=False,
+                changes=(promote, demote),
+            )
         )
-        self.assertEqual(info.database_name, "playerlist.garou3299.json")
+        self.assertIn("**1 entry promoted to `cheater` in the Garou3299 database:**", rendered)
+        self.assertIn(
+            "**1 entry demoted (present in the previous snapshot, absent from the current "
+            "Vorobey hackerpolice list) in the Garou3299 database:**",
+            rendered,
+        )
+
+    def test_headlines_take_the_database_label(self):
+        promote = Change("[U:1:400]", "a", ("suspicious",), ("cheater",), kind="promote")
+        demote = Change("[U:1:300]", "b", ("cheater",), (), kind="demote")
+        self.assertEqual(
+            _promotion_lines([promote], database="Garou3299")[0],
+            "**1 entry promoted to `cheater` in the Garou3299 database:**",
+        )
+        self.assertEqual(
+            _demotion_lines([demote], database="Garou3299")[0],
+            "**1 entry demoted (present in the previous snapshot, absent from the current "
+            "Vorobey hackerpolice list) in the Garou3299 database:**",
+        )
 
     def test_combined_promote_and_demote(self):
         changes = [
@@ -2216,7 +3278,8 @@ class ClosingMessageTests(unittest.TestCase):
         )
 
     def test_no_changes(self):
-        self.assertEqual(render_closing([]), "; nothing else is modified.")
+        self.assertEqual(render_closing([]), "Nothing has changed.")
+        self.assertEqual(render_closing([], database="Garou3299"), "In the Garou3299 database: nothing has changed.")
 
     def test_closing_sentence_is_bounded_for_a_huge_run(self):
         limit = report_module.MAX_CLOSING_STEAMIDS
@@ -2306,7 +3369,7 @@ class ReportBoundaryTests(unittest.TestCase):
             Change(steamid="[U:1:200]", name="d", before=("cheater", "racist"), after=("racist",), kind="demote"),
         )
         rendered = render_report(self._info(changes=changes))
-        promotion_block, demotion_block = rendered.split("demoted (in the previous snapshot", 1)
+        promotion_block, demotion_block = rendered.split(" demoted (present in the previous snapshot", 1)
         self.assertIn("[U:1:100]", promotion_block)
         self.assertNotIn("[U:1:200]", promotion_block)
         self.assertIn("[U:1:200]", demotion_block)
@@ -2318,6 +3381,45 @@ class ReportBoundaryTests(unittest.TestCase):
         without = (Change(steamid="[U:1:1]", name="n", before=("suspicious",), after=("cheater",)),)
         self.assertIn("Proof link comes from", render_report(self._info(changes=with_link)))
         self.assertNotIn("Proof link", render_report(self._info(changes=without)))
+
+    def test_proof_note_needs_a_link_in_the_rendered_rows(self):
+        """A capped table can hide every link: then there is nothing to annotate.
+
+        The note sits directly under the tables, so a note about a link the
+        reader cannot see -- the only proof riding on the row the row cap drops
+        -- reads as a promise the report does not keep.
+        """
+        limit = MAX_CHANGE_TABLE_ROWS
+
+        def promotions(proof_on: int) -> tuple[Change, ...]:
+            return tuple(
+                Change(
+                    steamid=f"[U:1:{n}]",
+                    name="n",
+                    before=("suspicious",),
+                    after=("cheater",),
+                    evidence=("https://proof.example/1",) if n == proof_on else (),
+                )
+                # Starts at 1, so proof_on=0 is the run with no link at all.
+                for n in range(1, limit + 2)
+            )
+
+        def account_id(steamid: str) -> int:
+            return int(steamid.rsplit(":", 1)[1].rstrip("]"))
+
+        bare = render_report(self._info(changes=promotions(0)))
+        self.assertNotIn("Proof link", bare)
+        shown = [line.split("`")[1] for line in bare.splitlines() if line.startswith("| `[")]
+        self.assertEqual(len(shown), limit)
+        hidden = next(f"[U:1:{n}]" for n in range(1, limit + 2) if f"[U:1:{n}]" not in shown)
+
+        # The only link rides on the entry the cap drops.
+        dropped = render_report(self._info(changes=promotions(account_id(hidden))))
+        self.assertIn("1 more entry not shown", dropped)
+        self.assertNotIn("Proof link", dropped)
+        # In a visible row the same link is annotated again.
+        kept = render_report(self._info(changes=promotions(account_id(shown[0]))))
+        self.assertIn("Proof link comes from", kept)
 
     def test_multiple_links_use_the_plural_note(self):
         changes = (
@@ -2342,22 +3444,516 @@ class ClosingOrderTests(unittest.TestCase):
         self.assertIn("these SteamIDs: [U:1:100], [U:1:900];", closing)
 
 
-class WriteDatabaseCompatibilityTests(unittest.TestCase):
-    def test_accepts_the_pre_4_0_parsed_playerlist(self):
-        """The signature used to take the parsed document, not the text."""
+class SnapshotReadTests(unittest.TestCase):
+    def test_a_path_the_os_cannot_stat_is_a_read_error_not_a_crash(self):
+        """``exists()`` raises for a path longer than the OS allows (ENAMETOOLONG).
+
+        It must not escape as a bare OSError -- and it must not be read as "no
+        snapshot" either, which would silently disable demotion.
+        """
+        path = Path("/tmp") / ("d" * 200) / "snap.json"
+        with (
+            mock.patch.object(Path, "exists", side_effect=OSError(36, "File name too long", str(path))),
+            self.assertRaises(SyncError) as caught,
+        ):
+            sources.load_snapshot(path)
+        self.assertIn("cannot read", str(caught.exception))
+        self.assertIn("File name too long", str(caught.exception))
+
+
+class SupportedPythonTests(unittest.TestCase):
+    """pyproject.toml promises Python 3.10+, and only CI's 3.12 ever runs.
+
+    Enforce the floor with the standard library: the parser knows which syntax
+    each version accepts, so a 3.12-only construct fails here instead of in a
+    contributor's 3.10 interpreter.
+    """
+
+    root = Path(__file__).resolve().parent.parent
+
+    def test_the_scripts_parse_as_the_oldest_supported_python(self):
+        for path in sorted((self.root / "scripts").glob("*.py")):
+            with self.subTest(path.name):
+                ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10))
+
+    def test_the_tests_parse_as_the_oldest_supported_python(self):
+        path = self.root / "tests" / "test_sync_vorobey_hackerpolice.py"
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10))
+
+    def test_the_floor_is_the_one_documented(self):
+        pyproject = (self.root / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('target-version = "py310"', pyproject)
+        self.assertIn("Python 3.10+", pyproject)
+
+    def test_the_guard_actually_rejects_newer_syntax(self):
+        """A guard nobody tested is a guard that silently stops guarding."""
+        with self.assertRaises(SyntaxError):
+            ast.parse("type Alias = int\n", feature_version=(3, 10))
+
+
+class WorkflowContractTests(unittest.TestCase):
+    """The workflow is code too, and only the schedule ever executes it.
+
+    A renamed CLI flag, a step output nobody writes any more, a report path that
+    drifted from the pull-request body, an unpinned action or a job that stopped
+    running the tests would all break the bot silently -- GitHub only finds out
+    when the cron fires. Pin the contract in the suite instead.
+    """
+
+    root = Path(__file__).resolve().parent.parent
+    workflow_path = root / ".github" / "workflows" / "sync-vorobey-hackerpolice.yml"
+    dependabot_path = root / ".github" / "dependabot.yml"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = cls.workflow_path.read_text(encoding="utf-8")
+
+    def jobs(self) -> dict[str, str]:
+        """Split the jobs: mapping into one string per job."""
+        _, _, body = self.workflow.partition("\njobs:\n")
+        self.assertTrue(body, "the workflow must declare jobs")
+        parts = re.split(r"^  ([a-z][a-z-]*):$", body, flags=re.M)
+        return {parts[index]: parts[index + 1] for index in range(1, len(parts) - 1, 2)}
+
+    def sync_invocation(self) -> str:
+        start = self.workflow.index("python3 scripts/sync_vorobey_hackerpolice.py")
+        lines = []
+        for line in self.workflow[start:].splitlines():
+            lines.append(line)
+            if not line.rstrip().endswith("\\"):
+                break
+        return "\n".join(lines)
+
+    def test_every_flag_it_passes_is_a_real_option(self):
+        options = {option for action in sync_module.build_parser()._actions for option in action.option_strings}
+        invocation = self.sync_invocation()
+        passed = set(re.findall(r"--[a-z][a-z-]*", invocation))
+        self.assertTrue(passed, "the sync step should pass flags")
+        self.assertEqual(passed - options, set(), "the workflow passes a flag the parser dropped")
+        # Flags hidden in the DRY_RUN / ALLOW_MASS_DEMOTION shell variables.
+        for hidden in re.findall(r"'(--[a-z][a-z-]*)'", self.workflow):
+            self.assertIn(hidden, options)
+
+    def test_it_always_demotes(self):
+        """Without --demote the bot never applies a single demotion."""
+        self.assertIn("--demote", set(re.findall(r"--[a-z][a-z-]*", self.sync_invocation())))
+
+    def test_it_passes_the_files_from_the_environment(self):
+        invocation = self.sync_invocation()
+        self.assertIn('--database "$DATABASE"', invocation)
+        self.assertIn('--snapshot "$SNAPSHOT"', invocation)
+
+    def test_every_step_output_it_reads_is_one_the_run_writes(self):
+        written = run_sync_and_read_outputs(
+            database=dumps({"players": [player("[U:1:1]", ["cheater"])]}),
+            snapshot=dumps({"players": []}),
+            source=dumps({"players": [player("[U:1:1]", ["cheater"])]}),
+        )
+        read = set(re.findall(r"steps\.sync\.outputs\.([a-z_]+)", self.workflow))
+        self.assertTrue(read, "the workflow reads no step output at all")
+        self.assertEqual(read - set(written), set(), "the workflow reads an output nothing writes")
+
+    def test_the_publish_steps_require_a_successful_sync(self):
+        for block in re.findall(
+            r"- name: (?:Open or update pull request|Push branch|Commit directly)([\s\S]*?)(?=\n\s+- name:|\Z)",
+            self.workflow,
+        ):
+            self.assertIn("steps.sync.outcome == 'success'", block, "publishing must not run after a failed sync")
+            self.assertIn("steps.sync.outputs.changed == 'true'", block)
+
+    def test_the_pull_request_carries_both_files_and_uses_the_report_as_its_body(self):
+        block = self.workflow[self.workflow.index("add-paths:") :]
+        block = block[: block.index("branch:")]
+        self.assertIn("${{ env.DATABASE }}", block)
+        self.assertIn("${{ env.SNAPSHOT }}", block)
+        reported = re.search(r'--report "\$RUNNER_TEMP/([^"]+)"', self.workflow)
+        self.assertIsNotNone(reported, "the sync step must write a report")
+        body = re.search(r"body-path:\s*\$\{\{\s*runner\.temp\s*\}\}/(\S+)", self.workflow)
+        self.assertIsNotNone(body, "the pull request must use the report as its body")
+        self.assertEqual(body.group(1), reported.group(1))
+
+    def test_every_action_is_pinned_to_a_commit_and_says_which_release_it_is(self):
+        uses = re.findall(r"uses:\s*(\S+)\s*(#[^\n]*)?", self.workflow)
+        self.assertGreaterEqual(len(uses), 3)
+        for reference, comment in uses:
+            repository, _, sha = reference.partition("@")
+            self.assertRegex(repository, r"^[\w.-]+/[\w.-]+$")
+            self.assertRegex(sha, r"^[0-9a-f]{40}$", f"{reference} is not pinned to a commit SHA")
+            self.assertRegex(comment or "", r"#\s*v\d", f"{reference} needs its release tag in a comment")
+
+    def test_a_change_to_any_file_the_suite_reads_runs_the_checks(self):
+        """Every file these tests read must be able to trigger them.
+
+        ``README.md`` and ``.github/dependabot.yml`` are both read here (the
+        CLI inventory and the Dependabot contract) and neither was in the
+        ``pull_request`` paths filter: a pull request touching only those files
+        ran no checks at all, so the assertions guarding them could never fail.
+        """
+        block = self.workflow.split("  pull_request:\n", 1)[1].split("\npermissions:", 1)[0]
+        patterns = re.findall(r'^\s+- "([^"]+)"', block, re.M)
+        self.assertTrue(patterns, "the pull_request trigger has no paths at all")
+
+        def covered(name: str) -> bool:
+            return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+        for name in (
+            "README.md",
+            ".github/dependabot.yml",
+            ".github/workflows/sync-vorobey-hackerpolice.yml",
+            "pyproject.toml",
+            "scripts/playerlist.py",
+            "tests/test_sync_vorobey_hackerpolice.py",
+        ):
+            self.assertTrue(covered(name), f"{name} can change without the checks running")
+
+    def test_the_paths_it_names_exist(self):
+        for key in ("DATABASE", "SNAPSHOT"):
+            match = re.search(rf"^\s*{key}:\s*(\S+)$", self.workflow, re.M)
+            self.assertIsNotNone(match, f"{key} is not defined")
+            self.assertTrue((self.root / match.group(1)).is_file(), match.group(1))
+
+    def test_both_jobs_run_the_full_check_suite(self):
+        jobs = self.jobs()
+        self.assertEqual(set(jobs), {"checks", "sync"})
+        for name, block in jobs.items():
+            for command in (
+                "python3 -m ruff check scripts tests",
+                "python3 -m ruff format --check scripts tests",
+                "python3 -m mypy scripts",
+                "python3 -m bandit -q -r scripts",
+                "python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v",
+                "python3 -m coverage report",
+                "python3 -m vulture scripts tests --min-confidence 60",
+            ):
+                self.assertIn(command, block, f"the {name} job does not run: {command}")
+            self.assertIn("timeout-minutes:", block, f"the {name} job has no timeout")
+            self.assertIn("concurrency:", block, f"the {name} job has no concurrency group")
+
+    def test_the_sync_job_always_acts_on_the_default_branch(self):
+        """A dispatch from a feature branch must not commit or open a PR there.
+
+        actions/checkout follows the branch a workflow_dispatch was started
+        from. With no explicit ref, "commit the change" would commit to that
+        branch, and create-pull-request (whose base defaults to the checked-out
+        branch) would open a pull request against it -- a bot commit on someone's
+        feature branch, or a pull request that can never be merged into the
+        default branch. The sync maintains the default branch, and says so.
+        """
+        sync = self.jobs()["sync"]
+        self.assertIn("ref: ${{ github.event.repository.default_branch }}", sync)
+        # The checks job must NOT pin it: a pull request has to be tested on its
+        # own merge ref.
+        self.assertNotIn("ref: ${{ github.event.repository.default_branch }}", self.jobs()["checks"])
+
+    def test_the_pull_request_targets_the_default_branch_explicitly(self):
+        self.assertIn("base: ${{ env.BASE_BRANCH }}", self.workflow)
+
+    def test_a_run_with_nothing_to_do_closes_a_stale_bot_pull_request(self):
+        """Otherwise a day-old pull request stays open, offering a stale database.
+
+        Merging it later would undo whatever changed in between -- a manual fix,
+        or a newer upstream change. It must not fire on a dry run (which only
+        reports), must not fire in "commit" mode (there is no pull request), and
+        must never turn a clean run red if the token cannot manage pull requests.
+        """
+        steps = self.workflow.split("\n      - ")
+        block = next((step for step in steps if step.startswith("name: Close a stale bot pull request")), None)
+        self.assertIsNotNone(block, "the workflow must close a stale bot pull request")
+        assert block is not None  # for type checkers
+        self.assertIn("steps.sync.outputs.changed != 'true'", block)
+        self.assertIn("env.MODE != 'commit'", block)
+        self.assertIn("env.DRY_RUN_INPUT != 'true'", block)
+        self.assertIn("continue-on-error: true", block)
+        self.assertIn('gh pr list --repo "$REPOSITORY" --head "$BOT_BRANCH" --state open', block)
+
+    def test_the_checks_job_tests_the_python_floor_the_readme_promises(self):
+        """3.10 is promised in the README and was never exercised by CI.
+
+        A 3.11+ API (``datetime.UTC``, ``tomllib``) or a 3.12-only f-string would
+        keep CI green while breaking that promise for every user on the floor --
+        and the only job that really runs the code (sync) also runs 3.12.
+        """
+        checks = self.jobs()["checks"]
+        self.assertIn("matrix:", checks)
+        self.assertIn('"3.10"', checks)  # the documented floor
+        self.assertIn(
+            '"3.12"',
+            checks,
+        )  # the production version
+        self.assertIn("python-version: ${{ matrix.python-version }}", checks)
+        # Each leg needs its own concurrency group: with cancel-in-progress on a
+        # SHARED group the legs cancel each other and only one survives.
+        group = next(line for line in checks.splitlines() if line.strip().startswith("group: checks-"))
+        self.assertIn("matrix.python-version", group)
+        # The sync job is production: it stays on one version, deliberately.
+        self.assertNotIn("matrix:", self.jobs()["sync"])
+
+    def test_the_suite_does_not_inherit_the_runners_output_file(self):
+        """GITHUB_OUTPUT is exported by every CI step, including the test step.
+
+        Inheriting it made the suite append ~300 lines to the runner's real
+        output file: the tests then depended on their environment, and a step
+        reading its own outputs would be reading values produced by the tests.
+
+        Checked in a CHILD interpreter, because that is the only place the
+        import-time behaviour can be observed -- and because asserting on this
+        file's own text would match this test's own source and never fail.
+        """
+        code = (
+            "import os, sys;"
+            "os.environ['GITHUB_OUTPUT']='must-not-survive-the-import';"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r});"
+            "import test_sync_vorobey_hackerpolice;"  # importing runs the guard, no tests
+            "print(os.environ.get('GITHUB_OUTPUT', '<popped>'))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, encoding="utf-8", timeout=180
+        )
+        self.assertEqual(result.stdout.strip(), "<popped>", result.stderr[-500:])
+
+    def test_the_coverage_gate_is_encoded_not_just_convention(self):
+        """`coverage report` must fail on an untested statement OR branch.
+
+        Without a [tool.coverage] section the gate only exists in a reviewer's
+        head: a plain `coverage run` reports line coverage, and anything at all
+        reports success. The thresholds belong in the file CI reads.
+        """
+        pyproject = (self.root / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn("branch = true", pyproject)
+        self.assertIn("fail_under = 100", pyproject)
+        self.assertIn('source = ["scripts"]', pyproject)
+
+    def test_the_check_job_is_read_only(self):
+        jobs = self.jobs()
+        self.assertIn("contents: read", jobs["checks"])
+        self.assertNotIn("contents: write", jobs["checks"])
+        self.assertNotIn("pull-requests: write", jobs["checks"])
+
+    def test_the_tool_versions_are_defined_once_and_interpolated(self):
+        for name in ("RUFF_VERSION", "MYPY_VERSION", "BANDIT_VERSION", "COVERAGE_VERSION", "VULTURE_VERSION"):
+            self.assertEqual(len(re.findall(rf'^\s*{name}:\s*"[^"]+"$', self.workflow, re.M)), 1, name)
+        for name, tool in (
+            ("RUFF_VERSION", "ruff"),
+            ("MYPY_VERSION", "mypy"),
+            ("BANDIT_VERSION", "bandit"),
+            ("COVERAGE_VERSION", "coverage"),
+            ("VULTURE_VERSION", "vulture"),
+        ):
+            self.assertIn(f'"{tool}==${{{name}}}"', self.workflow)
+
+    def test_the_checks_job_runs_on_proposed_code_only(self):
+        jobs = self.jobs()
+        self.assertIn("github.event_name == 'pull_request'", jobs["checks"])
+        self.assertIn("github.event_name != 'pull_request'", jobs["sync"])
+        for watched in ("scripts/**", "tests/**", ".github/workflows/sync-vorobey-hackerpolice.yml"):
+            self.assertIn(watched, self.workflow)
+
+    def test_dependabot_only_bumps_the_pinned_actions(self):
+        text = self.dependabot_path.read_text(encoding="utf-8")
+        self.assertIn('package-ecosystem: "github-actions"', text)
+        self.assertNotIn("pip", text)  # no runtime dependencies to watch
+        self.assertNotIn("package-ecosystem: npm", text)
+        self.assertIn('interval: "weekly"', text)
+
+
+class WriteOrderTests(unittest.TestCase):
+    """Append step outputs first, then write report, database, and snapshot.
+
+    A snapshot failure can leave the database rewritten; reversing those two
+    data writes could instead advance the baseline and lose removals.
+    """
+
+    def test_a_failing_snapshot_write_happens_after_the_database_is_written(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "list.json"
-            database = {"players": [player("[U:1:1]", ["cheater"])]}
-            original = dumps(database)
-            path.write_text(original, encoding="utf-8")
-            self.assertFalse(write_database(path, database, original, dry_run=False))
-            self.assertEqual(path.read_text(encoding="utf-8"), original)
-            database["players"].append(player("[U:1:2]", ["cheater"]))
-            self.assertTrue(write_database(path, database, original, dry_run=False))
-            self.assertEqual(path.read_text(encoding="utf-8"), dumps(database))
-            # a dry run still refuses to write, whichever form is passed
-            self.assertTrue(write_database(path, {"players": []}, original, dry_run=True))
-            self.assertEqual(path.read_text(encoding="utf-8"), dumps(database))
+            root = Path(tmp)
+            (root / "up.json").write_text(dumps({"players": [player("[U:1:1]", ["cheater"])]}), encoding="utf-8")
+            # deliberately non-canonical, so a successful rewrite is visible
+            (root / "db.json").write_text(
+                '{"players":[{"attributes":["cheater"],"steamid":"[U:1:1]"}]}', encoding="utf-8"
+            )
+            # A symlink whose target directory does not exist: the guard sees a
+            # healthy parent (root), the previous-snapshot read sees "no file"
+            # (a broken link does not exist), and the write -- which resolves the
+            # link -- fails. That is the "last write fails after the database
+            # changed" case, deterministically, even when tests run as root.
+            (root / "snap.json.link").symlink_to(root / "nodir" / "snap.json")
+            with contextlib.redirect_stdout(io.StringIO()):  # the report goes to stdout
+                code = main(
+                    [
+                        "--database",
+                        str(root / "db.json"),
+                        "--snapshot",
+                        str(root / "snap.json.link"),
+                        "--source",
+                        str(root / "up.json"),
+                        "--report",
+                        str(root / "r.md"),
+                        "--demote",
+                        "-q",
+                    ]
+                )
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                (root / "db.json").read_bytes(),
+                dumps({"players": [player("[U:1:1]", ["cheater"])]}).encode("utf-8"),
+            )
+            self.assertTrue((root / "snap.json.link").is_symlink())  # the failed target is untouched
+            self.assertEqual([p.name for p in root.iterdir() if ".tmp" in p.name], [])
+
+
+class IdempotencyTests(unittest.TestCase):
+    """Running the sync again on its own output must find nothing to do.
+
+    The nightly cron consumes the files a previous run wrote. If a second run
+    still found work, every night would open another pull request -- and the
+    two reports would contradict each other.
+    """
+
+    def test_a_second_run_on_its_own_output_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            upstream = dumps(
+                {
+                    "players": [
+                        player("[U:1:1]", ["cheater"]),
+                        player("[U:1:2]", ["suspicious"]),
+                        player("[U:1:3]", ["cheater", "racist"]),
+                    ]
+                }
+            )
+            (root / "up.json").write_text(upstream, encoding="utf-8")
+            # Promoted, demoted (entry removed) and left alone, all in one run.
+            (root / "db.json").write_text(
+                dumps(
+                    {
+                        "players": [
+                            player("[U:1:1]", ["suspicious"], name="One"),
+                            player("[U:1:3]", ["cheater", "racist"], name="Three"),
+                            player("[U:1:9]", ["cheater"], name="Nine"),
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "snap.json").write_text(
+                dumps({"players": [{"steamid": "[U:1:3]"}, {"steamid": "[U:1:9]"}]}),
+                encoding="utf-8",
+            )
+
+            def run(output: Path) -> dict[str, str]:
+                argv = [
+                    "--database",
+                    str(root / "db.json"),
+                    "--snapshot",
+                    str(root / "snap.json"),
+                    "--source",
+                    str(root / "up.json"),
+                    "--report",
+                    str(root / "report.md"),
+                    "--demote",
+                    "-q",
+                ]
+                with (
+                    mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}),
+                    contextlib.redirect_stdout(io.StringIO()),  # the report goes to stdout
+                ):
+                    self.assertEqual(main(argv), 0)
+                return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+
+            first = run(root / "out1")
+            self.assertEqual(first["changed"], "true")
+            self.assertEqual(first["count"], "2")  # one promotion, one demotion
+            database_after, snapshot_after = (root / "db.json").read_bytes(), (root / "snap.json").read_bytes()
+            self.assertEqual(snapshot_after, upstream.encode("utf-8"))  # baseline advanced
+
+            second = run(root / "out2")
+            self.assertEqual(second["changed"], "false")
+            self.assertEqual(second["count"], "0")
+            self.assertEqual(second["modified"], "false")
+            self.assertEqual(second["snapshot_changed"], "false")
+            # Byte-for-byte untouched, and the report says so.
+            self.assertEqual((root / "db.json").read_bytes(), database_after)
+            self.assertEqual((root / "snap.json").read_bytes(), snapshot_after)
+            self.assertIn("No changes", (root / "report.md").read_text(encoding="utf-8"))
+
+
+class StepOutputTests(unittest.TestCase):
+    """The `changed` output is what makes the workflow open a pull request.
+
+    It was never asserted from a real run: flipping its `or` to `and` (no PR for
+    a database-only change) or dropping the dry-run guard (a PR from a dry run)
+    both left the suite green.
+    """
+
+    def run_sync(self, *, database, snapshot, source, dry_run=False):
+        outputs = run_sync_and_read_outputs(database=database, snapshot=snapshot, source=source, dry_run=dry_run)
+        self.assertIsNotNone(outputs)
+        return outputs
+
+    def test_a_database_only_change_still_opens_a_pull_request(self):
+        database = dumps({"players": [player("[U:1:1]", ["suspicious"])]})
+        upstream = dumps({"players": [player("[U:1:1]", ["cheater"])]})
+        values = self.run_sync(database=database, snapshot=upstream, source=upstream)
+        self.assertEqual(values["changed"], "true")
+        self.assertEqual(values["modified"], "true")
+        self.assertEqual(values["snapshot_changed"], "false")
+
+    def test_a_snapshot_only_change_opens_a_pull_request(self):
+        database = dumps({"players": [player("[U:1:1]", ["cheater"])]})
+        upstream = dumps({"players": [player("[U:1:1]", ["cheater"])]})
+        values = self.run_sync(database=database, snapshot=dumps({"players": []}), source=upstream)
+        self.assertEqual(values["changed"], "true")
+        self.assertEqual(values["modified"], "false")
+        self.assertEqual(values["snapshot_changed"], "true")
+
+    def test_a_dry_run_never_opens_a_pull_request(self):
+        database = dumps({"players": [player("[U:1:1]", ["suspicious"])]})
+        upstream = dumps({"players": [player("[U:1:1]", ["cheater"])]})
+        values = self.run_sync(database=database, snapshot=upstream, source=upstream, dry_run=True)
+        self.assertEqual(values["changed"], "false")
+        self.assertEqual(values["modified"], "true")
+
+    def test_a_run_with_nothing_to_do_opens_nothing(self):
+        database = dumps({"players": [player("[U:1:1]", ["cheater"])]})
+        upstream = dumps({"players": [player("[U:1:1]", ["cheater"])]})
+        values = self.run_sync(database=database, snapshot=upstream, source=upstream)
+        self.assertEqual(values["changed"], "false")
+
+
+class GithubOutputTests(unittest.TestCase):
+    """Step outputs stay one line each, so a value can never add an output."""
+
+    def test_bools_are_lowercased_and_ints_are_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "output"
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(target)}):
+                sync_module._write_github_outputs(changed=True, count=3, modified=False)
+            self.assertEqual(target.read_text(encoding="utf-8"), "changed=true\ncount=3\nmodified=false\n")
+
+    def test_a_multiline_value_cannot_inject_an_extra_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "output"
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(target)}):
+                sync_module._write_github_outputs(changed=True, count="a\ninjected=true")
+            self.assertEqual(target.read_text(encoding="utf-8"), "changed=true\ncount=a injected=true\n")
+
+    def test_an_unwritable_output_path_is_a_named_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "missing-dir" / "output"
+            with (
+                mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(target)}),
+                self.assertRaises(SyncError) as caught,
+            ):
+                sync_module._write_github_outputs(changed=True)
+            self.assertIn("cannot write the GitHub step outputs", str(caught.exception))
+
+    def test_without_the_environment_variable_nothing_is_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "output"
+            environment = {key: value for key, value in os.environ.items() if key != "GITHUB_OUTPUT"}
+            with mock.patch.dict(os.environ, environment, clear=True):
+                sync_module._write_github_outputs(changed=True)
+            self.assertFalse(target.exists())
 
 
 class CliTests(unittest.TestCase):
@@ -2399,11 +3995,77 @@ class CliTests(unittest.TestCase):
         snapshot_file.write_text(dumps({"$schema": "x", "file_info": {}, "players": list(entries)}), encoding="utf-8")
         return snapshot_file
 
+    def test_an_unusable_step_output_file_changes_nothing(self):
+        """An output path that cannot even be opened must fail before any write.
+
+        The early preflight catches a directory deterministically; a separate
+        test covers a path that opens but fails when the actual append flushes.
+        """
+        target = self.root / "outputs"
+        target.mkdir()  # opening a directory for append fails, like a full disk
+        before = self.database.read_bytes()
+        code, _, stderr = self.run_cli("--source", str(self.source), env={"GITHUB_OUTPUT": str(target)})
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write the GitHub step outputs", stderr)
+        self.assertEqual(self.database.read_bytes(), before, "the database must not be touched")
+        self.assertFalse((self.root / "snapshot.json").exists(), "nor the snapshot")
+
+    @unittest.skipUnless(Path("/dev/full").exists(), "requires the Linux full-device test fixture")
+    def test_a_github_output_write_failure_changes_no_files(self):
+        """Opening GITHUB_OUTPUT can succeed even when its later write cannot.
+
+        /dev/full accepts append-open (so the early preflight passes), then
+        fails on flush with ENOSPC. The real output append must happen before
+        the report, database, or snapshot is written.
+        """
+        before = self.database.read_bytes()
+        report = self.root / "report.md"
+        code, stdout, stderr = self.run_cli(
+            "--source", str(self.source), "--report", str(report), env={"GITHUB_OUTPUT": "/dev/full"}
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write the GitHub step outputs", stderr)
+        self.assertEqual(stdout, "")
+        self.assertEqual(self.database.read_bytes(), before)
+        self.assertFalse((self.root / "snapshot.json").exists())
+        self.assertFalse(report.exists())
+
+    def test_github_output_cannot_alias_a_run_file(self):
+        """Appending step metadata to an input or output silently corrupts it."""
+        report = self.root / "report.md"
+        cases = (
+            ("--database", self.database, ()),
+            ("--snapshot", self.root / "snapshot.json", ()),
+            ("--report", report, ("--report", str(report))),
+            ("--source", self.source, ()),
+        )
+        for flag, target, extra in cases:
+            with self.subTest(alias=flag):
+                before_database = self.database.read_bytes()
+                before_source = self.source.read_bytes()
+                code, _, stderr = self.run_cli("--source", str(self.source), *extra, env={"GITHUB_OUTPUT": str(target)})
+                self.assertEqual(code, 2)
+                self.assertIn(f"GITHUB_OUTPUT must not be the same file as {flag}", stderr)
+                self.assertEqual(self.database.read_bytes(), before_database)
+                self.assertEqual(self.source.read_bytes(), before_source)
+                self.assertFalse((self.root / "snapshot.json").exists())
+                self.assertFalse(report.exists())
+
     def test_version_flag(self):
         with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as exit_:
             build_parser().parse_args(["--version"])
         self.assertEqual(exit_.exception.code, 0)
         self.assertIn(sources.VERSION, out.getvalue())
+
+    def test_the_version_is_plain_digits_and_dots(self):
+        """VERSION is interpolated into a User-Agent header.
+
+        urllib rejects a header value holding a newline, so a version typo
+        would turn every fetch into an exception rather than a request.
+        """
+        self.assertRegex(sources.VERSION, r"^[0-9]+\.[0-9]+$")
+        self.assertIn(f"/{sources.VERSION} (", sources.USER_AGENT)
+        self.assertNotIn("\n", sources.USER_AGENT)
 
     def test_snapshot_default_path_and_flags(self):
         self.assertEqual(DEFAULT_SNAPSHOT, "snapshot/playerlist.vorobey-hackerpolice.json")
@@ -2435,6 +4097,35 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.database.read_text(encoding="utf-8"), original)
         self.assertIn("dry run", stdout)
         self.assertIn("dry run", (self.root / "r.md").read_text(encoding="utf-8"))
+
+    def test_empty_paths_are_refused_with_a_clear_message(self):
+        """An unset shell variable used to surface as "Is a directory: '.'"."""
+        for flag in ("--database", "--snapshot", "--report"):
+            with self.subTest(flag=flag):
+                code, _, stderr = self.run_cli("--source", str(self.source), flag, "")
+                self.assertEqual(code, 2)
+                self.assertIn(f"{flag} must not be empty", stderr)
+
+    def test_an_empty_source_is_refused(self):
+        code, _, stderr = self.run_cli("--source", "")
+        self.assertEqual(code, 2)
+        self.assertIn("--source must not be empty", stderr)
+
+    def test_a_hostile_path_cannot_inject_a_log_line_or_an_ansi_escape(self):
+        code, _, stderr = self.run_cli("--source", str(self.source), "--database", "a\nb\x1b[31m.json")
+        self.assertEqual(code, 2)
+        self.assertNotIn("\x1b", stderr)  # no raw ESC
+        self.assertEqual(stderr.strip().count("\n"), 0)  # exactly one line
+        self.assertIn("a\\nb", stderr)  # shown as an escape, not dropped
+
+    def test_a_hostile_snapshot_path_cannot_repaint_the_log(self):
+        """The success lines print paths too: escape them like the error lines."""
+        snapshot = self.root / "s\x1b[0m.json"
+        code, _, stderr = self.run_cli("--source", str(self.source), "--snapshot", str(snapshot))
+        self.assertEqual(code, 0)
+        self.assertNotIn("\x1b", stderr)
+        self.assertIn("\\x1b[0m", stderr)  # shown as an escape, not dropped
+        self.assertTrue(snapshot.exists())
 
     def test_suspicious_and_racist_are_written(self):
         code, _, _ = self.run_cli("--source", str(self.source))
@@ -2487,7 +4178,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(players["[U:1:500]"]["attributes"], ["cheater"])
         self.assertIn("Previous snapshot: 2 entries; 2 SteamIDs removed upstream", stdout)
         self.assertIn(
-            "- Snapshot diff: **2 new SteamIDs added**, **2 SteamIDs removed** (2 → 2 entries; net +0)",
+            "- Snapshot diff: **2 new SteamIDs added**, **2 SteamIDs removed** (2 → 2 entries; no net change)",
             stdout,
         )
 
@@ -2519,7 +4210,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         report = report_file.read_text(encoding="utf-8")
         self.assertEqual(report, stdout)
-        self.assertIn("**3 SteamIDs removed from the Vorobey hackerpolice list since the previous snapshot.**", report)
+        # The file IS the pull request body: exactly one trailing newline, so
+        # the published body does not end with a blank line.
+        self.assertTrue(report.endswith("\n"))
+        self.assertFalse(report.endswith("\n\n"))
+        self.assertEqual(report_file.read_bytes(), report.encode("utf-8"))
+        self.assertIn("**3 SteamIDs removed from the Vorobey hackerpolice list since the previous snapshot:**", report)
         self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
         for account in (300, 400, 500):
             steamid64 = 76561197960265728 + account
@@ -2682,14 +4378,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual((self.root / "snapshot.json").read_bytes(), raw)
 
-    def test_include_proof_writes_the_citation(self):
-        code, _, _ = self.run_cli("--source", str(self.source), "--include-proof")
-        self.assertEqual(code, 0)
-        players = {p["steamid"]: p for p in json.loads(self.database.read_text(encoding="utf-8"))["players"]}
-        proof = players["[U:1:100]"]["proof"]
-        self.assertEqual(len(proof), 1)
-        self.assertIn(PROOF_MARKER, proof[0])
-        self.assertIn(HACKERPOLICE_PROOF, proof[0])
+    def test_the_removed_flag_is_rejected_by_the_parser(self):
+        """A future workflow could not re-enable proof writing by accident."""
+        with (
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as caught,
+        ):
+            main(
+                [
+                    "--database",
+                    str(self.database),
+                    "--snapshot",
+                    str(self.root / "snapshot.json"),
+                    "--source",
+                    str(self.source),
+                    "--include-proof",
+                ]
+            )
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("unrecognized arguments: --include-proof", err.getvalue())
 
     def test_github_outputs(self):
         output_file = self.root / "github_output"
@@ -2772,6 +4479,43 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("→", raw.getvalue().decode("utf-8"))
 
+    def test_undecodable_source_is_refused_without_a_traceback(self):
+        """A source with an undecodable byte is a clean refusal, not a crash."""
+        code, _, stderr = self.run_cli("--source", "https://host.invalid/?token=\udcff")
+        self.assertEqual(code, 2)
+        self.assertIn("token=REDACTED", stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_hand_appended_entry_is_resorted_and_reported(self):
+        """A file out of SteamID order is normalised without any tag changing.
+
+        The old behaviour said "No database changes" while rewriting the file,
+        so a reviewer saw a diff with a body denying it.
+        """
+        self.database.write_text(
+            dumps(
+                {
+                    "$schema": "x",
+                    "file_info": {},
+                    "players": [
+                        player("[U:1:900]", ["cheater"]),  # appended by hand, out of order
+                        player("[U:1:100]", ["cheater"]),
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, stdout, stderr = self.run_cli("--source", str(self.source), "--demote")
+        self.assertEqual(code, 0)
+
+        self.assertEqual(
+            [entry["steamid"] for entry in json.loads(self.database.read_text(encoding="utf-8"))["players"]],
+            ["[U:1:100]", "[U:1:900]"],
+        )
+        self.assertIn("**No player changes** (the database file was normalised", stdout)
+        self.assertIn("no tag changes: the file was normalised", stderr)
+        self.assertNotIn("No changes.", stderr)
+
     def test_dry_run_never_writes_the_snapshot(self):
         """A dry run must leave BOTH files alone, not just the database."""
         snapshot = self.write_snapshot_fixture(hackerpolice_entry("[U:1:999]"))
@@ -2790,14 +4534,44 @@ class CliTests(unittest.TestCase):
         self.assertIn(f"Updated snapshot {snapshot}", first[2])
         second = self.run_cli("--source", str(self.source), "--snapshot", str(snapshot), "--demote")
         self.assertEqual(second[0], 0)
-        self.assertIn("No changes: nothing to update.", second[2])
+        self.assertIn("No database changes: nothing to update.", second[2])
         self.assertNotIn("Updated snapshot", second[2])
+
+    def test_the_no_change_log_line_names_the_database(self):
+        """A snapshot-only run writes a file and opens a PR.
+
+        A bare "No changes: nothing to update." then contradicts both the
+        report body ("No database changes (snapshot refresh only)") and the
+        ``Updated snapshot …`` line that follows it. The upstream entry here
+        is not in the database, so nothing is promoted and only the snapshot
+        changes.
+        """
+        source = self.root / "unrelated-upstream.json"
+        source.write_text(dumps({"players": [hackerpolice_entry("[U:1:12345]")]}), encoding="utf-8")
+        snapshot = self.write_snapshot_fixture()
+        code, stdout, stderr = self.run_cli("--source", str(source), "--snapshot", str(snapshot))
+        self.assertEqual(code, 0)
+        self.assertIn("**No database changes** (snapshot refresh only).", stdout)
+        self.assertIn("No database changes: nothing to update.", stderr)
+        self.assertIn(f"Updated snapshot {snapshot}", stderr)
+        self.assertNotIn("No changes: nothing to update.", stderr)
 
     def test_quiet_prints_only_the_report(self):
         code, stdout, stderr = self.run_cli("--source", str(self.source), "--dry-run", "-q")
         self.assertEqual(code, 0)
         self.assertIn("## Vorobey hackerpolice sync", stdout)
         self.assertEqual(stderr.strip(), "")
+
+    def test_verbose_reports_each_source_it_tries(self):
+        """--verbose must actually add something: it used to set DEBUG with no
+        DEBUG record anywhere, so it printed exactly what the default run did."""
+        code, _, verbose = self.run_cli("--source", str(self.source), "--dry-run", "-v")
+        self.assertEqual(code, 0)
+        self.assertIn("Trying source", verbose)
+        self.assertIn("from disk", verbose)
+        code, _, plain = self.run_cli("--source", str(self.source), "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertNotIn("Trying source", plain)
 
     def test_verbose_logs_the_index_and_the_diff(self):
         code, _, stderr = self.run_cli("--source", str(self.source), "--dry-run", "-v")
@@ -2808,39 +4582,6 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.run_cli("--snapshot", str(self.database))
         self.assertEqual(code, 2)
         self.assertIn("--snapshot and --database must be different files", stderr)
-
-    def test_a_proof_line_cites_at_most_five_links(self):
-        """An upstream entry may list thousands of links; the database must not.
-
-        The full set is always in the pull request, so the ``[auto]`` line keeps
-        only the first few and says how many it left out.
-        """
-        evidence = tuple(f"https://discord.com/channels/1/2/{index}" for index in range(1, 8))
-        player = {"steamid": "[U:1:5]", "attributes": ["cheater"]}
-        policy._write_proof(player, evidence)
-        line = player["proof"][0]
-        self.assertEqual(line.count("https://discord.com/channels/1/2/"), 5)
-        self.assertIn("(+2 more, see the pull request)", line)
-        policy._write_proof(player, evidence)  # idempotent
-        self.assertEqual(player["proof"], [line])
-        self.assertLessEqual(len(line), 400, "the proof line must stay bounded")
-
-    def test_five_or_fewer_proofs_get_no_overflow_note(self):
-        for count in (0, 1, 5):
-            evidence = tuple(f"https://discord.com/channels/1/2/{index}" for index in range(1, count + 1))
-            player = {"steamid": "[U:1:5]", "attributes": ["cheater"]}
-            policy._write_proof(player, evidence)
-            line = player["proof"][0]
-            self.assertEqual(line.count("https://discord.com/channels/1/2/"), count)
-            self.assertNotIn("more, see the pull request", line)
-            self.assertNotIn("+0 more", line)
-
-    def test_a_thousand_proofs_do_not_grow_the_proof_line(self):
-        evidence = tuple(f"https://discord.com/channels/1/2/{index}" for index in range(1, 1001))
-        player = {"steamid": "[U:1:5]", "attributes": ["cheater"]}
-        policy._write_proof(player, evidence)
-        self.assertLess(len(player["proof"][0]), 500)
-        self.assertIn("(+995 more, see the pull request)", player["proof"][0])
 
     def test_load_index_still_refuses_an_empty_index(self):
         """Backstop: the chain normally filters these out, the guard stays."""
@@ -2875,6 +4616,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("refusing to fetch a non-HTTPS URL", stderr)
         self.assertNotIn("Traceback", stderr)
+
+    def test_an_uppercase_http_source_is_refused_as_non_https_not_as_a_missing_path(self):
+        """It used to be mistaken for a local path, giving "cannot read"."""
+        code, _, stderr = self.run_cli("--source", "HTTP://example.invalid/list.json")
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to fetch a non-HTTPS URL", stderr)
+        self.assertNotIn("cannot read", stderr)
 
     def test_unwritable_report_path_is_a_clean_error(self):
         report_dir = self.root / "report-dir"
@@ -2914,6 +4662,64 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.run_cli("--source", str(self.database))
         self.assertEqual(code, 2)
         self.assertIn("--source must not be the same file as --database", stderr)
+
+    def test_source_must_not_be_the_snapshot(self):
+        """Aliasing the baseline with the source silently disables the bot.
+
+        The run would compare the snapshot with itself: "0 added, 0 removed"
+        every time, so no removal can ever be proven and promotions come from
+        the stale baseline instead of the live list -- while the run exits 0
+        and looks completely healthy.
+        """
+        snapshot = self.write_snapshot_fixture(hackerpolice_entry("[U:1:300]"))
+        before = snapshot.read_bytes()
+        code, _, stderr = self.run_cli("--source", str(snapshot), "--snapshot", str(snapshot))
+        self.assertEqual(code, 2)
+        self.assertIn("--source must not be the same file as --snapshot", stderr)
+        # Nothing was written: the baseline is exactly as it was.
+        self.assertEqual(snapshot.read_bytes(), before)
+
+    def test_a_broken_snapshot_is_not_reported_as_a_broken_upstream_list(self):
+        """The index builder serves two documents: the list AND the snapshot.
+
+        A snapshot with no 'players' array used to be reported as "the Vorobey
+        hackerpolice list has no 'players' array" -- pointing the operator at a
+        file that was perfectly fine while the broken one stayed unnamed.
+        """
+        broken = self.root / "snapshot.json"
+        broken.write_text('{"$schema": "x"}', encoding="utf-8")  # well-formed JSON, wrong shape
+        # --source keeps this off the network: without it the run fetches the
+        # real upstream list first (slow, and unreachable in an offline build).
+        code, _, stderr = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 2)
+        self.assertIn(f"the previous snapshot {broken}", stderr)
+        self.assertNotIn("the Vorobey hackerpolice list has no", stderr)
+
+    def test_a_snapshot_in_a_missing_directory_is_refused_by_name(self):
+        """A writer must not invent a directory.
+
+        It used to ``mkdir -p`` for any output, so a typo'd ``--snapshot``
+        silently produced a FRESH baseline in a brand-new tree. That looks
+        harmless but is not: a fresh baseline proves no removal (previous
+        minus current is empty), so ``--demote`` would quietly do nothing
+        forever -- the same silent stall the --source==--snapshot guard
+        prevents, reached from the other side.
+        """
+        missing = self.root / "typo" / "snapshot.json"
+        code, _, stderr = self.run_cli("--snapshot", str(missing))
+        self.assertEqual(code, 2)
+        self.assertIn(f"--snapshot directory does not exist: {missing.parent}", stderr)
+        self.assertFalse(missing.parent.exists())  # and it was NOT created
+
+    def test_a_report_in_a_missing_directory_is_refused_by_name(self):
+        missing = self.root / "typo" / "report.md"
+        code, _, stderr = self.run_cli("--report", str(missing))
+        self.assertEqual(code, 2)
+        self.assertIn(f"--report directory does not exist: {missing.parent}", stderr)
+        self.assertFalse(missing.parent.exists())
+        self.assertEqual(
+            [p.name for p in self.root.iterdir() if ".tmp" in p.name], []
+        )  # refused before anything was written
 
     def test_missing_database_is_an_error(self):
         self.database.unlink()
@@ -3009,6 +4815,12 @@ class UnpublishableJsonTests(unittest.TestCase):
         if snapshot is None:
             self.assertFalse((self.root / "snap.json").exists())
 
+    def test_an_out_of_range_number_in_the_database_is_refused(self):
+        self.assert_refused(
+            database='{"players":[{"steamid":"[U:1:100]","attributes":["suspicious"],"last_seen":{"time":1e999}}]}',
+            upstream=self.UPSTREAM,
+        )
+
     def test_nan_in_the_database_is_refused(self):
         self.assert_refused(
             database='{"players":[{"steamid":"[U:1:100]","attributes":["suspicious"],"last_seen":{"time":NaN}}]}',
@@ -3063,7 +4875,7 @@ class LifecycleTests(unittest.TestCase):
         self.up = self.root / "upstream.json"
 
     def git(self, *args):
-        subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True, text=True, encoding="utf-8")
 
     def write(self, path, players):
         path.write_text(dumps({"$schema": "x", "file_info": {}, "players": players}), encoding="utf-8")
@@ -3125,7 +4937,12 @@ class LifecycleTests(unittest.TestCase):
         # Run 3: fully converged - no changes, clean working tree.
         self.assertIn("No changes", self.run_bot())
         status = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=self.root, capture_output=True, text=True, check=True
+            ["git", "status", "--porcelain"],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
         ).stdout
         self.assertEqual(status, "")
 
@@ -3137,6 +4954,23 @@ class RepositoryDataTests(unittest.TestCase):
     """The data files this repository ships must be exactly what the bot expects."""
 
     ROOT = Path(__file__).resolve().parents[1]
+
+    def test_every_auto_proof_in_the_shipped_database_still_qualifies(self):
+        """Tightening the prefix rule must never drop a real machine record.
+
+        The shipped list carries hundreds of TF2BD auto lines; if any of them
+        stopped qualifying, a demotion would silently delete evidence that
+        justifies a racist tag.
+        """
+        database, _ = load(self.ROOT / "playerlist.garou3299.json")
+        auto = [
+            line
+            for entry in database["players"]
+            for line in (entry.get("proof") or [])
+            if isinstance(line, str) and line.strip().casefold().startswith(policy.RACIST_PROOF_PREFIX.casefold())
+        ]
+        self.assertGreater(len(auto), 100, "the fixture this guards has disappeared")
+        self.assertEqual([line for line in auto if not is_racist_proof(line)], [])
 
     def test_shipped_database_is_valid_and_canonically_formatted(self):
         database, original = load(self.ROOT / "playerlist.garou3299.json")
@@ -3199,6 +5033,7 @@ class RepositoryDataTests(unittest.TestCase):
             "Push branch and link a manual pull request",
             "Commit directly to the default branch",
             "Nothing to do",
+            "Close a stale bot pull request",
         ):
             block = next((step for step in steps if step.startswith(f"name: {name}")), None)
             self.assertIsNotNone(block, f"workflow step not found: {name}")
@@ -3348,6 +5183,30 @@ class AttributeTests(unittest.TestCase):
     def test_unknown_attributes_sort_last(self):
         self.assertEqual(order_attributes(["zeta", "racist", "cheater"]), ["cheater", "racist", "zeta"])
 
+    def test_the_canonical_attribute_order_is_pinned(self):
+        """The order is part of the byte-identical-file guarantee.
+
+        A single-element assertion cannot see an order, and nothing compared
+        suspicious with racist: typo-ing either name in ATTRIBUTE_ORDER left
+        the suite green while quietly reordering every future write.
+        """
+        self.assertEqual(ATTRIBUTE_ORDER, ("cheater", "suspicious", "exploiter", "racist"))
+        self.assertEqual(order_attributes(list(reversed(ATTRIBUTE_ORDER))), list(ATTRIBUTE_ORDER))
+        self.assertEqual(order_attributes(["racist", "suspicious"]), ["suspicious", "racist"])
+        self.assertEqual(order_attributes(["exploiter", "suspicious"]), ["suspicious", "exploiter"])
+        self.assertEqual(
+            order_attributes(["zzz", "racist", "aaa", "suspicious"]),
+            ["suspicious", "racist", "aaa", "zzz"],
+        )
+
+    def test_every_known_attribute_is_known_to_the_validator(self):
+        self.assertEqual(KNOWN_ATTRIBUTES, frozenset({"cheater", "suspicious", "exploiter", "racist"}))
+        result = validate(
+            {"players": [{"steamid": "[U:1:1]", "attributes": ["cheater", "suspicious", "exploiter", "racist"]}]}
+        )
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.warnings, [])
+
 
 class SortPlayersTests(unittest.TestCase):
     def test_numeric_order(self):
@@ -3428,12 +5287,34 @@ class StrictJsonTests(unittest.TestCase):
                 strict_json_loads(body)
             self.assertIn("not valid JSON", str(caught.exception))
 
+    def test_a_number_that_overflows_into_infinity_is_refused(self):
+        """``1e999`` is valid JSON syntax but becomes ``inf``.
+
+        ``inf`` cannot be written back out (``dumps`` refuses it, as TF2BD's
+        parser would), so a file holding one could never be round-tripped:
+        it was refused only after validation passed, when the writer raised an
+        uncaught ValueError -- a traceback instead of a named refusal.
+        """
+        for body in ('{"t": 1e999}', '{"t": -1e999}', '{"players": [], "file_info": {"y": 1e400}}'):
+            with self.assertRaises(ValueError) as caught:
+                strict_json_loads(body)
+            self.assertIn("out of range for a JSON number", str(caught.exception))
+        self.assertEqual(strict_json_loads('{"t": 1.5}'), {"t": 1.5})
+        self.assertEqual(strict_json_loads('{"t": 1e-999}'), {"t": 0.0})  # underflow is finite
+
     def test_duplicate_keys_are_refused(self):
         with self.assertRaises(ValueError) as caught:
             strict_json_loads('{"players": [1], "players": []}')
         self.assertIn("duplicate key", str(caught.exception))
         with self.assertRaises(ValueError):
             strict_json_loads('{"a": {"attributes": ["x"], "attributes": ["y"]}}')
+
+    def test_a_huge_duplicate_key_cannot_flood_the_log(self):
+        key = "k" * 3_000_000
+        with self.assertRaises(ValueError) as caught:
+            strict_json_loads('{"' + key + '": 1, "' + key + '": 2}')
+        self.assertIn("duplicate key", str(caught.exception))
+        self.assertLessEqual(len(str(caught.exception)), 200)
 
     def test_the_same_input_as_the_standard_library_still_parses(self):
         for body in ('{"players": []}', '{"a": [1, 2.5, true, false, null]}', '{"s": "ы\\u00e9"}', "[]", "3"):
@@ -3464,11 +5345,263 @@ class DocumentHandlingTests(unittest.TestCase):
         self.assertEqual(player_name({"last_seen": {"player_name": "Bob"}}), "Bob")
         self.assertEqual(player_name({"last_seen": "nonsense"}), "")
         self.assertEqual(player_name({}), "")
+
+    def test_a_malformed_name_never_prints_python_syntax(self):
+        """A dict/list/float name is malformed: UNKNOWN, not "{'a': 1}"."""
+        for value in ({"a": 1}, ["x"], 1.5, True, None):
+            self.assertEqual(player_name({"last_seen": {"player_name": value}}), "", value)
+        self.assertEqual(player_name({"last_seen": {"player_name": 12345}}), "12345")
         result = validate({"players": ["not a dict", player("[U:1:1]", ["cheater"])]})
         self.assertIn("players[0] is not an object", result.errors)
 
     def test_steam_notation_with_too_many_digits_is_unusable(self):
         self.assertIsNone(normalize_steamid("STEAM_0:1:12345678901"))
+
+    def test_a_steamid_with_thousands_of_digits_is_unusable_without_crashing(self):
+        """Python refuses to int() 5,000 digits; the length guard answers first."""
+        for hostile in ("[U:1:" + "9" * 5000 + "]", "STEAM_0:1:" + "9" * 5000, "9" * 5000):
+            self.assertIsNone(normalize_steamid(hostile))
+        result = validate({"players": [{"steamid": "[U:1:" + "9" * 5000 + "]", "attributes": ["cheater"]}]})
+        self.assertTrue(result.errors)
+
+
+def run_sync_and_read_outputs(*, database, snapshot, source, dry_run=False) -> dict[str, str]:
+    """Run the real CLI on three loose files and return its GitHub step outputs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "db.json").write_text(database, encoding="utf-8")
+        (root / "snap.json").write_text(snapshot, encoding="utf-8")
+        (root / "up.json").write_text(source, encoding="utf-8")
+        output = root / "github-output"
+        argv = [
+            "--database",
+            str(root / "db.json"),
+            "--snapshot",
+            str(root / "snap.json"),
+            "--source",
+            str(root / "up.json"),
+            "--report",
+            str(root / "r.md"),
+            "-q",
+        ]
+        if dry_run:
+            argv.append("--dry-run")
+        with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}), contextlib.redirect_stdout(io.StringIO()):
+            code = main(argv)
+        if code != 0:
+            raise AssertionError(f"the sync refused: exit {code}")
+        return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+
+
+class DocumentedLimitsTests(unittest.TestCase):
+    """The caps are contract, not tuning knobs -- so pin the numbers.
+
+    Mutation testing found every one of these replaceable with a neighbouring
+    value while the suite stayed green: ``CapBoundaryTests`` derives its sizes
+    FROM the constant, so it proves the comparison is exact but cannot notice
+    the constant itself moving. A one-digit typo in ``MAX_REPORT_BYTES`` would
+    therefore ship a bot that truncates every busy report, and a typo in
+    ``MAX_SOURCE_BYTES`` would ship one that refuses a legitimate download.
+    Each number below is quoted from README.md so the two cannot drift.
+    """
+
+    def test_the_documented_report_limits(self):
+        # README: "a table stops at 150 rows (100 for the removed-SteamID list)
+        # and the whole body stops at 60,000 bytes".
+        self.assertEqual(report_module.MAX_CHANGE_TABLE_ROWS, 150)
+        self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 100)
+        self.assertEqual(report_module.MAX_REPORT_BYTES, 60_000)
+
+    def test_the_display_caps(self):
+        self.assertEqual(report_module.MAX_NAME_CHARS, 80)
+        self.assertEqual(report_module.MAX_ATTRIBUTE_CHARS, 40)
+        self.assertEqual(report_module.MAX_ATTRIBUTE_CELLS, 8)
+        self.assertEqual(report_module.MAX_EVIDENCE_LINKS, 10)
+        self.assertEqual(report_module.MAX_CLOSING_STEAMIDS, 150)
+        self.assertEqual(playerlist_module.MAX_SHOWN_VALUE_CHARS, 120)
+        self.assertEqual(playerlist_module.MAX_SHOWN_PATH_CHARS, 200)
+        self.assertEqual(sources.MAX_URL_DISPLAY_CHARS, 2048)
+
+    def test_the_read_and_fetch_limits(self):
+        # README: "64 MiB per download, 30 s, 3 attempts, then the next fallback.
+        # The same 64 MiB cap applies to the database and snapshot files".
+        self.assertEqual(playerlist_module.MAX_FILE_BYTES, 64 * 1024 * 1024)
+        self.assertEqual(sources.MAX_SOURCE_BYTES, 64 * 1024 * 1024)
+        self.assertEqual(sources.FETCH_TIMEOUT_SECONDS, 30)
+        self.assertEqual(sources.FETCH_ATTEMPTS, 3)
+        self.assertEqual(sources.RETRY_BACKOFF_SECONDS, 2)
+
+    def test_the_documented_guard_and_account_bounds(self):
+        # README: "more than 50 IDs *and* more than 20 % gone at once".
+        self.assertEqual(sync_module.MASS_DEMOTION_MIN_IDS, 50)
+        self.assertEqual(sync_module.MASS_DEMOTION_MAX_FRACTION, 0.2)
+        # TF2BD account ids are 32-bit and never 0.
+        self.assertEqual(playerlist_module.MAX_ACCOUNT_ID, 2**32)
+
+
+class InterruptTests(unittest.TestCase):
+    """Ctrl-C used to leave a KeyboardInterrupt traceback on stderr."""
+
+    def test_an_interrupt_is_reported_in_one_line_with_exit_130(self):
+        stderr = io.StringIO()
+        with mock.patch.object(sync_module, "run", side_effect=KeyboardInterrupt), contextlib.redirect_stderr(stderr):
+            code = sync_module.main(["--database", "unused.json"])
+        self.assertEqual(code, 130)
+        self.assertEqual(stderr.getvalue().strip(), "interrupted.")
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_the_exit_code_is_the_shell_convention(self):
+        """128 + SIGINT(2) -- what a shell reports for a killed foreground job."""
+        self.assertEqual(130, 128 + 2)
+
+
+class ReadmeCliTests(unittest.TestCase):
+    """The README promises they document the tool; make that mechanical.
+
+    Seven of the twelve flags -- including ``--database``, ``--source`` and
+    ``--snapshot``, the three that decide WHAT the run reads and writes --
+    were reachable only through ``--help``. A flag nobody documented is a
+    flag only its author can use, so both directions are pinned here.
+    """
+
+    @staticmethod
+    def _readme() -> str:
+        path = Path(__file__).resolve().parents[1] / "README.md"
+        return path.read_text(encoding="utf-8")
+
+    def test_every_flag_is_documented(self):
+        readme = self._readme()
+        flags = {
+            flag
+            for action in sync_module.build_parser()._actions
+            for flag in action.option_strings
+            if flag.startswith("--")
+        }
+        self.assertEqual(sorted(flag for flag in flags if flag not in readme), [])
+
+    def test_the_readme_invents_no_flags(self):
+        """The other direction: a documented flag that does not exist."""
+        readme = self._readme()
+        known = {flag for action in sync_module.build_parser()._actions for flag in action.option_strings}
+        mentioned = set(re.findall(r"`(--[a-z][a-z0-9-]+)", readme))
+        self.assertEqual(sorted(mentioned - known), [])
+
+
+class CapBoundaryTests(unittest.TestCase):
+    """Every cap is an exact boundary: at the limit unchanged, one over clipped.
+
+    Mutation testing found all of these untested: flipping ``<=`` to ``<`` in
+    each of them left the suite green, which is how an off-by-one would ship.
+    """
+
+    def test_shown_values_are_exact_at_the_limit(self):
+        """The limit applies to the quoted text, i.e. the repr including quotes."""
+        at_limit = "x" * (MAX_SHOWN_VALUE_CHARS - 2)
+        self.assertEqual(len(repr(at_limit)), MAX_SHOWN_VALUE_CHARS)
+        self.assertEqual(playerlist_module._shown(at_limit), repr(at_limit))
+        self.assertTrue(playerlist_module._shown(at_limit + "x").endswith("…"))
+
+    def test_paths_are_exact_at_the_limit(self):
+        at_limit = "/tmp/" + "d" * (MAX_SHOWN_PATH_CHARS - 5)
+        self.assertEqual(display_path(at_limit), at_limit)
+        self.assertTrue(display_path(at_limit + "d").endswith("…"))
+
+    def test_a_printable_non_ascii_path_stays_readable(self):
+        """Only control characters are escaped; ü is a character, not junk."""
+        self.assertEqual(display_path("/tmp/über.json"), "/tmp/über.json")
+        self.assertEqual(display_path("a\u2028b"), "a\\u2028b")
+
+    def test_shorten_is_exact_at_the_limit(self):
+        self.assertEqual(_shorten("abc", 3), "abc")
+        self.assertEqual(_shorten("abcd", 3), "abc…")
+
+    def test_evidence_links_are_exact_at_the_limit(self):
+        prefix = "https://example.invalid/"
+        link = prefix + "x" * (MAX_EVIDENCE_LINK_CHARS - len(prefix))
+        self.assertEqual(len(link), MAX_EVIDENCE_LINK_CHARS)
+        self.assertIn("](", report_module._evidence_cell([link]))  # a real link
+        longer = link + "x"
+        self.assertNotIn("](", report_module._evidence_cell([longer]))  # plain text, not a dead link
+
+    def test_redact_url_is_exact_at_the_display_limit(self):
+        prefix = "https://example.invalid/"
+        url = prefix + "x" * (sources.MAX_URL_DISPLAY_CHARS - len(prefix))
+        self.assertEqual(sources.redact_url(url), url)
+        self.assertTrue(sources.redact_url(url + "x").endswith("…"))
+
+    def test_the_database_file_limit_is_exact(self):
+        body = b'{"players": []}'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "list.json"
+            path.write_bytes(body + b" " * (200 - len(body)))
+            with mock.patch.object(playerlist_module, "MAX_FILE_BYTES", 200):
+                database, _ = load(path)
+                self.assertEqual(database["players"], [])
+                path.write_bytes(body + b" " * (201 - len(body)))
+                with self.assertRaises(PlayerListError):
+                    load(path)
+
+    def test_the_snapshot_file_limit_is_exact(self):
+        body = b'{"players": [{"steamid": "[U:1:1]"}]}'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "snap.json"
+            path.write_bytes(body + b" " * (200 - len(body)))
+            with mock.patch.object(sources, "MAX_FILE_BYTES", 200):
+                index, raw = sources.load_snapshot(path)
+                self.assertEqual(len(index.by_steamid), 1)
+                self.assertEqual(raw, body + b" " * (200 - len(body)))
+                path.write_bytes(body + b" " * (201 - len(body)))
+                with self.assertRaises(SyncError):
+                    sources.load_snapshot(path)
+
+    def test_a_body_of_exactly_the_budget_is_not_touched(self):
+        """Exactly at the limit is a fit, not an overflow.
+
+        Enough rows that shrinking would visibly change the report, so an
+        off-by-one here cannot hide behind a table that was short anyway.
+        """
+        changes = tuple(Change(f"[U:1:{number}]", "name", ("suspicious",), ("cheater",)) for number in range(1, 151))
+        info = RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://example.invalid/list.json",
+            source_total=10,
+            source_skipped=0,
+            dry_run=False,
+            changes=changes,
+        )
+        full = render_report(info)
+        self.assertEqual(full.count("| `[U:1:"), 150)  # nothing was dropped
+        budget = len(full.encode("utf-8"))
+        with mock.patch.object(report_module, "MAX_REPORT_BYTES", budget):
+            self.assertEqual(render_report(info), full)  # fits exactly: no shrink, no cut
+
+
+class DisplayPathTests(unittest.TestCase):
+    """Paths are operator input too: one line, printable, bounded."""
+
+    def test_control_characters_are_escaped_rather_than_dropped(self):
+        self.assertEqual(display_path("a\nb.json"), "a\\nb.json")
+        self.assertEqual(display_path("a\x1b[31m.json"), "a\\x1b[31m.json")
+        self.assertEqual(display_path("a\r\tb"), "a\\r\\tb")
+        self.assertEqual(display_path("/tmp/plain.json"), "/tmp/plain.json")
+
+    def test_line_separators_are_escaped(self):
+        """U+2028/U+2029 break a line in a renderer even though they print."""
+        self.assertEqual(display_path("a\u2028b"), "a\\u2028b")
+        self.assertEqual(display_path("a\u2029b"), "a\\u2029b")
+
+    def test_a_lone_surrogate_is_still_printable(self):
+        shown = display_path("a\udcffb")
+        self.assertNotIn("\udcff", shown)
+        shown.encode("utf-8")  # must not raise
+
+    def test_a_very_long_path_is_clipped(self):
+        shown = display_path("/tmp/" + "d" * 5_000)
+        self.assertEqual(len(shown), MAX_SHOWN_PATH_CHARS + 1)
+        self.assertTrue(shown.endswith("…"))
+
+    def test_a_path_that_is_not_a_string_still_works(self):
+        self.assertEqual(display_path(Path("/tmp/x.json")), "/tmp/x.json")
 
 
 class ValidateTests(unittest.TestCase):
@@ -3476,6 +5609,50 @@ class ValidateTests(unittest.TestCase):
         result = validate({"players": [{"steamid": "²", "attributes": ["cheater"]}]})
         self.assertTrue(result.errors)
         self.assertIn("unusable steamid", result.errors[0])
+
+    def test_a_hostile_value_cannot_inject_a_log_line_or_an_ansi_escape(self):
+        """These messages are printed to a terminal and to the CI job log."""
+        result = validate(
+            {
+                "players": [
+                    {"steamid": "x\n### fake heading\x1b[32m", "attributes": []},
+                    {"steamid": "[U:1:2]", "attributes": ["scammer\nINFO: all good\x1b[0m"]},
+                ]
+            }
+        )
+        messages = result.errors + result.warnings
+        self.assertTrue(messages)
+        for message in messages:
+            self.assertNotIn("\n", message)
+            self.assertNotIn("\x1b", message)
+
+    def test_no_malformed_entry_can_flood_the_log(self):
+        """One bad entry used to print a single 3,000,038-character log line.
+
+        Every combination matters: one entry produces several messages, and
+        each of them used to carry the raw value (fixing only the first left
+        the second just as long).
+        """
+        big = "x" * 3_000_000
+        seen = 0
+        for steamid, attributes, proof in itertools.product(
+            ("[U:1:5]", big), (["cheater"], [], ["a" * 3_000_000]), (None, ["ok"], big)
+        ):
+            entry = {"steamid": steamid, "attributes": attributes}
+            if proof is not None:
+                entry["proof"] = proof
+            result = validate({"players": [entry]})
+            for message in result.errors + result.warnings:
+                seen += 1
+                self.assertLessEqual(len(message), 400, message[:80])
+                self.assertNotIn("\n", message)
+                self.assertNotIn("\x1b", message)
+        self.assertGreaterEqual(seen, 18)
+
+    def test_a_usable_steamid_is_still_reported_in_canonical_form(self):
+        """Escaping the junk must not make the normal message noisier."""
+        result = validate({"players": [{"steamid": "STEAM_0:0:1", "attributes": []}]})
+        self.assertEqual(result.errors, ["players[0] ([U:1:2]) has no attributes"])
 
     def test_valid_database(self):
         result = validate({"players": [{"steamid": "[U:1:1]", "attributes": ["cheater"]}]})
@@ -3513,10 +5690,181 @@ class ValidateTests(unittest.TestCase):
         result = validate({"players": [{"steamid": "[U:1:1]", "attributes": ["cheater", ["racist"]]}]})
         self.assertTrue(any("non-string attribute" in error for error in result.errors))
 
+    def test_a_players_value_that_is_not_an_array_is_one_error_not_a_crash(self):
+        """Deleting the early return makes this a TypeError (or a cascade)."""
+        for players in (42, "players", {"steamid": "[U:1:1]"}, None, True):
+            with self.subTest(players=players):
+                result = validate({"players": players})
+                self.assertEqual(result.errors, ["'players' is not an array"])
+
+    def test_a_malformed_attributes_value_is_one_error_not_a_cascade(self):
+        """A string is iterable and a list of characters "has duplicates".
+
+        Falling through the guard would report a second, nonsensical problem
+        for the same field, so pin the count -- one problem per field.
+        """
+        for attributes in ("cheater", [], None, 7, {"cheater": True}):
+            with self.subTest(attributes=attributes):
+                result = validate({"players": [{"steamid": "[U:1:1]", "attributes": attributes}]})
+                self.assertEqual(len(result.errors), 1, result.errors)
+                self.assertIn("has no attributes", result.errors[0])
+
     def test_unknown_attribute_is_only_a_warning(self):
         result = validate({"players": [{"steamid": "[U:1:1]", "attributes": ["scammer"]}]})
         self.assertEqual(result.errors, [])
         self.assertEqual(len(result.warnings), 1)
+
+
+class OwnerAcceptanceTests(unittest.TestCase):
+    """The five rules the database owner stated, each executed end to end.
+
+    Every test below runs the real entry point over real files, so a regression
+    anywhere in the chain -- parsing, policy, report, database write, snapshot
+    write -- fails here, not only in a unit test of a single function.
+    """
+
+    RACIST_LINE = '[auto] automatically marked: Racist | reason: "slur"'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.database = self.root / "playerlist.garou3299.json"
+        self.upstream = self.root / "upstream.json"
+        self.snapshot = self.root / "snapshot" / "playerlist.vorobey-hackerpolice.json"
+        self.snapshot.parent.mkdir(parents=True, exist_ok=True)  # the CLI will not invent it
+
+    def write(self, path, players):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(dumps({"$schema": "s", "file_info": {}, "players": players}), encoding="utf-8")
+
+    def run_sync(self, *flags):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(
+                [
+                    "--database",
+                    str(self.database),
+                    "--snapshot",
+                    str(self.snapshot),
+                    "--source",
+                    str(self.upstream),
+                    "--report",
+                    str(self.root / "report.md"),
+                    "--quiet",
+                    *flags,
+                ]
+            )
+        self.assertEqual(code, 0, stderr.getvalue())
+        return json.loads(self.database.read_text(encoding="utf-8"))
+
+    def entry(self, database, steamid):
+        matches = [player for player in database["players"] if player["steamid"] == steamid]
+        self.assertLessEqual(len(matches), 1)
+        return matches[0] if matches else None
+
+    def test_rule_1_suspicious_is_promoted_without_adding_any_proof(self):
+        """suspicious -> cheater, no proof added, existing proofs untouched."""
+        existing = "https://youtu.be/already-there"
+        self.write(self.database, [player("[U:1:100]", ["suspicious"], proof=[existing])])
+        self.write(self.upstream, [hackerpolice_entry("[U:1:100]", [HACKERPOLICE_PROOF])])
+
+        after = self.run_sync("--demote")
+
+        entry = self.entry(after, "[U:1:100]")
+        self.assertEqual(entry["attributes"], ["cheater"])
+        self.assertEqual(entry["proof"], [existing])
+
+    def test_rule_1_promotion_adds_no_proof_at_all_when_there_is_none(self):
+        self.write(self.database, [player("[U:1:101]", ["suspicious"])])
+        self.write(self.upstream, [hackerpolice_entry("[U:1:101]", [HACKERPOLICE_PROOF])])
+
+        after = self.run_sync()
+
+        entry = self.entry(after, "[U:1:101]")
+        self.assertEqual(entry["attributes"], ["cheater"])
+        self.assertNotIn("proof", entry)  # nothing was invented
+
+    def test_rule_2_suspicious_and_racist_becomes_cheater_and_racist_without_new_proofs(self):
+        self.write(self.database, [player("[U:1:200]", ["suspicious", "racist"], proof=[self.RACIST_LINE])])
+        self.write(self.upstream, [hackerpolice_entry("[U:1:200]", [HACKERPOLICE_PROOF])])
+
+        after = self.run_sync()
+
+        entry = self.entry(after, "[U:1:200]")
+        self.assertEqual(entry["attributes"], ["cheater", "racist"])
+        self.assertEqual(entry["proof"], [self.RACIST_LINE])
+
+    def test_rule_3_cheater_only_removed_upstream_drops_the_whole_entry(self):
+        self.write(self.database, [player("[U:1:300]", ["cheater"], proof=["Silent Aim & ESP"])])
+        self.write(self.snapshot, [player("[U:1:300]", ["cheater"])])
+        self.write(self.upstream, [hackerpolice_entry("[U:1:399]")])  # 300 is gone from upstream
+
+        after = self.run_sync("--demote")
+
+        self.assertIsNone(self.entry(after, "[U:1:300]"))
+        self.assertEqual(after["players"], [])
+
+    def test_rule_4_cheater_and_racist_removed_upstream_keeps_only_the_auto_racist_proofs(self):
+        """The cheater tag goes, and so does every proof that is not a
+        ``[auto] automatically marked: Racist | reason: "..."`` line -- including
+        gibberish that never pointed at cheating in the first place."""
+        self.write(
+            self.database,
+            [
+                player(
+                    "[U:1:400]",
+                    ["cheater", "racist"],
+                    proof=[
+                        self.RACIST_LINE,
+                        "Silent Aim & ESP",
+                        "asdf gibberish n0t a proof",
+                        "https://youtu.be/cheat-video",
+                    ],
+                )
+            ],
+        )
+        self.write(self.snapshot, [player("[U:1:400]", ["cheater", "racist"])])
+        self.write(self.upstream, [hackerpolice_entry("[U:1:499]")])  # 400 is gone from upstream
+
+        after = self.run_sync("--demote")
+
+        entry = self.entry(after, "[U:1:400]")
+        self.assertEqual(entry["attributes"], ["racist"])
+        self.assertEqual(entry["proof"], [self.RACIST_LINE])
+
+    def test_rule_5_snapshot_is_a_byte_for_byte_copy_of_the_upstream_file(self):
+        """CRLF, tabs, unsorted keys and no trailing newline: all preserved."""
+        raw = b'{\r\n\t"players": [ {"attributes": ["cheater"], "steamid": "[U:1:500]" } ],\r\n\t"$schema": "s"\r\n}'
+        self.write(self.database, [player("[U:1:500]", ["suspicious"])])
+        self.upstream.parent.mkdir(parents=True, exist_ok=True)
+        self.upstream.write_bytes(raw)
+
+        after = self.run_sync()
+
+        self.assertEqual(self.entry(after, "[U:1:500]")["attributes"], ["cheater"])  # the run did something
+        self.assertEqual(self.snapshot.read_bytes(), raw)  # ... and the copy is exact
+
+    def test_rule_5_snapshot_keeps_being_updated_when_the_database_does_not_change(self):
+        """A run that changes no entry must still advance the baseline."""
+        self.write(self.database, [player("[U:1:600]", ["cheater"])])
+        first = json.dumps({"$schema": "s", "file_info": {}, "players": [hackerpolice_entry("[U:1:600]")]}).encode()
+        self.upstream.write_bytes(first)
+        self.run_sync("--demote")
+        self.assertEqual(self.snapshot.read_bytes(), first)
+
+        second = json.dumps(
+            {
+                "$schema": "s",
+                "file_info": {},
+                "players": [hackerpolice_entry("[U:1:600]"), hackerpolice_entry("[U:1:601]")],
+            }
+        ).encode()
+        self.upstream.write_bytes(second)
+        after = self.run_sync("--demote")
+
+        self.assertEqual(after["players"][0]["attributes"], ["cheater"])  # no database change
+        self.assertEqual(self.snapshot.read_bytes(), second)  # baseline still advanced
 
 
 if __name__ == "__main__":

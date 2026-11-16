@@ -30,3 +30,20 @@ extraPaths = ["scripts"]
 # unattended, so a type error is worth failing a pull request over.
 strict = true
 mypy_path = "scripts"
+
+[tool.coverage.run]
+# Branch coverage, not just lines: a branch nobody takes (the error path of a
+# guard) is exactly the code this bot runs when something has gone wrong, so
+# "every line ran" is not good enough.
+branch = true
+source = ["scripts"]
+
+[tool.coverage.report]
+# The gate itself. `coverage report` exits non-zero below this, so CI fails
+# on an untested statement or branch instead of on a reviewer noticing.
+fail_under = 100
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+]

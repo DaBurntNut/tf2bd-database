@@ -8,7 +8,9 @@ name: Sync Vorobey hackerpolice
 # Demotes entries that carry cheater, but ONLY SteamIDs that were in the
 # previous hackerpolice snapshot (snapshot/playerlist.vorobey-hackerpolice.json)
 # and have since been removed from the hackerpolice list:
-#   * "cheater" + "racist"     -> only "cheater" is removed ("racist" kept)
+#   * "cheater" + "racist"     -> only "cheater" is removed ("racist" kept), together
+#                                with every proof that is not an
+#                                `[auto] automatically marked: Racist | reason: "…"` line
 #   * "cheater" alone          -> whole entry is removed
 # Cheaters that were never on the hackerpolice list (added manually) are
 # never demoted. Everything else is never touched, and the hackerpolice proof
@@ -36,6 +38,16 @@ name: Sync Vorobey hackerpolice
 # "Compare & pull request" link in the job summary. Alternatively, store a
 # personal access token with contents + pull-requests write access in the
 # BOT_TOKEN secret and it will be used instead of GITHUB_TOKEN.
+#
+# Supply chain: every action below is pinned to a full commit SHA (with its
+# release tag in a trailing comment), not to a tag. A tag is a mutable pointer
+# in someone else's repository: whoever can move it -- the maintainer, a stolen
+# account, a compromised release process -- gets to run arbitrary code in this
+# job, which holds a token that can write to this repository. A SHA cannot be
+# moved. All three pins are signed commits from their project's own release.
+# .github/dependabot.yml bumps them (and the trailing comment) every week, so
+# they stay current without anyone having to remember; review those pull
+# requests like any other dependency update.
 
 on:
   schedule:
@@ -75,11 +87,30 @@ on:
       - "tests/**"
       - "pyproject.toml"
       - ".gitattributes"
+      # Both are read by the suite (the CLI inventory and the Dependabot
+      # contract): without them here, a pull request touching only those files
+      # runs no checks, and the tests that guard them can never fail.
+      - "README.md"
+      - ".github/dependabot.yml"
       - ".github/workflows/sync-vorobey-hackerpolice.yml"
 
 permissions:
   contents: write
   pull-requests: write
+
+# Pinned tool versions, shared by EVERY job: the lint/type-check steps are
+# identical in both, and a version bumped in one place but not the other would
+# mean a pull request is validated against different tools than the sync runs.
+# The values reach the steps through the environment (never interpolated into
+# a shell line), so they are plain strings here.
+env:
+  RUFF_VERSION: "0.17.4"
+  MYPY_VERSION: "2.4.1"
+  BANDIT_VERSION: "1.9.4"
+  # 7.17.3 requires Python >=3.11; 7.16.2 is the latest release supporting
+  # the 3.10 floor in this workflow's test matrix.
+  COVERAGE_VERSION: "7.16.2"
+  VULTURE_VERSION: "2.16"
 
 jobs:
   # Read-only sibling of the sync job: runs the same lint + test steps on a
@@ -91,35 +122,66 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    strategy:
+      # One leg failing must not hide what the other found.
+      fail-fast: false
+      matrix:
+        # Test the floor the README promises AND the version the bot runs on.
+        # With only 3.12 in the matrix, a 3.11+ API (datetime.UTC, tomllib) or a
+        # 3.12-only f-string keeps CI green while breaking the promise for
+        # everyone on the floor -- and the sync job, which is the only place
+        # that really executes the code, also runs 3.12, so nothing would ever
+        # notice. The sync job stays on 3.12 on purpose: that is production.
+        python-version: ["3.10", "3.12"]
     # Own concurrency group: a pull request must never queue behind the nightly
     # sync (which shares the group below for up to 10 minutes), and a newer
-    # push to the same PR cancels the older, now-pointless run.
+    # push to the same PR cancels the older, now-pointless run. The Python
+    # version is part of the group because these legs run in parallel with
+    # cancel-in-progress: without it, one leg could cancel the other -- and the
+    # 3.10 leg is the whole point of the matrix.
     concurrency:
-      group: checks-${{ github.event.pull_request.number || github.ref }}
+      group: checks-${{ github.event.pull_request.number || github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Lint (ruff)
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check ruff==0.17.4
+          python3 -m pip install --quiet --disable-pip-version-check "ruff==${RUFF_VERSION}"
           python3 -m ruff check scripts tests
           python3 -m ruff format --check scripts tests
 
       - name: Type-check (mypy, strict)
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check mypy==2.4.1
+          python3 -m pip install --quiet --disable-pip-version-check "mypy==${MYPY_VERSION}"
           python3 -m mypy scripts
 
-      - name: Run unit tests
-        run: python3 -m unittest discover -s tests -v
+      - name: Security scan (bandit)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "bandit==${BANDIT_VERSION}"
+          python3 -m bandit -q -r scripts
+
+      - name: Run unit tests under the coverage gate
+        # `coverage report` reads its thresholds from pyproject.toml and fails
+        # below them: 100% of statements AND branches. A guard's error path is
+        # the code that runs when something has already gone wrong, so "every
+        # line ran" is not enough -- the branch has to run too.
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "coverage==${COVERAGE_VERSION}"
+          python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
+          python3 -m coverage report
+
+      - name: Dead code (vulture)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "vulture==${VULTURE_VERSION}"
+          python3 -m vulture scripts tests --min-confidence 60
 
   sync:
     name: Check Vorobey hackerpolice list
@@ -140,29 +202,55 @@ jobs:
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
       # Scheduled runs always open a pull request; manual runs choose.
       MODE: ${{ github.event_name == 'schedule' && 'pull-request' || inputs.mode }}
+      # Empty on scheduled runs (only workflow_dispatch defines the input), so
+      # the cleanup step below compares against the string, never a null.
+      DRY_RUN_INPUT: ${{ inputs.dry_run }}
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Always the DEFAULT branch, never the branch a manual dispatch was
+          # started from: "commit the change" would otherwise commit to that
+          # branch, the pull request would target it, and a feature branch would
+          # carry a bot commit. The sync exists to maintain the default branch.
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
       - name: Lint (ruff)
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check ruff==0.17.4
+          python3 -m pip install --quiet --disable-pip-version-check "ruff==${RUFF_VERSION}"
           python3 -m ruff check scripts tests
           python3 -m ruff format --check scripts tests
 
       - name: Type-check (mypy, strict)
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check mypy==2.4.1
+          python3 -m pip install --quiet --disable-pip-version-check "mypy==${MYPY_VERSION}"
           python3 -m mypy scripts
 
-      - name: Run unit tests
-        run: python3 -m unittest discover -s tests -v
+      - name: Security scan (bandit)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "bandit==${BANDIT_VERSION}"
+          python3 -m bandit -q -r scripts
+
+      - name: Run unit tests under the coverage gate
+        # `coverage report` reads its thresholds from pyproject.toml and fails
+        # below them: 100% of statements AND branches. A guard's error path is
+        # the code that runs when something has already gone wrong, so "every
+        # line ran" is not enough -- the branch has to run too.
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "coverage==${COVERAGE_VERSION}"
+          python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
+          python3 -m coverage report
+
+      - name: Dead code (vulture)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "vulture==${VULTURE_VERSION}"
+          python3 -m vulture scripts tests --min-confidence 60
 
       - name: Sync database with Vorobey hackerpolice list
         id: sync
@@ -200,13 +288,16 @@ jobs:
         # lint/test step above), printing a misleading "Nothing to publish"
         # line -- or publishing from a run whose own checks failed.
         if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE != 'commit'
-        uses: peter-evans/create-pull-request@v8
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
         with:
           token: ${{ secrets.BOT_TOKEN || github.token }}
           add-paths: |
             ${{ env.DATABASE }}
             ${{ env.SNAPSHOT }}
           branch: ${{ env.BOT_BRANCH }}
+          # Explicit, not "whatever branch is checked out": the bot's pull
+          # request must always propose a change to the default branch.
+          base: ${{ env.BASE_BRANCH }}
           delete-branch: true
           title: "Sync the Vorobey hackerpolice matches"
           commit-message: |
@@ -227,12 +318,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # create-pull-request may already have committed the change locally
-          # before failing on the pull request API call.
-          if ! git rev-parse --verify --quiet "refs/heads/$BOT_BRANCH" > /dev/null; then
+          # Commit whatever is still uncommitted. Depending on where
+          # create-pull-request stopped, the change can be uncommitted, partly
+          # staged, or already committed on the branch. The working tree is the
+          # only reliable answer: an existing branch ref proves nothing about
+          # what it contains, and pushing one without the change would open a
+          # pull request whose diff is empty.
+          if [ -n "$(git status --porcelain -- "$DATABASE" "$SNAPSHOT")" ]; then
             git checkout -B "$BOT_BRANCH"
             git add -- "$DATABASE" "$SNAPSHOT"
             git commit -m "Sync the Vorobey hackerpolice matches"
+          fi
+          if ! git rev-parse --verify --quiet "refs/heads/$BOT_BRANCH" > /dev/null; then
+            echo "::error::Nothing was committed to $BOT_BRANCH and no such branch exists - nothing to push."
+            exit 1
           fi
           # --force-with-lease only works if the remote ref is known locally;
           # a fresh checkout has never seen the bot branch.
@@ -270,3 +369,27 @@ jobs:
       - name: Nothing to do
         if: steps.sync.outcome == 'success' && steps.sync.outputs.changed != 'true'
         run: echo "Nothing to publish (no database or snapshot changes, or this was a dry run)."
+
+      - name: Close a stale bot pull request
+        # A previous run may have opened a pull request that was never merged.
+        # If TODAY'S run finds nothing left to do, that pull request is stale: it
+        # still offers the database and snapshot of an earlier day, and merging
+        # it now would undo whatever changed in between (a manual fix, or a
+        # later upstream change). A run that still has work never gets here --
+        # create-pull-request refreshes that same pull request instead.
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed != 'true' && env.MODE != 'commit' && env.DRY_RUN_INPUT != 'true'
+        # Cleanup must never turn an otherwise clean run red: a token without
+        # pull-request access fails here and the failure stays visible, but the
+        # database has already been synced correctly.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN || github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          numbers=$(gh pr list --repo "$REPOSITORY" --head "$BOT_BRANCH" --state open --json number --jq '.[].number')
+          for number in $numbers; do
+            gh pr close "$number" --repo "$REPOSITORY" --delete-branch \
+              --comment "Closing: the latest sync run found nothing left to do, so this pull request is stale. A new one is opened automatically the next time the list changes."
+            echo "Closed stale bot pull request #$number." >> "$GITHUB_STEP_SUMMARY"
+          done
