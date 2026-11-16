@@ -488,6 +488,19 @@
 				"cheater"
 			],
 			"last_seen": {
+				"player_name": "Gregorian",
+				"time": 1794847948
+			},
+			"proof": [
+				"Silent Aim & ESP"
+			],
+			"steamid": "[U:1:173721301]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
 				"player_name": "grifoxqqqwer",
 				"time": 1779885286
 			},
@@ -1676,6 +1689,16 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "GGSSUT",
+				"time": 1794847311
+			},
+			"steamid": "[U:1:662081349]"
+		},
+		{
+			"attributes": [
 				"cheater"
 			],
 			"last_seen": {
@@ -1931,6 +1954,19 @@
 				"Bot Account"
 			],
 			"steamid": "[U:1:704698368]"
+		},
+		{
+			"attributes": [
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "epicgamer2015",
+				"time": 1794849661
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"NIGGA FUCK RANDOM CRITS\""
+			],
+			"steamid": "[U:1:704748768]"
 		},
 		{
 			"attributes": [
@@ -3733,6 +3769,16 @@
 				"[auto] automatically marked: Racist | reason: \"wait that nigga i know\""
 			],
 			"steamid": "[U:1:1142640262]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "D1SZI",
+				"time": 1794854054
+			},
+			"steamid": "[U:1:1143565630]"
 		},
 		{
 			"attributes": [
