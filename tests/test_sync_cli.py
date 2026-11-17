@@ -192,14 +192,14 @@ class UntouchedPathTests(unittest.TestCase):
                 "encoding": "base64",
                 "content": base64.b64encode(b"{}").decode("ascii"),
                 "sha": "a" * 40,
-                "download_url": "https://example.invalid/download.json",
+                "download_url": "https://raw.githubusercontent.com/Nocrex/Tom/main/download.json",
             }
         ).encode("utf-8")
 
         def read(url):
             if url == SOURCE_API_URL:
                 return envelope
-            if url == "https://example.invalid/download.json":
+            if url == "https://raw.githubusercontent.com/Nocrex/Tom/main/download.json":
                 return b'{"$schema": "x"}'  # Valid JSON, but not a playerlist document.
             raise SyncError("blocked")
 

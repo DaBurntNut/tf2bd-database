@@ -76,6 +76,7 @@ class HackerpoliceIndexTests(unittest.TestCase):
 class SourceFetchTests(unittest.TestCase):
     URL = SOURCE_URL
     API_URL = SOURCE_API_URL
+    RAW_URL = "https://raw.githubusercontent.com/Nocrex/Tom/main/playerlist.vorobey-hackerpolice.json"
     BODY = SOURCE_BODY
 
     def fetch(self, side_effect):
@@ -130,6 +131,40 @@ class SourceFetchTests(unittest.TestCase):
             ):
                 load_first_available_raw([self.URL])
             self.assertEqual(urlopen.call_count, 1)  # Only the API envelope was fetched.
+
+    def test_cross_origin_https_download_urls_are_never_followed(self):
+        """An API response cannot make the sync job probe unrelated HTTPS hosts."""
+        for bad_url in (
+            "https://attacker.invalid/raw.json",
+            "https://user:secret@example.invalid/raw.json",
+            "https://example.invalid:8443/raw.json",
+            "https://example.invalid:not-a-port/raw.json",
+        ):
+            with self.subTest(download_url=bad_url):
+                envelope = json.dumps({"encoding": "none", "content": "", "download_url": bad_url}).encode("utf-8")
+                with (
+                    mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(envelope)]) as urlopen,
+                    mock.patch("sources.time.sleep"),
+                    self.assertRaises(SyncError),
+                ):
+                    load_first_available_raw([self.URL])
+                self.assertEqual(urlopen.call_count, 1)  # The response URL was not followed.
+
+    def test_an_oversized_download_url_is_rejected_before_url_parsing(self):
+        candidate = "https://example.invalid/" + "x" * sources._MAX_URL_PARSE_CHARS
+        with mock.patch("sources.urllib.parse.urlsplit", side_effect=AssertionError("must not parse")):
+            self.assertFalse(sources._allowed_download_url(self.URL, candidate))
+
+    def test_same_origin_https_download_keeps_its_non_default_port(self):
+        source = "https://example.invalid:8443/api"
+        download_url = "https://example.invalid:8443/raw.json"
+        envelope = json.dumps({"encoding": "none", "content": "", "download_url": download_url}).encode("utf-8")
+        with (
+            mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(envelope), _FakeResponse(self.BODY)]),
+            mock.patch("sources.time.sleep"),
+        ):
+            _, _, raw = load_first_available_raw([source])
+        self.assertEqual(raw, self.BODY)
 
     def test_a_non_string_download_url_is_ignored(self):
         """download_url is response data: it can be any JSON type, not just text."""
@@ -903,9 +938,9 @@ class SourceFetchTests(unittest.TestCase):
                 load_snapshot(Path(tmp))  # A directory is not a source file.
 
     def test_bad_base64_envelope_falls_through_to_the_next_strategy(self):
-        envelope = json.dumps({"encoding": "base64", "content": "!!!not base64!!!", "download_url": self.URL}).encode(
-            "utf-8"
-        )
+        envelope = json.dumps(
+            {"encoding": "base64", "content": "!!!not base64!!!", "download_url": self.RAW_URL}
+        ).encode("utf-8")
         with (
             mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(envelope), _FakeResponse(self.BODY)]),
             mock.patch("sources.time.sleep"),
@@ -915,7 +950,7 @@ class SourceFetchTests(unittest.TestCase):
 
     def test_inline_content_that_is_not_a_playerlist_falls_through(self):
         inner = base64.b64encode(b"[]").decode("ascii")
-        envelope = json.dumps({"encoding": "base64", "content": inner, "download_url": self.URL}).encode("utf-8")
+        envelope = json.dumps({"encoding": "base64", "content": inner, "download_url": self.RAW_URL}).encode("utf-8")
         with (
             mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(envelope), _FakeResponse(self.BODY)]),
             mock.patch("sources.time.sleep"),
@@ -927,9 +962,9 @@ class SourceFetchTests(unittest.TestCase):
     def test_a_failing_candidate_is_skipped_for_the_next_one(self):
         sha = "d" * 40
         # Try download_url first, then the Git blob endpoint after three failures.
-        envelope = json.dumps(
-            {"encoding": "none", "content": "", "sha": sha, "download_url": "https://raw.invalid/list.json"}
-        ).encode("utf-8")
+        envelope = json.dumps({"encoding": "none", "content": "", "sha": sha, "download_url": self.RAW_URL}).encode(
+            "utf-8"
+        )
         with (
             mock.patch(
                 "sources._OPENER.open",

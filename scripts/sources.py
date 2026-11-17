@@ -761,6 +761,45 @@ def _github_blob_url(source: str, sha: Any) -> str | None:
     return f"https://api.github.com{repository}/git/blobs/{sha}"
 
 
+def _allowed_download_url(source: str, candidate: str) -> bool:
+    """Only follow same-origin HTTPS downloads, plus GitHub's raw-content host.
+
+    Contents API responses are untrusted data. HTTPS alone is not an origin
+    boundary: following an arbitrary ``download_url`` would let a remote list
+    make a write-capable CI job issue requests to unrelated hosts. The GitHub
+    Contents API legitimately points from ``api.github.com`` to
+    ``raw.githubusercontent.com``; all other follow-ups must stay on the
+    source's own HTTPS origin. Userinfo is rejected so a response cannot make
+    the client send Basic credentials.
+    """
+    if len(candidate) > _MAX_URL_PARSE_CHARS or http_scheme(candidate) != "https":
+        return False
+    try:
+        source_parts = urllib.parse.urlsplit(source)
+        candidate_parts = urllib.parse.urlsplit(candidate)
+        source_port = source_parts.port
+        candidate_port = candidate_parts.port
+    except ValueError:
+        return False
+
+    if candidate_parts.username is not None:
+        return False
+
+    source_origin = (source_parts.scheme.lower(), source_parts.hostname, 443 if source_port is None else source_port)
+    candidate_origin = (
+        candidate_parts.scheme.lower(),
+        candidate_parts.hostname,
+        443 if candidate_port is None else candidate_port,
+    )
+    if source_origin == candidate_origin:
+        return True
+    return source_origin == ("https", "api.github.com", 443) and candidate_origin == (
+        "https",
+        "raw.githubusercontent.com",
+        443,
+    )
+
+
 def _document_from(raw: bytes, source: str) -> tuple[dict[str, Any], bytes] | None:
     """Parse ``raw`` and return it only when it has a usable SteamID.
 
@@ -792,8 +831,7 @@ def _resolve_indirect_document(document: dict[str, Any], source: str) -> tuple[d
 
     candidates: list[str] = []
     download_url = document.get("download_url")
-    # Treat API-provided download_url as untrusted; require HTTPS and disallow local paths.
-    if isinstance(download_url, str) and http_scheme(download_url) == "https":
+    if isinstance(download_url, str) and _allowed_download_url(source, download_url):
         candidates.append(download_url)
     blob_url = _github_blob_url(source, document.get("sha"))
     if blob_url is not None:
@@ -845,7 +883,7 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
             resolved = _resolve_indirect_document(document, source)
             if resolved is None:
                 failures.append(
-                    f"{_redact_source(source)}: no 'players' array, and neither inline content, a usable HTTPS "
+                    f"{_redact_source(source)}: no 'players' array, and neither inline content, an allowed HTTPS "
                     "download_url nor a Git blob could be resolved"
                 )
                 continue

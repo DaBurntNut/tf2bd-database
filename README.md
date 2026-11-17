@@ -105,13 +105,15 @@ remains the complete record.
   integer tokens over 4,300 digits and duplicate keys are rejected. This avoids
   invalid numeric values, version-dependent integer parsing and silent data loss.
 - **Bounded reads** — HTTPS only (a redirect downgrade or a URL over 4,096
-  characters is refused), 64 MiB per download, 30 s, 3 attempts, then the next
-  fallback. The same 64 MiB cap applies to database, snapshot and local-source
-  files. FIFOs/devices are refused before reading, so a local path cannot hang
-  the run or stream indefinitely. Credentials in a URL (including nested links
-  in proof text) are redacted before anything is printed or published;
-  overlong URLs are omitted before parsing, and a URL cannot ping a user with
-  `@handle`.
+  characters is refused); API-provided follow-up URLs stay on the same origin,
+  except GitHub Contents API downloads from `api.github.com` to
+  `raw.githubusercontent.com`. Downloads are capped at 64 MiB, 30 s and 3
+  attempts before trying the next fallback. The same 64 MiB cap applies to
+  database, snapshot and local-source files. FIFOs/devices are refused before
+  reading, so a local path cannot hang the run or stream indefinitely.
+  Credentials in a URL (including nested links in proof text) are redacted before
+  anything is printed or published; overlong URLs are omitted before parsing,
+  and a URL cannot ping a user with `@handle`.
 - **Safe messages** — every value that reaches a log line or the pull request is
   escaped and bounded: a player name or a path cannot start a second log line,
   repaint the terminal, hide itself behind invisible or bidirectional characters
@@ -145,13 +147,19 @@ remains the complete record.
 ```
 python3 scripts/sync_vorobey_hackerpolice.py --dry-run
 python3 scripts/sync_vorobey_hackerpolice.py --demote --report out.md
-python3 -m coverage run -m unittest discover -s tests   # the gate is in pyproject.toml
+```
+
+The scripts use only Python's standard library. To run the coverage gate locally,
+install the same coverage version as CI first:
+
+```
+python3 -m pip install coverage==7.16.2
+python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
 python3 -m coverage report
 ```
 
-Python 3.10 or newer, no dependencies: the scripts use the standard library
-only. CI runs both 3.10 (the floor the promise rests on) and 3.12 (what the
-sync itself runs on).
+Python 3.10 or newer; CI checks both 3.10 (the minimum) and 3.12 (the runtime
+used by the sync job).
 
 The interface (`--help` prints the long version):
 

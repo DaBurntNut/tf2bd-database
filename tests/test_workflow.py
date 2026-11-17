@@ -324,6 +324,14 @@ class WorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(f'"{tool}==${{{name}}}"', self.workflow)
 
+    def test_local_coverage_instructions_match_the_ci_tool_version(self):
+        readme = (self.root / "README.md").read_text(encoding="utf-8")
+        documented = re.search(r"python3 -m pip install coverage==([^\s`]+)", readme)
+        configured = re.search(r'^\s*COVERAGE_VERSION:\s*"([^"]+)"$', self.workflow, re.M)
+        self.assertIsNotNone(documented, "the local test instructions must install coverage")
+        self.assertIsNotNone(configured, "CI must pin coverage")
+        self.assertEqual(documented.group(1), configured.group(1))
+
     def test_checks_run_for_all_events_and_only_pull_requests_run_no_sync(self):
         jobs = self.jobs()
         self.assertNotIn("if: github.event_name == 'pull_request'", jobs["checks"])
