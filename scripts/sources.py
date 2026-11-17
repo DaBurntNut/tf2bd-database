@@ -41,20 +41,13 @@ from playerlist import (
 
 SOURCE_REPO_URL = "https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json"
 
-# Tried in order until one of them answers. The first is the canonical raw
-# URL of the original file -- the exact bytes the snapshot must replicate.
+# Try sources in order; the first URL serves the original file's raw bytes.
 DEFAULT_SOURCES: tuple[str, ...] = (
     "https://raw.githubusercontent.com/Nocrex/Tom/refs/heads/main/playerlist.vorobey-hackerpolice.json",
     "https://github.com/Nocrex/Tom/raw/main/playerlist.vorobey-hackerpolice.json",
     "https://api.github.com/repos/Nocrex/Tom/contents/playerlist.vorobey-hackerpolice.json",
 )
 
-# Single source of truth for the tool version (also used for --version and the
-# HTTP User-Agent). 5.0 is a major bump: the unsafe --include-proof flag was
-# removed, so promotions can no longer write upstream evidence into the
-# database. The run's interruption/error handling and review text were also
-# hardened: Ctrl-C exits 130 without a traceback, errors name the relevant file,
-# and report text is inert as Markdown.
 VERSION = "5.0"
 
 USER_AGENT = (
@@ -65,20 +58,12 @@ FETCH_TIMEOUT_SECONDS = 30
 FETCH_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 2
 
-# A displayed URL is capped at 2,048 characters. Parsing an arbitrarily large
-# URL first can nevertheless materialise millions of query-parameter tuples
-# from a single bounded (64 MiB) upstream document. Four kilobytes is generous
-# for a real URL and bounds both that work and network request-targets; longer
-# URLs are refused for fetches and omitted from logs/reports before parsing.
+# Bound URL parsing and request targets; reject oversized URLs before parsing.
 _MAX_URL_PARSE_CHARS = 4_096
-# Nested redirect/callback URLs can themselves contain URLs. Bound recursion so
-# a tiny self-similar query cannot exhaust the Python call stack while logging.
+# Bound nested URL inspection to prevent excessive recursion.
 _MAX_NESTED_URL_DEPTH = 8
 
-# Sanity cap on a fetched list (the real one is ~1.9 MB): a misbehaving or
-# hostile endpoint must not be able to exhaust memory by streaming forever.
-# The same budget applies to the snapshot file read from disk, which used to be
-# read whole however big it was.
+# Cap fetched files and snapshots to bound memory use.
 MAX_SOURCE_BYTES = MAX_FILE_BYTES
 
 __all__ = [
@@ -101,9 +86,7 @@ class SyncError(Exception):
     """A user-facing failure (bad input, unreachable source) rather than a bug."""
 
 
-# ``--verbose`` turns these on: without them the flag only re-printed the INFO
-# lines the default run already shows, so it did nothing at all. Every message
-# names a source through ``redact_url``, because a --source may carry a token.
+# Debug fetch details only in verbose mode; redact source URLs in every message.
 LOGGER = logging.getLogger("vorobey_sources")
 
 
@@ -128,8 +111,7 @@ def http_scheme(value: str) -> str:
     has no scheme, so it answers ``""``.
     """
     if len(value) > _MAX_URL_PARSE_CHARS:
-        # The scheme is at the front, so do not ask urlsplit() to scan a
-        # potentially 64 MiB upstream-supplied download_url just to classify it.
+        # Classify oversized URLs from the prefix without scanning untrusted input.
         if value[:8].casefold() == "https://":
             return "https"
         if value[:7].casefold() == "http://":
@@ -137,7 +119,7 @@ def http_scheme(value: str) -> str:
         return ""
     try:
         scheme = urllib.parse.urlsplit(value).scheme.lower()
-    except ValueError:  # e.g. a malformed IPv6 literal
+    except ValueError:  # Invalid URLs have no usable HTTP scheme
         return ""
     return scheme if scheme in {"http", "https"} else ""
 
@@ -168,8 +150,7 @@ class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new
 
 
-# One opener for the whole process: it holds no per-request state, and it is
-# what enforces the HTTPS-only redirect rule above.
+# Shared opener enforces HTTPS-only redirects.
 _OPENER = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
 
 
@@ -177,8 +158,7 @@ def _declared_length(response: object) -> int | None:
     """Usable ``Content-Length`` of a response, or ``None`` when absent/invalid."""
     response_headers = getattr(response, "headers", None)
     declared = response_headers.get("Content-Length") if response_headers is not None else None
-    # ASCII digits only: isdigit() also accepts things like "²", which int()
-    # then refuses -- a malformed header must not crash the fetch.
+    # Accept only ASCII digits in Content-Length.
     if isinstance(declared, str) and declared.isascii() and declared.isdigit():
         return int(declared)
     return None
@@ -245,7 +225,7 @@ def _parse_document(raw: bytes, source: str) -> dict[str, Any]:
     try:
         document = strict_json_loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValueError) as exc:
-        # ValueError: e.g. a JSON number beyond Python's int-parsing limit.
+        # ValueError also covers Python's integer digit limit.
         raise SyncError(f"{_redact_source(source)} is not valid JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise SyncError(f"{_redact_source(source)} does not contain a JSON object")
@@ -263,20 +243,11 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     is parsed from exactly the bytes handed back.
     """
     try:
-        # Resolve first so a self-referential symlink is not mistaken for a
-        # missing baseline. Path.exists() can return False for ELOOP; treating
-        # that as "no snapshot" would silently disable demotion and let the
-        # writer replace the link with a file.
-        # strict=False still permits a genuinely dangling link, whose final
-        # target may legitimately be created by the subsequent snapshot write.
+        # Resolve symlinks first to detect loops while allowing a missing final target.
+        # strict=False permits a dangling link whose target may be created later.
         path.resolve(strict=False)
-        # An unencodable surrogate cannot name a filesystem entry at all; keep
-        # the existing "no snapshot" behavior for that impossible path.
-        # (Surrogate-escape code points are still representable and continue
-        # through normal filesystem handling.)
-        # Use stat() rather than exists(): newer pathlib versions may turn any
-        # OSError into False, which would mistake a permission/IO failure for a
-        # missing baseline and could let the next write replace it.
+        # Unencodable paths cannot name a snapshot; preserve the missing-file behavior.
+        # Use stat(), not exists(), so permission and I/O errors are not treated as missing.
         path.stat()
     except FileNotFoundError:
         return None
@@ -296,20 +267,8 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     return HackerpoliceIndex.build(document, what=f"the previous snapshot {display_path(path)}"), raw
 
 
-# Query parameters whose VALUE is a credential. GitHub's own raw URLs, S3
-# presigned URLs (?X-Amz-Signature=..., ?X-Amz-Credential=...) and most token
-# schemes carry the secret in the query rather than in the userinfo -- and this
-# URL is printed in the report, i.e. in the pull request body and the job
-# summary, which are public in a public repository. The NAME is matched, never
-# the value: a parameter called "ref" keeps its value, so the line still says
-# which file was fetched.
-#
-# These are SUBSTRING matches on purpose. An exact-name list was a leak: it
-# knew "token" but not GitLab's "private_token", "refresh_token", "auth_token",
-# "secret_key", "pass", "bearer" or Google's "X-Goog-Signature", so a
-# credential in one of those sailed into a public pull request. Matching a
-# fragment over-redacts the occasional harmless parameter (?keyword=...), which
-# costs a reader nothing, while a missed secret cannot be undone.
+# Redact values for credential-like query parameter names before logging or publishing.
+# Substring matching catches provider-specific variants; false positives are safer than missed credentials.
 _SECRET_QUERY_PARAM = re.compile(
     r"token|secret|passw|^pass$|pass$|auth|credential|session|sid|bearer|jwt|nonce|state|ticket|"
     r"apikey|api[_-]?key|sig|hmac|saml|key|x-amz|x-goog|code",
@@ -328,12 +287,7 @@ def _normalised_query_name(name: str) -> str | None:
     use at least as broad a normalization so encoding cannot bypass it.
     """
     decoded = name
-    # The first parse_qsl/unquote_plus pass has already happened for URL pairs.
-    # A few consumers decode keys more than once, so inspect a small bounded
-    # number of additional percent-encoding layers rather than allowing
-    # ``to%250Aken`` to disguise the same key as ``to\nken``. HTML character
-    # references can spell the same separators (``to&#x6e;ken``) and URL
-    # delimiters (``token&#x3d;SECRET``), so inspect those at every layer too.
+    # Inspect bounded additional percent/HTML decoding layers for obfuscated keys and delimiters.
     for _ in range(_MAX_NESTED_URL_DEPTH):
         next_decoded = _html_unescape_bounded(urllib.parse.unquote(decoded))
         if next_decoded is None:
@@ -342,9 +296,7 @@ def _normalised_query_name(name: str) -> str | None:
             break
         decoded = next_decoded
     if _PERCENT_ESCAPE.search(decoded):
-        # A later consumer may decode more layers. An unresolved escape in a
-        # parameter name is ambiguous, so treat it as sensitive rather than
-        # risking a token hidden just beyond our budget.
+        # Fail closed on unresolved escapes; another decoder could expose a credential key.
         return None
     return "".join(char for char in decoded if unicodedata.category(char)[0] not in {"C", "Z"}).casefold()
 
@@ -357,13 +309,7 @@ def _has_sensitive_query_name(name: str) -> bool:
 
 REDACTED = "REDACTED"
 
-# Lone UTF-16 surrogates. ``argv`` decodes bytes that are not valid UTF-8 with
-# ``surrogateescape``, so ``--source $'https://host/?token=\xff'`` arrives
-# holding ``\udcff``. ``urllib.parse.urlencode`` cannot encode that (it raises
-# UnicodeEncodeError, which nothing above catches -- the run would die with a
-# traceback instead of refusing cleanly), and the same character cannot be
-# written to the report. They become U+FFFD, exactly as the report renders
-# them, so a redacted URL is always printable.
+# Replace lone surrogates before URL encoding or report output.
 _SURROGATES = re.compile(r"[\ud800-\udfff]")
 
 
@@ -379,35 +325,21 @@ def _html_unescape_bounded(value: str) -> str | None:
         if decoded == value:
             return value
         value = decoded
-    # Do not inspect or echo a still-encoded value whose structure might appear
-    # only after another decoding pass.
+    # Omit values that remain encoded after the inspection limit.
     return None if html.unescape(value) != value else value
 
 
-# Line terminators and invisible format characters must never appear raw in a
-# URL that is printed. ``--source`` can carry untrusted text, and URLs are
-# written to the CI log and pull request: controls can forge a line, bidi marks
-# can reverse its apparent meaning, and format characters (including joiners)
-# can disguise a different target. Detect Unicode categories rather than a
-# hand-maintained character list so newly assigned format characters are safe.
+# Neutralise control and format characters in URLs before logging or publishing.
 _URL_IN_TEXT = re.compile(r"(?:(?:[a-z][a-z0-9+.-]*:)?//)[^\s<>\"'`]+", re.IGNORECASE | re.ASCII)
-# A malformed URL embedded in prose may be split at whitespace. The normal
-# URL scanner stops there, so separately redact query secrets even when a
-# control or Unicode line separator breaks the URL before its parameter.
+# Scan query parameters separately when malformed URLs split at whitespace or controls.
 _QUERY_PARAM_IN_TEXT = re.compile(
     r"(?P<separator>[?&#;])"
-    # Query-key normalization drops whitespace and invisible separators, so
-    # include them here too: ``?to ken=secret`` can normalize to ``token`` in
-    # a downstream consumer. This scanner runs only on bounded display text.
+    # Include separators ignored by query-key normalization.
     r"(?P<name>[^?&#;=]+)="
-    # The value extends to the next query/fragment delimiter. Spaces, quotes,
-    # controls, and markup punctuation may be encoded or normalized by a URL
-    # consumer, so stopping at one could expose the rest of a credential. This
-    # can over-redact nearby prose in malformed text, but never leaks a suffix.
+    # Extend values to the next delimiter so secret suffixes are not exposed.
     r"(?P<value>[^&;#]*)"
 )
-# urlsplit() ignores raw newlines while parsing, but the prose scanner treats
-# them as boundaries. Catch a userinfo password split by one before scanning.
+# Catch userinfo split by line breaks; urlsplit ignores raw newlines.
 _MULTILINE_USERINFO_IN_TEXT = re.compile(
     r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//)[^/@?#<>\"'`]*\s+[^/@?#<>\"'`]*@",
     re.IGNORECASE | re.ASCII,
@@ -431,12 +363,7 @@ def _one_line(value: str) -> str:
     return "".join(pieces)
 
 
-# How much of a URL is ever shown. Every URL that reaches a log line or the
-# report goes through redact_url(), so this is the single bound on how big that
-# line can get: a presigned URL is legitimately 1-2 kB, and a 100 kB one used to
-# push the report past its byte budget, which hard-truncates the body and drops
-# the closing sentence the report exists to publish. 2,048 is far beyond any
-# real fetch URL and still short enough that the budget cannot be reached.
+# Bound every URL included in logs or reports.
 MAX_URL_DISPLAY_CHARS = 2048
 
 
@@ -478,14 +405,11 @@ def _redact_nested_url(value: str, depth: int) -> str:
 
     if not has_url_markers(candidate):
         if _PERCENT_ESCAPE.search(candidate):
-            # A nested URL can be encoded more times than this bounded scan.
-            # Do not echo a still-encoded value: a downstream decoder could
-            # reveal credentials that we have not inspected.
+            # Omit nested values that remain encoded after the bounded inspection.
             return "[nested URL omitted: too deep to inspect safely]"
         return value
     if depth >= _MAX_NESTED_URL_DEPTH:
-        # Fail closed: never echo the nested value if its depth exceeds the
-        # inspection budget, even if its secret is hidden another level down.
+        # Fail closed when nested URL depth exceeds the inspection limit.
         return "[nested URL omitted: too deep to inspect safely]"
     return _redact_urls_in_text(candidate, depth + 1)
 
@@ -503,10 +427,7 @@ def _sanitised_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tup
     changed = False
     for name, value in items:
         sensitive = _has_sensitive_query_name(name)
-        # Keep ordinary credential parameter names readable, but don't echo an
-        # obfuscated key that contains a second delimiter or embedded value
-        # (for example ``token%3DSECRET``). The secret may be in the *name*, not
-        # only after the parser's first equals sign.
+        # Redact the whole parameter name when it contains an encoded delimiter or value.
         safe_name = name if not sensitive or _SAFE_QUERY_NAME.fullmatch(name) else "REDACTED"
         safe_name = _no_surrogates(safe_name)
         safe_value = REDACTED if sensitive else _no_surrogates(_redact_nested_url(value, depth))
@@ -530,11 +451,8 @@ def _redact_url(url: str, depth: int) -> str:
     if len(url) > _MAX_URL_PARSE_CHARS:
         return "[URL omitted: too long to inspect safely]"
     original_url = url
-    # URL values are also rendered inside Markdown. HTML character references
-    # can spell structural delimiters there, bypassing urlsplit's userinfo
-    # detection (``user&#x3a;PASS&#x40;host``) or the query parser's equals sign
-    # (``?token&#x3d;SECRET``). Parse a bounded decoded view for redaction; when
-    # no credentials are found, the original spelling is preserved below.
+    # Parse a bounded decoded view so HTML entities cannot hide credentials.
+    # Preserve the original spelling when no redaction is needed.
     decoded_url = _html_unescape_bounded(url)
     if decoded_url is None:
         return "[URL omitted: too deeply encoded to inspect safely]"
@@ -542,21 +460,18 @@ def _redact_url(url: str, depth: int) -> str:
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
-        # Parsing failed before userinfo/query redaction could run. Never fall
-        # back to echoing the raw input: it may hold credentials in either.
+        # Omit unparseable URLs rather than risk echoing credentials.
         return "[malformed URL omitted]"
 
     netloc = parts.netloc
     if parts.username is not None:
         host = parts.hostname or ""
-        # urlsplit.hostname omits brackets around IPv6 literals; restore them
-        # before rebuilding netloc or the redacted URL is malformed (and can
-        # be misread as a host with a port).
+        # Restore IPv6 brackets when rebuilding the authority.
         if ":" in host:
             host = f"[{host}]"
         try:
             port = parts.port
-        except ValueError:  # a malformed port must not crash the error path
+        except ValueError:  # Ignore malformed ports rather than failing during redaction
             port = None
         if port is not None:
             host = f"{host}:{port}"
@@ -568,10 +483,7 @@ def _redact_url(url: str, depth: int) -> str:
         if changed:
             query = urllib.parse.urlencode(safe_items)
 
-    # A FRAGMENT carries credentials too: OAuth's implicit flow puts them there
-    # (``https://host/callback#access_token=...&state=...``), and this URL is
-    # published in the pull request. Only query-shaped fragments are touched --
-    # "#L10" and "#section-2" are not pairs and stay exactly as they were.
+    # Redact query-shaped fragments (for example, OAuth tokens); preserve ordinary anchors.
     fragment = parts.fragment
     if fragment and "=" in fragment:
         safe_items, changed = _sanitised_pairs(_query_pairs(fragment), depth)
@@ -579,10 +491,10 @@ def _redact_url(url: str, depth: int) -> str:
             fragment = urllib.parse.urlencode(safe_items)
 
     if netloc == parts.netloc and query == parts.query and fragment == parts.fragment:
-        shown = original_url  # nothing to hide: hand back the caller's string untouched
+        shown = original_url  # Preserve the caller's original spelling when nothing needs redaction
     else:
         shown = urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
-    # Always encodable and always one line, whatever the caller passed.
+    # Keep output encodable and on one line
     shown = _one_line(_no_surrogates(shown))
     return shown if len(shown) <= MAX_URL_DISPLAY_CHARS else shown[:MAX_URL_DISPLAY_CHARS] + "…"
 
@@ -617,9 +529,7 @@ def _redact_text_query_parameter(match: re.Match[str]) -> str:
     name = urllib.parse.unquote_plus(_no_surrogates(raw_name))
     if not _has_sensitive_query_name(name):
         return match.group()
-    # As in _sanitised_pairs, a sensitive key can itself carry an encoded
-    # delimiter and the secret after it. Keep only an ordinary parameter name;
-    # otherwise replace the whole name rather than exposing that text.
+    # Redact parameter names that contain an encoded delimiter or secret.
     safe_name = raw_name if _SAFE_QUERY_NAME.fullmatch(raw_name) else "REDACTED"
     value = match.group("value")
     end = len(value)
@@ -642,18 +552,12 @@ def _redact_urls_in_text(text: str, depth: int, *, decode_entities: bool = True)
         if decoded is None:
             return "[URL omitted: too deeply encoded to inspect safely]"
         if decoded != text:
-            # A character reference can hide even the URL scheme's colon, so
-            # inspect a decoded view too. Keep the caller's original prose if
-            # no redaction was needed; entity spellings in ordinary text are
-            # data and are escaped by the report renderer separately.
+            # Inspect a decoded view for entity-hidden delimiters; preserve original prose if unchanged.
             safe_decoded = _redact_urls_in_text(decoded, depth, decode_entities=False)
             if safe_decoded != decoded:
                 return safe_decoded
     text = _MULTILINE_USERINFO_IN_TEXT.sub(_redact_multiline_userinfo, text)
-    # Avoid parsing arbitrary prose as a URL: urlsplit can treat "Context:" as
-    # a scheme and normalize its casing. A standalone query/fragment-shaped
-    # value is still passed through the regular redactor; embedded URLs are
-    # handled one at a time so surrounding prose stays byte-for-byte intact.
+    # Do not parse prose colons as schemes; redact standalone queries and embedded URLs separately.
     stripped = text.strip()
     has_html_reference = html.unescape(stripped) != stripped
     if not any(char.isspace() for char in stripped) and (
@@ -701,7 +605,7 @@ def _safe_fetch_error(exc: Exception) -> str:
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP status {exc.code}"
     if isinstance(exc, _ShortRead):
-        return str(exc)  # generated locally from byte counts, not response text
+        return str(exc)  # Generated locally from byte counts; safe to display
     if isinstance(exc, http.client.IncompleteRead):
         return "incomplete HTTP response"
     if isinstance(exc, (ValueError, http.client.HTTPException)):
@@ -737,76 +641,60 @@ def _fetch_bytes(url: str) -> bytes:
     if len(url) > _MAX_URL_PARSE_CHARS:
         raise SyncError(f"refusing to fetch a URL longer than {_MAX_URL_PARSE_CHARS:,} characters")
     if http_scheme(url) != "https":
-        # Plain HTTP is refused even when the operator passes the URL
-        # explicitly: this file decides who gets promoted, so its transport is
-        # part of the trust model (a network attacker could otherwise inject
-        # entries). Local mirrors stay supported as a path.
+        # Reject HTTP because the list controls promotions; local paths remain supported.
         raise SyncError(f"refusing to fetch a non-HTTPS URL (use https:// or a local path): {redact_url(url)}")
     last_error: Exception | None = None
     for attempt in range(1, FETCH_ATTEMPTS + 1):
         LOGGER.debug("Fetching %s (attempt %d of %d).", redact_url(url), attempt, FETCH_ATTEMPTS)
         try:
             headers = {"User-Agent": USER_AGENT}
-            # Hostname comparison, not a substring match: a look-alike URL
-            # such as https://api.github.com.example.invalid/ must not be
-            # treated as the GitHub API.
+            # Compare hostnames exactly to reject lookalike API domains.
             parsed = urllib.parse.urlparse(url)
             if parsed.hostname == "api.github.com":
-                # Blobs answer with the file itself -- exactly the bytes the
-                # snapshot must replicate. Contents endpoints must answer
-                # with JSON instead: "vnd.github.raw" is refused outright for
-                # files over 1 MB, which would kill the fallback before the
-                # sha-based blob fetch ever got a chance to run.
+                # Request raw Git Blob bytes; keep Contents API JSON for its large-file fallback.
                 headers["Accept"] = (
                     "application/vnd.github.raw" if "/git/blobs/" in parsed.path else "application/vnd.github+json"
                 )
             request = urllib.request.Request(url, headers=headers)
-            # Scheme is restricted to HTTP(S) above (Bandit B310); the opener
-            # only adds the HTTPS-downgrade guard.
+            # HTTPS is enforced above; this handler prevents redirect downgrades.
             with _OPENER.open(request, timeout=FETCH_TIMEOUT_SECONDS) as response:  # nosec B310
-                # Reject an oversized body before downloading it when the
-                # server says how big it is.
+                # Reject oversized responses before reading when Content-Length is available.
                 declared = _declared_length(response)
                 if declared is not None and declared > MAX_SOURCE_BYTES:
                     raise _too_large(url)
                 body: bytes = response.read(MAX_SOURCE_BYTES + 1)
-                # A chunked body has no declared length, and its own decoder
-                # already raises when the stream ends early.
+                # The HTTP decoder detects incomplete chunked responses.
                 chunked = bool(getattr(response, "chunked", False))
             if len(body) > MAX_SOURCE_BYTES:
                 raise _too_large(url)
             if declared is not None and not chunked and len(body) != declared:
-                # The connection closed before the body did; retry it.
+                # Retry if a declared response body ends early.
                 raise _ShortRead(f"received {len(body):,} of {declared:,} bytes")
             return body
         except urllib.error.HTTPError as exc:
-            # HTTPError owns the response body. Close it before retrying or
-            # falling back so failed requests do not retain sockets/file handles.
+            # Close HTTPError bodies before retrying or falling back.
             if exc.fp is not None:
                 with contextlib.suppress(OSError, ValueError):
                     exc.close()
             last_error = exc
             if exc.code != 429 and not 500 <= exc.code < 600:
-                break  # permanent: don't waste attempts, fall back sooner
+                break  # Non-retryable client error; try the next source
             if attempt < FETCH_ATTEMPTS:
                 _log_retry(attempt, exc)
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-        except OSError as exc:  # URLError, socket timeouts, resets, ...
+        except OSError as exc:  # Retry network and socket errors
             last_error = exc
             if attempt < FETCH_ATTEMPTS:
                 _log_retry(attempt, exc)
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
         except http.client.IncompleteRead as exc:
-            # A CHUNKED body that ended early: transient, like a reset.
+            # Retry incomplete HTTP responses.
             last_error = exc
             if attempt < FETCH_ATTEMPTS:
                 _log_retry(attempt, exc)
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
         except (ValueError, http.client.HTTPException) as exc:
-            # A malformed URL (bad IPv6 literal, control characters, ...)
-            # fails identically on every attempt and every machine: report
-            # it as a fetch failure so the caller falls back / exits cleanly
-            # instead of crashing with a traceback.
+            # Report invalid URL or HTTP syntax as a fetch failure so the next source can be tried.
             raise SyncError(f"could not fetch {redact_url(url)}: {_safe_fetch_error(exc)}") from exc
     reason = _safe_fetch_error(last_error) if last_error is not None else "unknown network error"
     raise SyncError(f"could not fetch {redact_url(url)}: {reason}")
@@ -827,8 +715,7 @@ def _read_bytes(source: str) -> bytes:
     try:
         raw = _read_bounded_regular_file(Path(source), MAX_SOURCE_BYTES)
     except (OSError, ValueError) as exc:
-        # ValueError: a path the OS cannot encode (embedded NUL, lone
-        # surrogate) -- a refusal like any other unreadable source.
+        # ValueError also covers paths the OS cannot encode (for example, NUL).
         raise SyncError(f"cannot read {_redact_source(source)}: {error_reason(exc)}") from exc
     if len(raw) > MAX_SOURCE_BYTES:
         raise _too_large(source)
@@ -851,9 +738,7 @@ def _unwrap_github_contents_envelope(document: dict[str, Any]) -> bytes | None:
         decoded = base64.b64decode(content, validate=False)
     except (binascii.Error, ValueError):
         return None
-    # The Contents API omits the content for files over ~1 MB (this list is
-    # larger): an empty decode is not a usable file, let the caller fall
-    # back to download_url / the Git blob endpoint instead.
+    # The Contents API omits large file content; try download_url or the Git Blob endpoint.
     return decoded or None
 
 
@@ -908,9 +793,7 @@ def _resolve_indirect_document(document: dict[str, Any], source: str) -> tuple[d
 
     candidates: list[str] = []
     download_url = document.get("download_url")
-    # download_url comes from the fetched document itself, so unlike an
-    # operator-supplied --source it is untrusted: HTTPS only, never a local
-    # path or a plaintext URL.
+    # Treat API-provided download_url as untrusted; require HTTPS and disallow local paths.
     if isinstance(download_url, str) and http_scheme(download_url) == "https":
         candidates.append(download_url)
     blob_url = _github_blob_url(source, document.get("sha"))
@@ -923,7 +806,7 @@ def _resolve_indirect_document(document: dict[str, Any], source: str) -> tuple[d
             parsed = _parse_document(body, candidate)
         except SyncError:
             continue
-        # A blob response may itself be a base64 envelope instead of the file.
+        # A blob response may itself be a base64 envelope.
         for payload in (body, _unwrap_github_contents_envelope(parsed)):
             if payload is None:
                 continue
@@ -969,9 +852,7 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
                 continue
             document, raw = resolved
         if not _has_usable_steamids(document):
-            # A 200 with an empty or all-garbage list is a broken mirror, not
-            # "nobody is listed": try the next source instead of stopping here,
-            # where a healthy fallback could still answer.
+            # Treat empty or unusable results as broken mirrors and try the next source.
             failures.append(f"{_redact_source(source)}: no usable SteamIDs in its 'players' array")
             continue
         return document, source, raw

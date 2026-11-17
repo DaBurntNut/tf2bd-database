@@ -73,9 +73,7 @@ LOGGER = logging.getLogger("sync_vorobey_hackerpolice")
 DEFAULT_DATABASE = "playerlist.garou3299.json"
 DEFAULT_SNAPSHOT = "snapshot/playerlist.vorobey-hackerpolice.json"
 
-# Mass-demotion guard: if upstream suddenly "removes" more than this share
-# (and more than this many IDs), something upstream broke or was renamed --
-# skip demotion for the run rather than stripping hundreds of entries.
+# Veto demotion if removals exceed both the minimum count and fraction thresholds.
 MASS_DEMOTION_MIN_IDS = 50
 MASS_DEMOTION_MAX_FRACTION = 0.2
 
@@ -142,7 +140,7 @@ def _open_github_output(path: str) -> TextIO:
     try:
         existing = target.stat()
     except FileNotFoundError:
-        # GITHUB_OUTPUT may not exist yet; O_CREAT below preserves open("a") behavior.
+        # Create GITHUB_OUTPUT if the runner has not created it.
         pass
     else:
         if not stat.S_ISREG(existing.st_mode):
@@ -152,12 +150,11 @@ def _open_github_output(path: str) -> TextIO:
     flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = os.open(target, flags, 0o666)
     try:
-        # Recheck the opened object: the path may have changed after stat(),
-        # and opening a FIFO without O_NONBLOCK can hang the whole sync.
+        # Recheck after open to avoid races and non-blocking FIFO hangs.
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, "not a regular file", os.fspath(target))
         handle = os.fdopen(fd, "a", encoding="utf-8")
-        fd = -1  # the text handle now owns the descriptor
+        fd = -1  # The text handle now owns the descriptor
         return handle
     finally:
         if fd >= 0:
@@ -169,9 +166,7 @@ def _write_github_outputs(**outputs: str | int | bool) -> None:
     path = os.environ.get("GITHUB_OUTPUT")
     if not path:
         return
-    # One output per line: a newline inside a value would silently inject an
-    # extra output, so flatten it. Every caller passes a bool or an int today,
-    # but this keeps the file well formed if a caller ever passes free text.
+    # Flatten values to one line to prevent extra GitHub outputs.
     lines = []
     for key, value in outputs.items():
         text = str(value).lower() if isinstance(value, bool) else str(value)
@@ -180,7 +175,7 @@ def _write_github_outputs(**outputs: str | int | bool) -> None:
         with _open_github_output(path) as handle:
             handle.write("\n".join(lines) + "\n")
     except (OSError, ValueError) as exc:
-        # Name the output file rather than exposing a bare or oversized OS path.
+        # Report the output path without exposing an oversized raw path.
         raise SyncError(f"cannot write the GitHub step outputs at {display_path(path)}: {error_reason(exc)}") from exc
 
 
@@ -196,9 +191,7 @@ def _check_github_output() -> None:
     if not path:
         return
     try:
-        # Append mode creates the file if the runner has not, and fails exactly
-        # the way the real write would (a directory, a missing parent, no
-        # permission). Nothing is written.
+        # Probe append access before the run writes any outputs.
         with _open_github_output(path):
             pass
     except (OSError, ValueError) as exc:
@@ -239,7 +232,7 @@ def _fsync_directory(directory: Path) -> None:
         finally:
             os.close(fd)
     except OSError:
-        pass  # e.g. platforms that cannot fsync directories
+        pass  # Directory fsync is best-effort; some platforms do not support it
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -250,39 +243,24 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     an exact replica of the upstream file (no encoding/newline translation
     ever touches them).
     """
-    # Write THROUGH a symlink. Replacing the link itself would delete it and
-    # leave the file it points at -- the one the operator actually keeps, and
-    # the one every other tool reads -- untouched, while this run reported
-    # success. Resolve strictly enough to detect a self-referential/recursive
-    # link: os.path.realpath() silently returns the unresolved name for a loop,
-    # and replacing that name would destroy the link rather than refuse it.
+    # Resolve symlinks before writing; replacing the link would leave its target unchanged.
+    # Detect loops explicitly so atomic replacement cannot destroy the link.
     target = path
     if path.is_symlink():
         try:
             target = path.resolve(strict=False)
         except RuntimeError as exc:
-            # pathlib has surfaced symlink loops as RuntimeError on some
-            # versions and OSError on others. Normalize this form into the
-            # write error path, which names the operator-supplied output path.
+            # Normalize symlink-loop errors to the path-aware write failure.
             raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), os.fspath(path)) from exc
-    # mkstemp creates the file with O_EXCL and a unique name, so concurrent
-    # runs -- separate processes or threads -- never share (and interleave
-    # writes into) one temp file. Keep the prefix short and independent of the
-    # target name: a valid basename near the filesystem's length limit must not
-    # become impossible to write because its temporary name is longer.
+    # Use unique, short temp names to avoid collisions and keep long basenames valid.
     fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".tf2bd-sync-", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
-            os.fsync(handle.fileno())  # content durable BEFORE it becomes visible
-        # mkstemp forces 0600 permissions, so put back the mode the file
-        # should have. An existing file keeps exactly its own mode. A NEW file
-        # takes the umask-derived default (0666 & ~umask): chmod'ing a flat
-        # 0644 overrode the operator's umask, so under `umask 077` -- which
-        # means "only I may read this" -- the snapshot and the report were
-        # created world-readable on a shared machine.
+            os.fsync(handle.fileno())  # Fsync file contents before publishing the rename
+        # Restore the existing mode, or use the process umask for a new file.
         try:
             existing = target.stat()
         except FileNotFoundError:
@@ -293,20 +271,15 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             existing_mode = stat.S_IMODE(existing.st_mode)
         if existing_mode is None:
             mask = os.umask(0)
-            os.umask(mask)  # set-and-restore: os.umask has no read-only form
+            os.umask(mask)  # Restore immediately; os.umask has no read-only query
             mode = 0o666 & ~mask
         else:
             mode = existing_mode
         tmp.chmod(mode)
         tmp.replace(target)
-        _fsync_directory(target.parent)  # make the rename itself durable
+        _fsync_directory(target.parent)  # Persist the rename
     finally:
-        # Runs on success as well, where the rename already moved the file and
-        # this is a no-op. Any other outcome -- OSError, Ctrl-C, SystemExit --
-        # deletes the temp file, so an interrupted run cannot leave a stray
-        # .tmp file in the repository. (SIGTERM has no Python handler: the
-        # process dies at once. The runners are ephemeral and both git add calls
-        # name their paths, so nothing is committed from such a run.)
+        # Always remove the temp file on exit; after a successful rename this is a no-op.
         tmp.unlink(missing_ok=True)
 
 
@@ -322,9 +295,7 @@ def write_database(path: Path, rendered: str, original: str, *, dry_run: bool) -
         try:
             _atomic_write_bytes(path, rendered.encode("utf-8"))
         except (OSError, ValueError) as exc:
-            # Name the file the operator asked for; the raw OSError mentions
-            # the temporary file, which means nothing to them. ValueError: a
-            # path the OS cannot encode (embedded NUL, lone surrogate).
+            # Name the requested output path, not the temp file; ValueError also covers unencodable paths.
             raise SyncError(f"cannot write {display_path(path)}: {error_reason(exc)}") from exc
     return modified
 
@@ -349,14 +320,10 @@ def _log_outcome(modified: bool, changes: list[Change], path: Path, *, dry_run: 
     count = len(changes)
     what = f"{count} {plural(count, 'entry', 'entries')}"
     if not modified:
-        # Scoped to the database on purpose: a snapshot-only run writes the
-        # snapshot and opens a pull request, so a bare "No changes" would
-        # contradict both the report body and the log line that follows.
+        # Scope the no-change message to the database; the snapshot may still change.
         LOGGER.info("No database changes: nothing to update.")
     elif not changes:
-        # The file changes without any tag changing: entries were re-sorted
-        # or the file's formatting was restored. "Updated 0 entries" would be
-        # nonsense, and "No changes" would contradict the written file.
+        # Report file-only normalisation separately from tag changes.
         LOGGER.info(
             "%s %s (no tag changes: the file was normalised).",
             "Dry run: would rewrite" if dry_run else "Rewrote",
@@ -375,12 +342,7 @@ def _same_file(first: Path, second: Path) -> bool:
             return True
         return first.exists() and second.exists() and os.path.samefile(first, second)
     except (OSError, ValueError, RuntimeError):
-        # ValueError: a path the OS cannot encode (embedded NUL, lone
-        # surrogate). pathlib has reported symlink loops as either RuntimeError
-        # or OSError depending on version; resolving both paths happens here,
-        # so an uncaught loop escaped as a traceback for every guarded path.
-        # Such a path cannot be an alias of a real file; the operation that uses
-        # it refuses it cleanly further down.
+        # Treat path-resolution failures as non-aliases; later file operations report unusable paths.
         return False
 
 
@@ -394,10 +356,7 @@ def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     rewrite it; and an output path in a directory that does not exist is a
     typo, never a design case.
     """
-    # An empty path is what a shell hands over for --database "$UNSET": Path("")
-    # is ".", so the run used to fail with "Is a directory: '.'" -- and an empty
-    # --report was worse, because it is falsy and was silently ignored, so the
-    # operator got no report and no warning. Name the real problem instead.
+    # Reject empty paths instead of treating them as the current directory or ignoring the report.
     for flag, value in (("--database", args.database), ("--snapshot", args.snapshot), ("--report", args.report)):
         if value == "":
             raise SyncError(f"{flag} must not be empty")
@@ -417,21 +376,12 @@ def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     for source in args.source or []:
         if http_scheme(source):
             continue
-        # A local --source may not be any of the files this run writes or reads
-        # as a baseline. Pointing it at the SNAPSHOT is the subtle one: the run
-        # then compares the baseline with itself, so the diff is always
-        # "0 added, 0 removed", no removal can ever be proven, and every
-        # promotion is computed from the stale baseline instead of the live
-        # list -- a run that exits 0 and looks healthy while the bot is
-        # quietly demoting nothing and never noticing an upstream change.
+        # Prevent local sources from aliasing inputs or outputs, especially the snapshot baseline.
         for flag, other in (("--database", database_path), ("--snapshot", snapshot_path)):
             if _same_file(Path(source), other):
                 raise SyncError(f"--source must not be the same file as {flag}")
 
-    # GitHub step outputs are an output file too. If one path aliases the
-    # database, snapshot, report, or a local source, appending the key=value
-    # lines can corrupt that file or silently erase the outputs when the other
-    # writer atomically replaces it. Check before loading or writing anything.
+    # Prevent GITHUB_OUTPUT from aliasing any input or output file.
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         github_protected = [("--database", database_path), ("--snapshot", snapshot_path)]
@@ -442,12 +392,7 @@ def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
             if _same_file(Path(github_output), path):
                 raise SyncError(f"GITHUB_OUTPUT must not be the same file as {flag}")
 
-    # A writer must not invent directories. `mkdir -p` on a typo'd --snapshot
-    # silently wrote a FRESH baseline, and a fresh baseline proves nothing was
-    # removed (previous - current is empty), so --demote would quietly do
-    # nothing forever -- the same silent stall the --source == --snapshot guard
-    # above exists to prevent. The snapshot FILE may legitimately be absent
-    # (that is the first run); its directory may not be.
+    # Require existing output directories; a typo must not create a false baseline.
     outputs = [("--snapshot", snapshot_path)]
     if args.report:
         outputs.append(("--report", Path(args.report)))
@@ -464,8 +409,7 @@ def _load_index(args: argparse.Namespace) -> tuple[HackerpoliceIndex, str, bytes
     index = HackerpoliceIndex.build(source_document)
     LOGGER.info("Indexed %d Vorobey hackerpolice SteamIDs (%d unusable).", len(index.by_steamid), index.skipped)
     if not index.by_steamid:
-        # An empty/unusable upstream list is a broken fetch, not a mass
-        # unban: never promote, demote, or overwrite the snapshot from it.
+        # Reject empty indexes; an unusable fetch must not drive policy or overwrite the snapshot.
         raise SyncError("the Vorobey hackerpolice list contains no usable SteamIDs, nothing was written")
     return index, source, source_bytes
 
@@ -485,8 +429,7 @@ def _plan_demotion(
     skipped removal is never silently forgotten.
     """
     demotion_note: str | None = None
-    # Set to False when demotion was skipped as unsafe: the snapshot must
-    # NOT advance then, or the skipped removals would be lost forever.
+    # Hold the snapshot when demotion is vetoed, or skipped removals would be lost.
     update_snapshot = not args.no_update_snapshot
     snapshot_note: str | None = "**not refreshed** (`--no-update-snapshot`)" if args.no_update_snapshot else None
     removed: set[str] = set()
@@ -531,9 +474,7 @@ def _plan_demotion(
                 snapshot_note = "**not refreshed** - demotion was skipped, so these removals stay demotion candidates"
 
     if not args.demote and removed_upstream:
-        # Demotion is off, so these removals cannot be applied. Advancing the
-        # baseline anyway would silently forget them forever (the next run
-        # would see "previous == current"). Keep the old snapshot instead.
+        # Keep the old baseline while removals cannot be applied.
         update_snapshot = False
         snapshot_note = (
             f"**not refreshed** - demotion is disabled (`--demote`) so the "
@@ -554,12 +495,10 @@ def run(args: argparse.Namespace) -> int:
     database, original = load_database(database_path)
     index, source, source_bytes = _load_index(args)
 
-    # --- Demotion baseline: previous snapshot vs. current list --------------
+    # --- Compare current list with the demotion baseline ---
     snapshot = load_snapshot(snapshot_path)
     previous_index, previous_bytes = snapshot if snapshot is not None else (None, None)
-    # Snapshot diff vs. the previous snapshot, independent of --demote: how
-    # many IDs the refreshed snapshot gains/loses. With no snapshot yet,
-    # every current ID counts as newly added (initial snapshot).
+    # Compute the snapshot diff even when demotion is disabled; a first snapshot counts all IDs as new.
     added_count = len(index.by_steamid)
     removed_upstream: set[str] = set()
     removed_count = 0
@@ -585,10 +524,7 @@ def run(args: argparse.Namespace) -> int:
     if result.error_count:
         raise SyncError("the synced playerlist is invalid, nothing was written")
 
-    # Decide what WOULD change and render the report before writing anything.
-    # The step outputs are appended first; if that append fails, report,
-    # database, and snapshot stay untouched. Then the report is written before
-    # the database and snapshot, so a report failure cannot advance either one.
+    # Render first; output or report failures must not advance the database or snapshot.
     rendered = dumps(database)
     modified = rendered != original
     snapshot_changed = update_snapshot and source_bytes != previous_bytes
@@ -612,17 +548,10 @@ def run(args: argparse.Namespace) -> int:
             snapshot_path=snapshot_path,
         )
     )
-    # Exactly one trailing newline, and the file and stdout carry the SAME
-    # bytes: the report file is the pull request body, so there is no second
-    # version of it to get out of step. (The old code appended a newline to a
-    # report that already ended with one, leaving a blank line at the end of
-    # every published pull request.)
+    # Use exactly one trailing newline for both the report file and stdout.
     body = report if report.endswith("\n") else report + "\n"
 
-    # Step outputs are required by the workflow, but a failure while appending
-    # them must not turn a successful database/snapshot write into an exit-2
-    # run with unpublished changes. Write them before every file and stdout
-    # output; the workflow only consumes them when this step succeeds.
+    # Append required step outputs before file writes so failures cannot leave unpublished data changes.
     changed = (modified or snapshot_changed) and not args.dry_run
     _write_github_outputs(
         changed=changed,
@@ -634,26 +563,15 @@ def run(args: argparse.Namespace) -> int:
     )
 
     if args.report:
-        # Written atomically, like the database and the snapshot: this same file
-        # is the pull request body, so a crash or a full disk must never leave a
-        # half-written report for the next step to publish.
+        # Write the report atomically; it is also the pull request body.
         try:
             _atomic_write_bytes(Path(args.report), body.encode("utf-8"))
         except (OSError, ValueError) as exc:
             raise SyncError(f"cannot write report {display_path(args.report)}: {error_reason(exc)}") from exc
     print(body, end="")
 
-    # Write the database, then refresh the snapshot in the SAME working tree
-    # (=> same pull request) so the baseline only advances once a human
-    # merges the changes it produced. The order matters: if the process dies
-    # between the two writes, a stale snapshot only makes the next run
-    # re-evaluate removals that are already applied (a no-op), whereas a
-    # fresh snapshot with an unwritten database would lose them forever. The
-    # snapshot refresh happens whenever it is safe, even if the Garou database
-    # itself did not change, so a run whose only change is the snapshot still
-    # opens a snapshot-only PR. Exception: if demotion is disabled, vetoed by
-    # either safety guard, or the source is incomplete, update_snapshot is
-    # False and the same removals are re-evaluated next run.
+    # Write the database before the snapshot; a fresh baseline must not outlive unapplied changes.
+    # Refresh snapshot-only changes when safe, but retain the baseline when removals are unsafe.
     write_database(database_path, rendered, original, dry_run=args.dry_run)
     _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
     if update_snapshot:
@@ -673,8 +591,7 @@ def _force_utf8_streams() -> None:
     characters fall back to backslash escapes instead of an exception.
     """
     for stream in (sys.stdout, sys.stderr):
-        # StringIO in tests (or an already-closed stream) cannot be
-        # reconfigured -- those are already safe, so skip them silently.
+        # Test streams may not support reconfiguration; leave them unchanged.
         with contextlib.suppress(AttributeError, OSError, ValueError):
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")  # type: ignore[union-attr]
 
@@ -695,17 +612,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOGGER.error("error: %s", exc)
         return 2
     except OSError as exc:
-        # e.g. the database/snapshot/report path became unwritable mid-run:
-        # report a bounded reason without echoing an untrusted filename from
-        # OSError.__str__ (which could inject a log line or expose a path).
+        # Report a bounded OS-error reason without echoing an untrusted path.
         LOGGER.error("error: %s", display_path(error_reason(exc)))
         return 2
     except KeyboardInterrupt:
-        # Ctrl-C is not a crash. The atomic writes have already removed their
-        # temporaries (the cleanup is in a finally block), and a half-written
-        # file was never possible, so say so in one line and use the shell's
-        # conventional 128 + SIGINT instead of dumping a stack trace into a
-        # cancelled CI job.
+        # Return 128 + SIGINT for Ctrl-C; atomic writes clean up temporary files.
         LOGGER.warning("interrupted.")
         return 130
 

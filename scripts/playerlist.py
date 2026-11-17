@@ -22,54 +22,36 @@ STEAMID64_BASE = 76561197960265728
 MAX_ACCOUNT_ID = 2**32
 MAX_STEAMID_INSTANCE = 2**20
 
-# Sanity cap on a playerlist file this tool reads. The real database is ~110 kB
-# and the upstream list ~1.9 MB, so this is far beyond anything legitimate --
-# but without it a 4 GB file (or a device that never ends) would be read
-# straight into memory and the run would die with a MemoryError traceback
-# instead of a clean refusal. The download path has always had this limit
-# (``sources.MAX_SOURCE_BYTES``); the local reads did not.
+# Bound local reads; the fetch path uses the same limit.
 MAX_FILE_BYTES = 64 * 1024 * 1024
 
 CANONICAL_PREFIX = "[U:1:"
 CANONICAL_SUFFIX = "]"
 
-# Attributes recognised by the TF2BD v3 schema, in the order used when writing.
+# TF2BD v3 attributes, ordered as written.
 ATTRIBUTE_ORDER: tuple[str, ...] = ("cheater", "suspicious", "exploiter", "racist")
 KNOWN_ATTRIBUTES = frozenset(ATTRIBUTE_ORDER)
 
-# ASCII digits only: \d also matches Arabic-Indic/Devanagari digits and
-# str.isdigit() also accepts things like "²" that int() then refuses, so a
-# corrupted or hostile SteamID could crash the run (or silently mint an id
-# from "١٢٣"). Every pattern and parser below is ASCII-strict.
+# SteamID digits are ASCII-only; Unicode digit checks accept extra characters.
 _ACCOUNT_ID_RE = re.compile(r"[0-9]+")
-# The canonical form is written upper-case by TF2BD, but matching is
-# case-insensitive on every notation so a hand-edited "[u:1:…]" still maps to
-# the same player (and is caught as a duplicate by validate()).
+# Accept case variants and canonicalize them for duplicate detection.
 _U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$", re.IGNORECASE | re.ASCII)
 _U_BARE_RE = re.compile(rf"^U:1:({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE | re.ASCII)
 _U_INSTANCE_RE = re.compile(
     rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):({_ACCOUNT_ID_RE.pattern})\]$", re.IGNORECASE | re.ASCII
 )
-# Public Steam accounts appear as STEAM_0 (legacy) or STEAM_1. Other
-# universes can reuse the same account number for different identities; dropping
-# their universe component would incorrectly match a public player.
+# Reject non-public Steam2 universes; dropping the universe could alias another account.
 _STEAM2_RE = re.compile(rf"^STEAM_[01]:([01]):({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE | re.ASCII)
 _STEAMID64_RE = re.compile(r"^[0-9]{17}$")
-# An entire Steam Community permalink, not a matching substring in arbitrary
-# text or a lookalike host (either could silently alias a victim's SteamID).
+# Require a complete Steam Community profile URL, not embedded text or a lookalike host.
 _PROFILE_URL_RE = re.compile(
     r"(?:https?://)?(?:www\.)?steamcommunity\.com/profiles/([0-9]{17})/?", re.IGNORECASE | re.ASCII
 )
 
 
-# How much of an arbitrary value a validation message quotes. These messages go
-# to a terminal and to the CI log, and the value comes from the file, so it can
-# be anything the file contains: an entry whose "steamid" is a 3 MB string used
-# to print a single 3,000,038-character line, which buries the error it is meant
-# to explain (and every other error after it, once GitHub truncates the log).
+# Bound untrusted values included in validation messages.
 MAX_SHOWN_VALUE_CHARS = 120
-# Bound decimal conversion as well as the final message length: repr(10**100000)
-# allocates the entire number before the preview can be clipped.
+# Bound integer formatting before building diagnostic previews.
 _MAX_SHOWN_INT_BITS = MAX_SHOWN_VALUE_CHARS * 4
 MAX_VALIDATION_MESSAGES = 100
 
@@ -98,9 +80,7 @@ def _shown(value: Any) -> str:
     return text if len(text) <= MAX_SHOWN_VALUE_CHARS else text[:MAX_SHOWN_VALUE_CHARS] + "…"
 
 
-# How much of a path is ever printed. A path comes from the command line or a
-# workflow variable, and a very long one would push the actual reason off the
-# end of the message.
+# Bound paths included in diagnostics.
 MAX_SHOWN_PATH_CHARS = 200
 
 
@@ -152,8 +132,7 @@ def _read_bounded_regular_file(path: Path, max_bytes: int) -> bytes:
     try:
         path_status = path.stat()
     except FileNotFoundError:
-        # Let os.open produce the same clean missing-path error as other
-        # failures; a broken symlink also follows this path.
+        # Let os.open report missing paths consistently, including broken symlinks.
         pass
     else:
         if not stat.S_ISREG(path_status.st_mode):
@@ -229,7 +208,7 @@ def normalize_steamid(value: Any) -> str | None:
     and complete Steam Community
     ``/profiles/<SteamID64>`` permalinks (optionally with scheme/``www``/slash).
     """
-    if isinstance(value, bool):  # bool is an int subclass; not a SteamID
+    if isinstance(value, bool):  # bool is an int subclass, but not a SteamID
         return None
 
     if isinstance(value, int):
@@ -244,8 +223,7 @@ def normalize_steamid(value: Any) -> str | None:
         match = pattern.match(text)
         if match:
             account = _bounded_int(match.group(1))
-            # Account ids are 32-bit and never 0; reject out-of-range input
-            # instead of minting a canonical ID no real account can have.
+            # Reject zero and values outside the 32-bit account-ID range.
             if account is None or not 0 < account < MAX_ACCOUNT_ID:
                 return None
             return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
@@ -254,17 +232,14 @@ def normalize_steamid(value: Any) -> str | None:
     if match:
         account = _bounded_int(match.group(1))
         instance = _bounded_int(match.group(2))
-        # The instance occupies 20 bits in the SteamID layout. It does not
-        # change the individual account, but an impossible instance must not
-        # let arbitrary suffixes alias a valid SteamID.
+        # The instance field is 20 bits; reject out-of-range values before canonicalizing.
         if account is None or not 0 < account < MAX_ACCOUNT_ID or instance is None or instance >= MAX_STEAMID_INSTANCE:
             return None
         return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
 
     match = _STEAM2_RE.match(text)
     if match:
-        # STEAM_X:Y:Z -> account id is Z * 2 + Y (Y is the auth-server bit).
-        # Same range rule as every other form: 32-bit and never 0.
+        # STEAM_X:Y:Z encodes the account ID as 2 * Z + Y.
         auth_server, account_half = match.groups()
         half = _bounded_int(account_half)
         if half is None:
@@ -276,13 +251,10 @@ def normalize_steamid(value: Any) -> str | None:
         account = _account_from_steamid64(int(text))
         if account is not None:
             return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
-        # A 17-digit string below the SteamID64 range may still be a
-        # zero-padded bare account ID. Let the bounded account parser decide;
-        # it rejects values whose significant digits exceed the 32-bit range.
+        # A 17-digit string below the SteamID64 base may be a zero-padded account ID.
 
     if text.isascii() and text.isdigit():
-        # Bare account id given as a string, e.g. "1730017" (the int form of
-        # this is accepted above, so accept the string form too).
+        # Accept bare account IDs as strings as well as integers.
         account = _bounded_int(text)
         if account is None or not 0 < account < MAX_ACCOUNT_ID:
             return None
@@ -348,14 +320,13 @@ def player_name(player: Player) -> str:
     if not isinstance(last_seen, dict):
         return ""
     value = last_seen.get("player_name")
-    if isinstance(value, bool) or not isinstance(value, (str, int)):  # bool is an int subclass
+    if isinstance(value, bool) or not isinstance(value, (str, int)):  # bool is an int subclass, but not a player name
         return ""
     return value if isinstance(value, str) else _shown(value)
 
 
 def _player_sort_key(player: Player) -> tuple[bool, int]:
-    # Non-object entries (malformed input the validator reports) sort last,
-    # stably, instead of crashing the sort.
+    # Invalid entries sort last; stable sorting preserves their input order.
     account = account_id(player.get("steamid")) if isinstance(player, dict) else None
     return (account is None, account or 0)
 
@@ -466,30 +437,23 @@ def load(path: Path) -> tuple[PlayerList, str]:
     matching what ``dumps()`` writes.
     """
     try:
-        # Read at most one byte past the limit and reject non-regular files
-        # before reading: a FIFO can block forever, while a device may never
-        # end. The byte budget is still enforced on the bytes actually read.
+        # Bound reads to regular files and enforce the limit on actual bytes read.
         raw = _read_bounded_regular_file(path, MAX_FILE_BYTES)
     except (OSError, ValueError) as exc:
-        # ValueError covers a path the operating system cannot even encode (an
-        # embedded NUL, a lone surrogate): "this file cannot be read",
-        # reported like any other unreadable file instead of a traceback.
+        # ValueError also covers paths the OS cannot encode (for example, NUL).
         raise PlayerListError(f"cannot read {display_path(path)}: {error_reason(exc)}") from exc
     if len(raw) > MAX_FILE_BYTES:
         limit = MAX_FILE_BYTES // (1024 * 1024)
         raise PlayerListError(f"{display_path(path)} is larger than the {limit} MiB safety limit")
     try:
-        # utf-8-sig == utf-8 for files without a mark, and strips it when present.
+        # utf-8-sig accepts UTF-8 files with or without a BOM.
         original = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
-        # The file is not valid UTF-8. Report it like any other unreadable
-        # file instead of crashing with a traceback.
         raise PlayerListError(f"cannot read {display_path(path)}: {error_reason(exc)}") from exc
     try:
         database = strict_json_loads(original)
     except (json.JSONDecodeError, RecursionError, ValueError) as exc:
-        # ValueError: e.g. a JSON number with more digits than Python's
-        # int-parsing limit -- invalid input, not a crash.
+        # ValueError also covers Python's integer digit limit.
         raise PlayerListError(f"{display_path(path)} is not valid JSON: {exc}") from exc
     if not isinstance(database, dict):
         raise PlayerListError(f"{display_path(path)} does not contain a JSON object")
@@ -553,12 +517,7 @@ def validate(database: PlayerList) -> ValidationResult:
         steamid = player.get("steamid")
         canonical = normalize_steamid(steamid)
         if canonical is None:
-            # A value that reached this point is arbitrary input, and these
-            # messages are printed to a terminal and to the CI log: str() would
-            # let a newline start a fake log line and an ESC sequence repaint
-            # the screen, so it is quoted with repr -- and clipped, because it
-            # can be as large as the file. Every later message about this entry
-            # reuses `shown`, so they are all bounded too.
+            # Quote and bound untrusted values before logging.
             result.add_error(f"players[{position}] has an unusable steamid: {_shown(steamid)}")
             shown = _shown(steamid)
         else:
@@ -573,7 +532,7 @@ def validate(database: PlayerList) -> ValidationResult:
             result.add_error(f"players[{position}] ({shown}) has no attributes")
             continue
         if not all(isinstance(attribute, str) for attribute in attributes):
-            # Also guards the set() below against unhashable attribute values.
+            # Keep unhashable values out of set().
             result.add_error(f"players[{position}] ({shown}) has a non-string attribute")
             continue
         if len(set(attributes)) != len(attributes):
@@ -582,8 +541,7 @@ def validate(database: PlayerList) -> ValidationResult:
             if attribute not in KNOWN_ATTRIBUTES:
                 result.add_warning(f"players[{position}] ({shown}) uses unknown attribute {_shown(attribute)}")
 
-        # The sync policy rewrites `proof` when demoting, so its shape is an
-        # invariant this tool relies on: an array of strings, if present.
+        # Demotion filters proof values, so present entries must be lists of strings.
         proof = player.get("proof")
         if "proof" in player and (not isinstance(proof, list) or not all(isinstance(item, str) for item in proof)):
             result.add_error(f"players[{position}] ({shown}) has a malformed 'proof' (must be an array of strings)")

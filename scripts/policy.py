@@ -45,28 +45,15 @@ __all__ = [
     "sync",
 ]
 
-# Keep only evidence the report can render. The upstream proof list is
-# untrusted and can be very large; copying every unique URL into each Change
-# record needlessly amplifies memory use during report generation. One extra
-# character beyond the report's display cap lets the renderer mark a shortened
-# value with an ellipsis without retaining an arbitrarily large upstream string.
+# Bound evidence to the report's display cap, plus one character for truncation.
 MAX_EVIDENCE_LINK_CHARS = 500
 MAX_EVIDENCE_LINKS = 10
 
 
-# The ONLY proof lines that justify the ``racist`` tag on their own. When a
-# ``cheater`` + ``racist`` entry is demoted (player removed from the Vorobey
-# list as a false positive), every proof that does not start with this exact
-# prefix belonged to the cheating accusation and must go with the tag.
-#
-# The trailing quote is part of the prefix on purpose: TF2BD writes the reason
-# as a quoted string ("[auto] automatically marked: Racist | reason: \"...\""),
-# so requiring it keeps only a complete, canonical auto line -- a truncated or
-# hand-mangled one ("... | reason:" with nothing after it) is not the machine
-# record that justifies a racist tag, and it goes with the rest.
+# Preserve only TF2BD's complete automatic racist records when removing the cheater tag.
+# The opening quote is part of the stored record format.
 RACIST_PROOF_PREFIX = '[auto] automatically marked: Racist | reason: "'
-# A TF2BD chat-message proof is a single line. Reject line separators so a
-# forged prefix cannot shelter unrelated evidence on a later line.
+# Proof records are single-line; reject embedded separators.
 _LINE_BREAKS = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
@@ -93,9 +80,7 @@ def is_racist_proof(proof: str) -> bool:
     prefix = RACIST_PROOF_PREFIX.casefold()
     if not text.startswith(prefix):
         return False
-    # The prefix already consumed the OPENING quote, so a complete line must
-    # end with the closing quote. Requiring only any later quote would accept
-    # an unfinished reason that happens to contain a quoted word.
+    # Require the closing quote of a complete record.
     return len(text) > len(prefix) and text.endswith('"')
 
 
@@ -155,9 +140,7 @@ def _evidence_links(entry: dict[str, Any]) -> tuple[tuple[str, ...], int]:
             shown.add(link)
             links.append(link)
         else:
-            # Once the display budget is full, don't retain every distinct
-            # upstream URL just to compute a count. Count additional entries;
-            # duplicates of already-shown links are filtered above.
+            # Count omitted entries without retaining additional URLs.
             omitted += 1
     return tuple(links), omitted
 
@@ -197,13 +180,13 @@ def promote(database: PlayerList, index: HackerpoliceIndex) -> list[Change]:
         if not isinstance(attributes, list) or not attributes:
             continue
         if not all(isinstance(attribute, str) for attribute in attributes):
-            continue  # malformed entry; the caller's validation reports it
+            continue
 
         before = tuple(attributes)
         if PROMOTED_TO in before:
-            continue  # already a cheater, nothing to add
+            continue
         if not PROMOTABLE_ATTRIBUTES.intersection(before):
-            continue  # exploiter / unknown attribute only - out of scope
+            continue
 
         after = tuple(order_attributes({*before, PROMOTED_TO} - {DROPPED_ATTRIBUTE}))
         player["attributes"] = list(after)
@@ -240,8 +223,6 @@ def _demoted_entry(player: Player, removed: frozenset[str]) -> tuple[bool, Chang
     if canonical is None:
         return True, None
 
-    # Not proven to have been removed upstream (never listed, or still
-    # listed) - nothing to demote, however the entry got its cheater tag.
     if canonical not in removed:
         return True, None
 
@@ -249,14 +230,13 @@ def _demoted_entry(player: Player, removed: frozenset[str]) -> tuple[bool, Chang
     if not isinstance(attributes, list) or not attributes:
         return True, None
     if not all(isinstance(attribute, str) for attribute in attributes):
-        return True, None  # malformed entry; validation reports it
+        return True, None
 
     before = tuple(attributes)
     if PROMOTED_TO not in before:
-        return True, None  # not a cheater - nothing to demote
+        return True, None
 
     if "racist" not in before:
-        # Remove the whole entry (cheater without racist)
         return False, Change(
             steamid=canonical,
             name=player_name(player),
@@ -265,17 +245,10 @@ def _demoted_entry(player: Player, removed: frozenset[str]) -> tuple[bool, Chang
             kind="demote",
         )
 
-    # Remove only cheater, keep racist
     after = tuple(order_attributes({*before} - {PROMOTED_TO}))
     player["attributes"] = list(after)
 
-    # Drop every proof except the "[auto] ... Racist" lines: the cheater tag
-    # was a false positive, so its evidence must not stay behind pretending to
-    # justify the remaining racist tag. When nothing survives the filter the
-    # KEY goes too: this database (and TF2BD) spells "no proof" as an absent
-    # key -- not one of the 456 entries carries an empty array -- so leaving
-    # ``"proof": []`` behind would put a shape in the file that nothing else
-    # in it has.
+    # Keep trusted racist records and omit the proof key if none remain.
     if "proof" in player:
         kept_proofs = _filter_racist_proofs(player.get("proof"))
         if kept_proofs:

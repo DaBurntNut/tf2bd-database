@@ -56,44 +56,21 @@ __all__ = [
     "render_report",
 ]
 
-# GitHub rejects a pull request body longer than 65,536 characters. Change
-# tables are capped, the removed table is capped, an oversized body is
-# re-rendered with smaller caps (see _SHRINK_STEPS), and a hard truncation is
-# the last resort, so publishing the PR can never fail on size -- however big a
-# single run turns out to be.
+# Limit report size below GitHub's body cap; reduce row limits before hard truncation.
 MAX_CHANGE_TABLE_ROWS = 150
 MAX_REMOVED_TABLE_ROWS = 100
-# The closing sentence names the changed SteamIDs too. A run with thousands of
-# changes would spend the whole byte budget there (and stop being readable), so
-# each clause names at most this many and says how many follow.
+# Bound closing-sentence SteamID lists to keep the summary readable.
 MAX_CLOSING_STEAMIDS = 150
-# GitHub rejects a pull request body over 65,536 BYTES, and the body doubles
-# as the job summary, so the budget is measured in bytes with room to spare.
-# Characters would be the wrong unit: 30,000 Cyrillic player names are half the
-# character budget and twice the byte budget.
+# Measure the shared report budget in UTF-8 bytes.
 MAX_REPORT_BYTES = 60_000
-# One cell can be as big as the data behind it, and a single enormous row
-# defeats every row cap: the body then gets hard-truncated, which loses the
-# closing sentence and the removed-SteamID list the report exists to publish
-# (measured: ten 6,000-character proof links collapsed the whole body to 494
-# bytes). Every cell that carries data from the database or the upstream file
-# therefore has a bound on BOTH how many items it lists and how long each item
-# may be:
-#   * proof links per row (the pull request is a review list, not an archive;
-#     the list is only ever read a few links at a time) and their length (a
-#     Discord proof link is ~60 characters, so 500 is already ~8x a real one),
-#   * player-name characters (Steam names are at most 32 characters, so a much
-#     longer one is abnormal -- the profile link still carries the identity),
-#   * attributes per row (the TF2BD schema has four; anything beyond a handful
-#     is malformed) and their length (the longest known one is 10 characters).
+# Cap row counts and cell lengths so large values cannot crowd out closing details.
 MAX_NAME_CHARS = 80
 MAX_DATABASE_LABEL_CHARS = 80
 MAX_ATTRIBUTE_CHARS = 40
 MAX_ATTRIBUTE_CELLS = 8
 
-# Characters that would break a Markdown link target.
-# "|" is percent-encoded too: a raw pipe inside a table cell ends the cell, so a
-# proof URL like .../a|b would split the row in the rendered pull request.
+# Percent-encode characters that can break a Markdown link target.
+# Escape pipes because GFM treats them as table separators.
 _LINK_ESCAPES = str.maketrans(
     {
         "(": "%28",
@@ -102,100 +79,62 @@ _LINK_ESCAPES = str.maketrans(
         "<": "%3C",
         ">": "%3E",
         "|": "%7C",
-        # A raw backtick in a URL starts a code span before the link is even
-        # recognised, so the rest of the row was parsed as code.
+        # Percent-encode backticks to prevent code spans in link URLs.
         "`": "%60",
         "\n": "%0A",
         "\r": "%0D",
     }
 )
 
-# Characters that would break out of Markdown text. ONE policy, two tables:
-# a value is escaped the same way in a table cell and in running text, and the
-# only difference is the pipe (which ends a cell). Keeping one map is the point
-# -- while the two lists were maintained apart, the entity spelling of a
-# character got past both of them.
+# Use one text-escaping policy for table cells and running text.
 _ESCAPES = {
-    # A literal "&" must not be able to spell an entity the guards do not see:
-    # "&#x202E;" rendered a real right-to-left override, "&#8203;" a zero-width
-    # space (both defeating the bidi/invisible scrubbing below), and "&#64;admin"
-    # rendered "@admin" (a mention ping, which the "@" escape exists to stop).
+    # Escape entity introducers so HTML references cannot bypass sanitization.
     "&": "&amp;",
-    # A backslash must be escaped first or it swallows the escape of whatever
-    # follows it; ``translate`` is a single pass, so order cannot be got wrong.
+    # Escape backslashes so they cannot suppress Markdown escapes.
     "\\": "\\\\",
     "<": "&lt;",
     ">": "&gt;",
-    # A link or an image: a name holding "[click](https://elsewhere.example)"
-    # would otherwise render as a live link in a bot-authored pull request.
+    # Escape brackets to prevent user-supplied links and images.
     "[": "\\[",
     "]": "\\]",
-    # A backtick OPENS a code span everywhere outside one. A name such as
-    # "tick` here" used to leave the report with an odd number of them, so the
-    # span swallowed the rest of the row -- the profile link stopped being a
-    # link and later rows were re-rendered as code.
+    # Escape backticks to prevent unterminated code spans.
     "`": "\\`",
-    # Renders as "@" but cannot ping a user or a team.
+    # Encode @ to prevent mention notifications.
     "@": "&#64;",
-    # Emphasis/strikethrough: "**Approved by admin**" rendered as BOLD inside
-    # the bot's own pull request, which reviewers approve.
+    # Escape emphasis and strikethrough markers.
     "*": "\\*",
     "_": "\\_",
     "~": "\\~",
-    # A line break would start a second line (in a table: a second row).
+    # Replace line breaks to prevent extra Markdown lines or table rows.
     "\n": " ",
     "\r": " ",
 }
 
-# Inside a table a raw pipe ends the cell, so it is escaped as well.
+# Escape pipes because they terminate table cells.
 _CELL_ESCAPES = str.maketrans({**_ESCAPES, "|": "\\|"})
 _TEXT_ESCAPES = str.maketrans(_ESCAPES)
 
-# Characters that would break out of an inline code span INSIDE A TABLE.
-# A pipe has to be escaped there because GFM splits a row into cells before it
-# parses code spans; the backslash that escapes it needs escaping in turn, or
-# a value like "a\|b" would leave a bare pipe behind. Outside a table neither
-# is needed (and escaping them would visibly double a Windows path).
+# Escape backslashes and pipes inside table code spans.
 _TABLE_CODE_ESCAPES = str.maketrans({"\\": "\\\\", "|": "\\|"})
 
-# Lone UTF-16 surrogates: legal in JSON input (e.g. "\ud800" in a player
-# name) and loadable by Python, but impossible to encode as UTF-8 -- one in
-# a name or proof would crash writing/printing the report. They are rendered
-# as the replacement character instead; the database itself is unaffected
-# (it is serialised with ensure_ascii, which re-escapes them losslessly).
+# Replace lone surrogates, which JSON can represent but UTF-8 cannot encode.
 _SURROGATES_RE = re.compile(r"[\ud800-\udfff]")
 
 PROMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "Hackerpolice proof", "SteamHistory")
 DEMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "SteamHistory")
 REMOVED_HEADER = ("SteamID", "Profile Link", "SteamHistory")
 
-# Display default only: the CLI always passes the real --snapshot path in
-# RunInfo, so a custom path is reported correctly instead of the default.
+# Fallback display label; callers should pass the actual snapshot path.
 DEFAULT_SNAPSHOT_LABEL = "snapshot/playerlist.vorobey-hackerpolice.json"
 
 
-# Control characters (including newlines) in anything that reaches the page or
-# the job log. The fetch URL can be an upstream-supplied download_url, so a
-# newline in it would otherwise start a new Markdown line (e.g. an extra bullet
-# in the report header), and an ESC would repaint the terminal that `cat`s it.
-#
-# U+0080-U+009F are C1 controls (including U+009B, the 8-bit CSI escape), and
-# U+0085 (NEL) plus U+2028/U+2029 are line terminators too -- ``str.splitlines``
-# and CSS both treat them specially. Neutralise the whole control range rather
-# than leaving a terminal control or an extra Markdown table line raw.
+# Neutralise controls and line separators before displaying untrusted text.
 _TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
-# Bidirectional overrides flip how the rest of the line is displayed, so a name
-# like "abc\u202eDEF" shows as "abcFED" and can make the NEXT table cell read
-# as something else. They have no legitimate use in a player name; a zero-width
-# joiner does (emoji, Indic scripts), so only the bidi controls are replaced.
+# Replace bidi controls so displayed text cannot reorder adjacent content.
 _BIDI_CONTROLS = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
-# Unicode FORMAT characters are generally invisible and can make two names
-# look alike. Replace every current or future FORMAT character except ZWNJ/ZWJ,
-# which carry meaning in Persian/Indic text and emoji sequences. In URLs those
-# joiners are percent-encoded instead, because a hidden character can disguise
-# a link target.
+# Replace invisible format characters, preserving ZWNJ/ZWJ; encode URL joiners.
 _MEANINGFUL_JOINERS = frozenset(("\u200c", "\u200d"))
 
 
@@ -271,8 +210,7 @@ def _code(value: str, *, in_table: bool = False) -> str:
     longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
     fence = "`" * (longest + 1)
     if text.startswith("`") or text.endswith("`"):
-        # CommonMark strips one space from each end; the padding keeps a value
-        # that begins or ends with a backtick from merging into the fence.
+        # Pad boundary backticks so CommonMark does not merge them with the fence.
         text = f" {text} "
     return f"{fence}{text}{fence}"
 
@@ -306,10 +244,8 @@ def _name_cell(change: Change) -> str:
     since the SteamID (and therefore the profile) is known even when the
     name is not; only an unusable SteamID renders as plain text.
     """
-    # UNKNOWN only when there is genuinely no recorded name; a player
-    # actually named "-" (or similar) keeps their name. _cell() escapes the
-    # brackets that would otherwise break the link text.
-    name = _shorten(change.name, MAX_NAME_CHARS)  # cut BEFORE escaping
+    # Show UNKNOWN only when no name is recorded; _cell() escapes link-text markup.
+    name = _shorten(change.name, MAX_NAME_CHARS)  # Apply the display limit before Markdown escaping
     label = "UNKNOWN" if not name.strip() else _cell(name)
     url = steam_profile_url(change.steamid)
     if url is None:
@@ -317,9 +253,8 @@ def _name_cell(change: Change) -> str:
     return _markdown_link(url, label)
 
 
-# GitHub Flavored Markdown auto-links URI literals and bare ``www.`` text;
-# non-clickable evidence containing either must be fenced as code. Requiring
-# non-whitespace after the colon avoids fencing ordinary prose like "Reason: ".
+# Fence URI-like text and bare www. values to prevent GitHub auto-linking.
+# Require text after ':' so prose such as 'Reason: ' remains plain text.
 _AUTOLINK_IN_TEXT = re.compile(r"(?:[a-z][a-z0-9+.-]*:[^\s]+|www\.[^\s]+)", re.IGNORECASE | re.ASCII)
 _SECOND_HTTP_URL = re.compile(r"\s+https?://", re.IGNORECASE)
 _MALFORMED_PERCENT_ESCAPE = re.compile(r"%(?![0-9a-fA-F]{2})")
@@ -370,8 +305,7 @@ def _is_url(text: str) -> bool:
     try:
         parts = urllib.parse.urlsplit(text)
         hostname = parts.hostname
-        # Accessing .port performs the validation urlsplit defers, including
-        # rejecting non-numeric and out-of-range ports.
+        # Access .port to trigger urlsplit's deferred port validation.
         _ = parts.port
     except ValueError:
         return False
@@ -439,8 +373,7 @@ def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     cell = ", ".join(rendered)
     hidden = max(0, len(links) - len(shown)) + max(0, omitted)
     if hidden:
-        # Plain text, not a link: it must never look clickable. ``omitted``
-        # counts additional upstream proof entries that policy did not retain.
+        # Keep the overflow note plain; it counts evidence links not shown.
         cell += f", and {_count(hidden)} more evidence entries"
     return cell
 
@@ -571,7 +504,7 @@ def _with_removed_table(lines: list[str], steamids: Sequence[str], limit: int = 
     if not table:
         return lines
     while lines and not lines[-1].strip():
-        lines.pop()  # exactly one blank line before the new section
+        lines.pop()  # Ensure exactly one blank line before the new section.
     return [*lines, "", *table]
 
 
@@ -593,8 +526,7 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
     is removed from the database for this SteamID: ...; nothing else is
     modified."
     """
-    # Same numeric order as the tables above, so the sentence reads the way
-    # the report does regardless of the order the changes were discovered in.
+    # Use the same numeric SteamID order as the tables above.
     changed_steamids = _sorted_steamids(
         [change.steamid for change in changes if (change.kind == "promote") or change.after]
     )
@@ -604,7 +536,7 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
 
     def clause(head: str, target: str, steamids: list[str]) -> str:
         if database is None:
-            head = head[:1].upper() + head[1:]  # standalone sentence starts capitalised
+            head = head[:1].upper() + head[1:]  # Capitalize standalone clauses
         return f"{head} for {target}: " + _steamid_list(steamids)
 
     parts: list[str] = []
@@ -625,8 +557,7 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
         parts.append(clause(head, "this SteamID" if one else "these SteamIDs", removed_steamids))
 
     if not parts:
-        # No changes at all. Without this guard the sentence reads
-        # "In the X database: ; nothing else is modified." -- an empty clause.
+        # Avoid an empty clause when there are no changes.
         return f"In the {_text(database)} database: nothing has changed." if database else "Nothing has changed."
     body = "; ".join(parts)
     if database:
@@ -640,35 +571,24 @@ class RunInfo:
 
     database_path: Path
     source: str
-    source_total: int  # raw rows in the current list, including duplicates
-    source_skipped: int  # rows without a usable SteamID
+    source_total: int  # Raw entries, including duplicates
+    source_skipped: int  # Rows without usable SteamIDs
     dry_run: bool
     changes: tuple[Change, ...] = ()
-    # Demotion provenance: how many IDs disappeared upstream vs. the snapshot,
-    # and (when demotion was skipped despite --demote) the reason why.
-    previous_source_total: int | None = None  # raw rows in the previous snapshot
-    added_to_source: int = 0  # distinct usable SteamIDs
-    removed_from_source: int = 0  # distinct usable SteamIDs
-    # SteamIDs that were in the previous snapshot but are gone from the
-    # current list. Reported whether or not demotion ran (and even when the
-    # mass-demotion guard skipped demotion), because it is the raw fact the
-    # pull request exists to communicate.
+    # Snapshot provenance and reasons a requested demotion was skipped.
+    previous_source_total: int | None = None  # Raw entries in the previous snapshot
+    added_to_source: int = 0  # Distinct usable SteamIDs
+    removed_from_source: int = 0  # Distinct usable SteamIDs
+    # IDs missing upstream since the previous snapshot, even when demotion is skipped.
     removed_upstream: tuple[str, ...] = ()
     demotion_note: str | None = None
-    # Why the snapshot was left alone (--no-update-snapshot, or a run that
-    # could not apply the removals it found).
+    # Explain why the snapshot was not refreshed.
     snapshot_note: str | None = None
-    # True when the snapshot file itself was refreshed this run, so a
-    # snapshot-only PR does not misleadingly report "No changes."
+    # Include snapshot-only changes in the report status.
     snapshot_changed: bool = False
-    # True when the DATABASE FILE changes even though no tag does: the sync
-    # always writes entries back in canonical form (sorted by SteamID), so a
-    # hand-appended entry is re-sorted without any attribute changing. Without
-    # this flag the body used to claim "No database changes" over a visible
-    # diff in the pull request.
+    # Distinguish file-only normalisation from no database changes.
     database_changed: bool = False
-    # The snapshot file this run used (--snapshot), so the report never names
-    # a path the run did not actually touch.
+    # Report the snapshot path actually used.
     snapshot_path: Path | None = None
 
     @property
@@ -681,9 +601,7 @@ class RunInfo:
         the headline always names the file the run actually writes and no
         repository name is hardcoded here.
         """
-        # Derive the label from the actual basename, not the bounded display
-        # path: clipping a long parent directory first can remove the filename
-        # and make the report name the wrong database.
+        # Derive the label from the basename so long parent paths cannot change it.
         stem = self.database_path.stem
         head, _, owner = stem.partition(".")
         name = owner if head == "playerlist" and owner else stem
@@ -710,12 +628,10 @@ def _header_lines(info: RunInfo) -> list[str]:
     if info.dry_run:
         lines.append("- Mode: **dry run** (no database or snapshot written)")
     if info.previous_source_total is not None:
-        # Totals count raw list entries; added/removed counts are distinct
-        # SteamIDs. Duplicates or unusable rows mean one cannot be derived from
-        # the other, so use the current list's actual entry count here.
+        # Totals use raw entries; snapshot changes count distinct usable SteamIDs.
         current_total = info.source_total
         delta = current_total - info.previous_source_total
-        # "+0" reads like a change was made; name the no-change case instead.
+        # State zero explicitly instead of showing a misleading +0.
         net = "no net change" if delta == 0 else f"net {delta:+,d}"
         lines.append(
             f"- Previous snapshot: {_count(info.previous_source_total)} entries; "
@@ -729,21 +645,17 @@ def _header_lines(info: RunInfo) -> list[str]:
             f"({_count(info.previous_source_total)} → {_count(current_total)} entries; {net})"
         )
     elif info.snapshot_changed:
-        # No baseline existed: every current ID is new in the initial snapshot.
+        # With no baseline, every usable ID is new.
         lines.append(
             f"- Snapshot diff: **{_count(info.added_to_source)} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
             "**0 SteamIDs removed** (no previous snapshot; initial snapshot)"
         )
     if info.demotion_note:
-        # _text(): this note embeds the snapshot PATH, which is data like any
-        # other. A directory called "a[x](https://evil.example)" used to render
-        # as a live link inside the bot's own pull request.
+        # Escape data-derived paths included in the demotion note.
         lines.append(f"- Demotion: **{_text(info.demotion_note)}**")
     if info.snapshot_note:
-        # Deliberately NOT escaped: unlike the demotion note, this one is
-        # authored in code (bold markers and a `--demote` code span) and carries
-        # no data -- escaping it would print the markers instead of applying them.
+        # Snapshot notes contain code-authored Markdown; preserve their formatting.
         lines.append(f"- Snapshot: {info.snapshot_note}")
     elif info.snapshot_changed:
         verb = "would be updated" if info.dry_run else "updated"
@@ -820,11 +732,10 @@ def _utf8_len(text: str) -> int:
 
 def _truncate_to_bytes(text: str, limit: int) -> str:
     """Longest prefix of ``text`` whose UTF-8 encoding fits in ``limit`` bytes."""
-    # Fast path: encoding a multi-megabyte body only to slice off all of it
-    # would cost more than the whole shrink step. Both branches return "".
+    # Skip encoding when the byte budget is nonpositive.
     if limit <= 0:
         return ""
-    return text.encode("utf-8", "surrogatepass")[:limit].decode("utf-8", "ignore")  # never a half character
+    return text.encode("utf-8", "surrogatepass")[:limit].decode("utf-8", "ignore")  # Ignore invalid UTF-8 sequences
 
 
 def _fit_body(text: str) -> str:
@@ -879,9 +790,7 @@ def _render_body(
 
     if not promotions and not demotions:
         if info.database_changed:
-            # The file changes without any tag changing (re-sorted entries,
-            # restored formatting). Say exactly that: "No changes" over a diff
-            # the reviewer can see is the one thing this sentence must not say.
+            # Describe file-only normalisation accurately instead of claiming no changes.
             verb = "would be normalised" if info.dry_run else "was normalised"
             detail = "entries re-sorted, formatting restored"
             if info.snapshot_changed:
@@ -899,27 +808,24 @@ def _render_body(
     if demotions:
         lines += _demotion_lines(demotions, change_limit, database=info.database_label)
 
-    # Upstream removals first: the closing sentence and the proof note that
-    # follow are always the last thing in the report.
+    # Place the removed-ID table before the closing summary and proof note.
     lines = _with_removed_table(lines, info.removed_upstream, removed_limit)
 
     if closing_sentence is None:
         closing_sentence = render_closing(info.changes, database=info.database_label)
 
     while lines and not lines[-1].strip():
-        lines.pop()  # exactly one blank line before the closing sentence
+        lines.pop()  # Ensure one blank line before the closing sentence.
     lines += ["", closing_sentence]
 
-    # Counted over the rows that are actually rendered: with a capped table the
-    # evidence of row 200 is not on the page, and a note about "the proof link"
-    # above no link at all is worse than no note.
+    # Count visible rows only; do not reference evidence omitted from the table.
     total_links = sum(
         _evidence_link_status(link)[1]
         for change in promotions[:change_limit]
         for link in change.evidence[:MAX_EVIDENCE_LINKS]
     )
     if total_links:
-        # Deliberately the last line of the report.
+        # Keep attribution as the report's final content line.
         note = (
             "Proof link comes from the Vorobey hackerpolice list and is shown for review only."
             if total_links == 1
@@ -930,13 +836,7 @@ def _render_body(
     return "\n".join(lines)
 
 
-# Tried in order when a report would exceed MAX_REPORT_BYTES. Rows are dropped
-# (each drop is announced with an "and N more" note) instead of the body being
-# cut off, because the closing sentence and the removed-SteamID list are what
-# the pull request exists to communicate. The change tables shrink first --
-# the same changes are visible in the PR's own diff -- and the removed list
-# only after them; the last resort is one row per table, and _fit_body() after
-# that for a single row that is itself enormous.
+# Reduce change-table rows first, then removed IDs; hard-truncate only as a last resort.
 _SHRINK_STEPS: tuple[tuple[int, int], ...] = (
     (100, MAX_REMOVED_TABLE_ROWS),
     (50, MAX_REMOVED_TABLE_ROWS),
