@@ -2266,6 +2266,16 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "Yuno",
+				"time": 1794938231
+			},
+			"steamid": "[U:1:733591217]"
+		},
+		{
+			"attributes": [
 				"cheater"
 			],
 			"last_seen": {
@@ -4053,6 +4063,16 @@
 				"cheater"
 			],
 			"last_seen": {
+				"player_name": "wora.",
+				"time": 1794931145
+			},
+			"steamid": "[U:1:1198563731]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
 				"player_name": "T95/FV420",
 				"time": 1779803690
 			},
@@ -4972,6 +4992,16 @@
 		},
 		{
 			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "kinda homeless",
+				"time": 1794940083
+			},
+			"steamid": "[U:1:1583209130]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -5254,6 +5284,19 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "balling",
+				"time": 1794934735
+			},
+			"proof": [
+				"Backtrack on Spy"
+			],
+			"steamid": "[U:1:1720617962]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -5506,6 +5549,19 @@
 				"time": 1779989903
 			},
 			"steamid": "[U:1:1846577382]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "Gold Ship",
+				"time": 1794938751
+			},
+			"proof": [
+				"ESP"
+			],
+			"steamid": "[U:1:1848020347]"
 		},
 		{
 			"attributes": [
@@ -5823,6 +5879,19 @@
 				"[auto] automatically marked: Racist | reason: \"nigga what?\""
 			],
 			"steamid": "[U:1:1926773115]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "MooZU",
+				"time": 1794932215
+			},
+			"proof": [
+				"ESP"
+			],
+			"steamid": "[U:1:1927492886]"
 		}
 	]
 }
