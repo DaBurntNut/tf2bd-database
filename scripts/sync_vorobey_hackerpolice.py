@@ -8,15 +8,16 @@ Demotion is snapshot-based, never "absent from the current list": an ID is
 only demoted if it is in the previous snapshot (``--snapshot``, default
 ``snapshot/playerlist.vorobey-hackerpolice.json``) AND missing from the
 current list. Cheaters this database added manually -- never listed by
-Vorobey at all -- are therefore never touched. Every run also refreshes
-the snapshot with the RAW BYTES of the current upstream file (an exact
-replica, never decoded/re-serialised) in the same working tree,
-so the workflow commits both files in one pull request and the baseline
-only advances when that PR is merged.
+Vorobey at all -- are therefore never touched. When it is safe and the
+upstream bytes differ, the snapshot is refreshed with the RAW BYTES of the
+current file (an exact replica, never decoded/re-serialised) alongside the
+database. Pull-request mode proposes both together; manual direct-commit mode
+publishes both together on the default branch.
 
 The snapshot is deliberately NOT advanced when the removals it found could
-not be applied -- demotion disabled (``--demote`` missing) or vetoed by the
-mass-demotion guard -- because advancing it would forget those removals.
+not be applied -- demotion disabled (``--demote`` missing), vetoed by the
+mass-demotion guard, or ambiguous because the current list has unusable rows --
+because advancing it would forget those removals.
 
 The report (pull request body / job summary) lists every SteamID that
 disappeared from the upstream list since the previous snapshot, as a
@@ -38,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import logging
 import os
 import stat
@@ -95,7 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Vorobey hackerpolice list HTTPS URL or local path; repeat for fallbacks (default: built-in GitHub URLs)",
     )
     parser.add_argument("--report", metavar="PATH", help="also write the Markdown summary to this file")
-    parser.add_argument("--dry-run", action="store_true", help="report what would change without writing the database")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would change without updating the database or snapshot (a requested report is still written)",
+    )
     parser.add_argument(
         "--demote",
         action="store_true",
@@ -109,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SNAPSHOT,
         metavar="PATH",
         help=f"previous hackerpolice snapshot used as the demotion baseline (default: {DEFAULT_SNAPSHOT}); "
-        "rewritten every run as an exact verbatim copy of the current upstream file",
+        "refreshed when the upstream bytes differ, as an exact verbatim copy",
     )
     parser.add_argument(
         "--no-update-snapshot",
@@ -120,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-mass-demotion",
         action="store_true",
-        help="demote even if an implausibly large share of the snapshot disappeared upstream",
+        help="override the mass-demotion veto (an incomplete-source safety check still blocks demotions)",
     )
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-q", "--quiet", action="store_true", help="only print the Markdown summary")
@@ -173,8 +179,12 @@ def _check_github_output() -> None:
 def _log_validation(result: ValidationResult, context: str) -> None:
     for warning in result.warnings:
         LOGGER.warning("%s", warning)
+    if result.warnings_omitted:
+        LOGGER.warning("%s additional validation warning(s) omitted", result.warnings_omitted)
     for error in result.errors:
         LOGGER.error("%s: %s", context, error)
+    if result.errors_omitted:
+        LOGGER.error("%s: %s additional validation problem(s) omitted", context, result.errors_omitted)
 
 
 def load_database(path: Path) -> tuple[PlayerList, str]:
@@ -186,8 +196,8 @@ def load_database(path: Path) -> tuple[PlayerList, str]:
 
     result = validate(database)
     _log_validation(result, f"{display_path(path)} is not a usable playerlist")
-    if result.errors:
-        raise SyncError(f"{display_path(path)} has {len(result.errors)} problem(s), nothing was written")
+    if result.error_count:
+        raise SyncError(f"{display_path(path)} has {result.error_count} problem(s), nothing was written")
     return database, original
 
 
@@ -214,8 +224,18 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     # Write THROUGH a symlink. Replacing the link itself would delete it and
     # leave the file it points at -- the one the operator actually keeps, and
     # the one every other tool reads -- untouched, while this run reported
-    # success. A chain of links resolves to the final target.
-    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    # success. Resolve strictly enough to detect a self-referential/recursive
+    # link: os.path.realpath() silently returns the unresolved name for a loop,
+    # and replacing that name would destroy the link rather than refuse it.
+    target = path
+    if path.is_symlink():
+        try:
+            target = path.resolve(strict=False)
+        except RuntimeError as exc:
+            # pathlib has surfaced symlink loops as RuntimeError on some
+            # versions and OSError on others. Normalize this form into the
+            # write error path, which names the operator-supplied output path.
+            raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), os.fspath(path)) from exc
     # mkstemp creates the file with O_EXCL and a unique name, so concurrent
     # runs -- separate processes or threads -- never share (and interleave
     # writes into) one temp file. The final replace is atomic, so readers
@@ -318,11 +338,11 @@ def _same_file(first: Path, second: Path) -> bool:
         return first.exists() and second.exists() and os.path.samefile(first, second)
     except (OSError, ValueError, RuntimeError):
         # ValueError: a path the OS cannot encode (embedded NUL, lone
-        # surrogate). RuntimeError: pathlib raises that -- not OSError -- for a
-        # symlink loop, and resolutions of both paths happen inside this call,
-        # so an uncaught one escaped as a traceback for every one of the four
-        # paths. Such a path cannot be an alias of a real file either; the
-        # operation that uses it refuses it cleanly further down.
+        # surrogate). pathlib has reported symlink loops as either RuntimeError
+        # or OSError depending on version; resolving both paths happens here,
+        # so an uncaught loop escaped as a traceback for every guarded path.
+        # Such a path cannot be an alias of a real file; the operation that uses
+        # it refuses it cleanly further down.
         return False
 
 
@@ -395,7 +415,7 @@ def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
         outputs.append(("--report", Path(args.report)))
     for flag, path in outputs:
         if not path.parent.is_dir():
-            raise SyncError(f"{flag} directory does not exist: {path.parent}")
+            raise SyncError(f"{flag} directory does not exist: {display_path(path.parent)}")
 
     return database_path, snapshot_path
 
@@ -417,6 +437,8 @@ def _plan_demotion(
     previous_index: HackerpoliceIndex | None,
     removed_upstream: set[str],
     snapshot_path: Path,
+    *,
+    source_skipped: int = 0,
 ) -> tuple[set[str], bool, str | None, str | None]:
     """Decide what may be demoted, and whether the baseline may advance.
 
@@ -442,7 +464,20 @@ def _plan_demotion(
                 len(removed),
                 len(previous_index.by_steamid),
             )
-            if (
+            if removed and source_skipped:
+                demotion_note = (
+                    f"skipped - the current list contains {source_skipped:,} unusable "
+                    f"SteamID {plural(source_skipped, 'entry', 'entries')}, so its upstream removals "
+                    "cannot be confirmed safely"
+                )
+                LOGGER.warning("Demotion %s.", demotion_note)
+                removed = set()
+                update_snapshot = False
+                snapshot_note = (
+                    "**not refreshed** - the current list is incomplete, so these removals stay "
+                    "demotion candidates until a clean list can confirm them"
+                )
+            elif (
                 not args.allow_mass_demotion
                 and len(removed) > MASS_DEMOTION_MIN_IDS
                 and len(removed) > MASS_DEMOTION_MAX_FRACTION * len(previous_index.by_steamid)
@@ -503,13 +538,13 @@ def run(args: argparse.Namespace) -> int:
         )
 
     removed, update_snapshot, demotion_note, snapshot_note = _plan_demotion(
-        args, previous_index, removed_upstream, snapshot_path
+        args, previous_index, removed_upstream, snapshot_path, source_skipped=index.skipped
     )
     changes = sync(database, index, enable_demote=args.demote, removed_ids=removed)
 
     result = validate(database)
     _log_validation(result, "refusing to write an invalid database")
-    if result.errors:
+    if result.error_count:
         raise SyncError("the synced playerlist is invalid, nothing was written")
 
     # Decide what WOULD change and render the report before writing anything.
@@ -576,11 +611,11 @@ def run(args: argparse.Namespace) -> int:
     # between the two writes, a stale snapshot only makes the next run
     # re-evaluate removals that are already applied (a no-op), whereas a
     # fresh snapshot with an unwritten database would lose them forever. The
-    # snapshot refresh happens on every run, even if the Garou database
+    # snapshot refresh happens whenever it is safe, even if the Garou database
     # itself did not change, so a run whose only change is the snapshot still
-    # opens a snapshot-only PR. Exception: when demotion was skipped as unsafe
-    # (mass-demotion guard), update_snapshot is False and the snapshot is left
-    # alone so the same removals are re-evaluated next run.
+    # opens a snapshot-only PR. Exception: if demotion is disabled, vetoed by
+    # either safety guard, or the source is incomplete, update_snapshot is
+    # False and the same removals are re-evaluated next run.
     write_database(database_path, rendered, original, dry_run=args.dry_run)
     _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
     if update_snapshot:
@@ -623,8 +658,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except OSError as exc:
         # e.g. the database/snapshot/report path became unwritable mid-run:
-        # report it cleanly instead of dumping a traceback.
-        LOGGER.error("error: %s", exc)
+        # report a bounded reason without echoing an untrusted filename from
+        # OSError.__str__ (which could inject a log line or expose a path).
+        LOGGER.error("error: %s", display_path(error_reason(exc)))
         return 2
     except KeyboardInterrupt:
         # Ctrl-C is not a crash. The atomic writes have already removed their

@@ -17,6 +17,7 @@ from typing import Any, TypedDict, cast
 
 STEAMID64_BASE = 76561197960265728
 MAX_ACCOUNT_ID = 2**32
+MAX_STEAMID_INSTANCE = 2**20
 
 # Sanity cap on a playerlist file this tool reads. The real database is ~110 kB
 # and the upstream list ~1.9 MB, so this is far beyond anything legitimate --
@@ -41,12 +42,18 @@ _ACCOUNT_ID_RE = re.compile(r"[0-9]+")
 # The canonical form is written upper-case by TF2BD, but matching is
 # case-insensitive on every notation so a hand-edited "[u:1:…]" still maps to
 # the same player (and is caught as a duplicate by validate()).
-_U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$", re.IGNORECASE)
-_U_BARE_RE = re.compile(rf"^U:1:({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE)
-_U_INSTANCE_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):{_ACCOUNT_ID_RE.pattern}\]$", re.IGNORECASE)
-_STEAM2_RE = re.compile(rf"^STEAM_[0-5]:([01]):({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE)
+_U_RE = re.compile(rf"^\[U:1:({_ACCOUNT_ID_RE.pattern})\]$", re.IGNORECASE | re.ASCII)
+_U_BARE_RE = re.compile(rf"^U:1:({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE | re.ASCII)
+_U_INSTANCE_RE = re.compile(
+    rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):({_ACCOUNT_ID_RE.pattern})\]$", re.IGNORECASE | re.ASCII
+)
+_STEAM2_RE = re.compile(rf"^STEAM_[0-5]:([01]):({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE | re.ASCII)
 _STEAMID64_RE = re.compile(r"^[0-9]{17}$")
-_PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/([0-9]{17})", re.IGNORECASE)
+# An entire Steam Community permalink, not a matching substring in arbitrary
+# text or a lookalike host (either could silently alias a victim's SteamID).
+_PROFILE_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?steamcommunity\.com/profiles/([0-9]{17})/?", re.IGNORECASE | re.ASCII
+)
 
 
 # How much of an arbitrary value a validation message quotes. These messages go
@@ -55,15 +62,33 @@ _PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/([0-9]{17})", re.IGN
 # to print a single 3,000,038-character line, which buries the error it is meant
 # to explain (and every other error after it, once GitHub truncates the log).
 MAX_SHOWN_VALUE_CHARS = 120
+# Bound decimal conversion as well as the final message length: repr(10**100000)
+# allocates the entire number before the preview can be clipped.
+_MAX_SHOWN_INT_BITS = MAX_SHOWN_VALUE_CHARS * 4
+MAX_VALIDATION_MESSAGES = 100
 
 
 def _shown(value: Any) -> str:
-    """``repr()`` of an arbitrary value, clipped so one bad entry cannot flood the log.
+    """A bounded, quoted preview so one bad entry cannot flood the log or RAM.
 
-    ``repr`` rather than ``str`` because these values are untrusted: a newline
-    would start a fake log line and an ESC sequence would repaint the terminal.
+    Strings are sliced before ``repr``: clipping its result afterwards still
+    allocated an escaped copy of an attacker-supplied 64 MiB value. JSON
+    arrays/objects are summarized by shape rather than fully rendered for the
+    same reason. ``repr`` rather than ``str`` keeps short scalar values safe: a
+    newline cannot start a fake log line and an ESC cannot repaint the terminal.
     """
-    text = repr(value)
+    if isinstance(value, str):
+        text = repr(value if len(value) <= MAX_SHOWN_VALUE_CHARS else value[:MAX_SHOWN_VALUE_CHARS])
+    elif isinstance(value, dict):
+        count = len(value)
+        text = f"<object with {count:,} {'key' if count == 1 else 'keys'}>"
+    elif isinstance(value, list):
+        count = len(value)
+        text = f"<array with {count:,} {'item' if count == 1 else 'items'}>"
+    elif isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > _MAX_SHOWN_INT_BITS:
+        text = "<integer too large to display>"
+    else:
+        text = repr(value)
     return text if len(text) <= MAX_SHOWN_VALUE_CHARS else text[:MAX_SHOWN_VALUE_CHARS] + "…"
 
 
@@ -80,13 +105,22 @@ def display_path(path: Any) -> str:
     second, operator-chosen log line) or an ESC sequence (which would repaint
     the terminal that runs ``cat`` on the log). Control characters are shown as
     escapes rather than dropped, so the message still names the file exactly;
-    ``str`` keeps it readable where ``repr`` would add quotes as well.
+    ``str`` keeps it readable where ``repr`` would add quotes as well. Build
+    only the preview: escaping an arbitrarily long input before clipping it
+    would allocate an arbitrarily long second string.
     """
-    shown = "".join(
-        char if char.isprintable() and char not in "\u2028\u2029" else char.encode("unicode_escape").decode("ascii")
-        for char in str(path)
-    )
-    return shown if len(shown) <= MAX_SHOWN_PATH_CHARS else shown[:MAX_SHOWN_PATH_CHARS] + "…"
+    parts: list[str] = []
+    length = 0
+    for char in str(path):
+        if char.isprintable() and char not in "\u2028\u2029":
+            piece = char
+        else:
+            piece = char.encode("unicode_escape").decode("ascii")
+        if length + len(piece) > MAX_SHOWN_PATH_CHARS:
+            return "".join(parts) + "…"
+        parts.append(piece)
+        length += len(piece)
+    return "".join(parts)
 
 
 def error_reason(exc: BaseException) -> str:
@@ -154,7 +188,8 @@ def normalize_steamid(value: Any) -> str | None:
     """Return canonical ``[U:1:<account id>]`` form, or ``None`` if unusable.
 
     Accepts canonical ``[U:1:x]``, bare ``U:1:x``, ``[U:1:x:instance]``,
-    ``STEAM_0:y:z``, SteamID64 integers/strings, and profile URLs.
+    ``STEAM_0:y:z``, SteamID64 integers/strings, and complete Steam Community
+    ``/profiles/<SteamID64>`` permalinks (optionally with scheme/``www``/slash).
     """
     if isinstance(value, bool):  # bool is an int subclass; not a SteamID
         return None
@@ -167,7 +202,7 @@ def normalize_steamid(value: Any) -> str | None:
         return None
 
     text = value.strip()
-    for pattern in (_U_RE, _U_BARE_RE, _U_INSTANCE_RE):
+    for pattern in (_U_RE, _U_BARE_RE):
         match = pattern.match(text)
         if match:
             account = _bounded_int(match.group(1))
@@ -176,6 +211,17 @@ def normalize_steamid(value: Any) -> str | None:
             if account is None or not 0 < account < MAX_ACCOUNT_ID:
                 return None
             return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+
+    match = _U_INSTANCE_RE.match(text)
+    if match:
+        account = _bounded_int(match.group(1))
+        instance = _bounded_int(match.group(2))
+        # The instance occupies 20 bits in the SteamID layout. It does not
+        # change the individual account, but an impossible instance must not
+        # let arbitrary suffixes alias a valid SteamID.
+        if account is None or not 0 < account < MAX_ACCOUNT_ID or instance is None or instance >= MAX_STEAMID_INSTANCE:
+            return None
+        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
 
     match = _STEAM2_RE.match(text)
     if match:
@@ -200,7 +246,7 @@ def normalize_steamid(value: Any) -> str | None:
             return None
         return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
 
-    match = _PROFILE_URL_RE.search(text)
+    match = _PROFILE_URL_RE.fullmatch(text)
     if match:
         account = _account_from_steamid64(int(match.group(1)))
         return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
@@ -262,7 +308,7 @@ def player_name(player: Player) -> str:
     value = last_seen.get("player_name")
     if isinstance(value, bool) or not isinstance(value, (str, int)):  # bool is an int subclass
         return ""
-    return str(value)
+    return value if isinstance(value, str) else _shown(value)
 
 
 def _player_sort_key(player: Player) -> tuple[bool, int]:
@@ -325,6 +371,14 @@ def _reject_out_of_range_float(text: str) -> float:
     return value
 
 
+def _parse_json_int(text: str) -> int:
+    """Parse a JSON integer with a fixed digit cap across supported Python versions."""
+    digits = text[1:] if text.startswith("-") else text
+    if len(digits) > 4_300:
+        raise _StrictJSONError(f"{_shown(text)} is out of range for a JSON integer")
+    return int(text)
+
+
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Refuse an object that defines the same key twice.
 
@@ -341,18 +395,19 @@ def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def strict_json_loads(raw: str | bytes) -> Any:
-    """Parse JSON, refusing what the standard library accepts silently.
+    """Parse JSON while rejecting non-standard, lossy, or unbounded numbers.
 
-    Four things a lenient parse lets through, each of which this tool would
-    otherwise publish back to disk: ``NaN``/``Infinity`` (a file no strict
-    parser -- including TF2BD's -- can read), a number that overflows into
-    infinity (the same hazard, spelled ``1e999``), and duplicate keys (silent
-    data loss). Everything else behaves exactly like ``json.loads``.
+    The standard library accepts ``NaN``/``Infinity``, turns overflowing floats
+    into infinity, and permits integer parsing limits to vary by Python version;
+    duplicate keys silently discard data. These cases could otherwise crash,
+    lose information, or consume excessive resources before the tool can name
+    the file. Everything else behaves like ``json.loads``.
     """
     return json.loads(
         raw,
         parse_constant=_reject_constant,
         parse_float=_reject_out_of_range_float,
+        parse_int=_parse_json_int,
         object_pairs_hook=_reject_duplicates,
     )
 
@@ -402,13 +457,41 @@ def load(path: Path) -> tuple[PlayerList, str]:
 
 @dataclass
 class ValidationResult:
-    """Problems found in a playerlist: errors block writing, warnings do not."""
+    """Problems found in a playerlist: errors block writing, warnings do not.
+
+    Keep only a bounded number of details. A syntactically small file can
+    contain hundreds of thousands of malformed entries; retaining and logging
+    one message per issue would turn validation into a memory and log flood.
+    Counts remain exact even when details are omitted.
+    """
 
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    errors_omitted: int = 0
+    warnings_omitted: int = 0
+
+    def add_error(self, message: str) -> None:
+        if len(self.errors) < MAX_VALIDATION_MESSAGES:
+            self.errors.append(message)
+        else:
+            self.errors_omitted += 1
+
+    def add_warning(self, message: str) -> None:
+        if len(self.warnings) < MAX_VALIDATION_MESSAGES:
+            self.warnings.append(message)
+        else:
+            self.warnings_omitted += 1
+
+    @property
+    def error_count(self) -> int:
+        return len(self.errors) + self.errors_omitted
+
+    @property
+    def warning_count(self) -> int:
+        return len(self.warnings) + self.warnings_omitted
 
     def __bool__(self) -> bool:
-        return not self.errors
+        return not self.errors and self.errors_omitted == 0
 
 
 def validate(database: PlayerList) -> ValidationResult:
@@ -417,13 +500,13 @@ def validate(database: PlayerList) -> ValidationResult:
 
     players = database.get("players")
     if not isinstance(players, list):
-        result.errors.append("'players' is not an array")
+        result.add_error("'players' is not an array")
         return result
 
     seen: set[str] = set()
     for position, player in enumerate(players):
         if not isinstance(player, dict):
-            result.errors.append(f"players[{position}] is not an object")
+            result.add_error(f"players[{position}] is not an object")
             continue
 
         steamid = player.get("steamid")
@@ -435,33 +518,33 @@ def validate(database: PlayerList) -> ValidationResult:
             # the screen, so it is quoted with repr -- and clipped, because it
             # can be as large as the file. Every later message about this entry
             # reuses `shown`, so they are all bounded too.
-            result.errors.append(f"players[{position}] has an unusable steamid: {_shown(steamid)}")
+            result.add_error(f"players[{position}] has an unusable steamid: {_shown(steamid)}")
             shown = _shown(steamid)
         else:
             shown = canonical
             if canonical in seen:
-                result.errors.append(f"duplicate steamid {canonical}")
+                result.add_error(f"duplicate steamid {canonical}")
             else:
                 seen.add(canonical)
 
         attributes = player.get("attributes")
         if not isinstance(attributes, list) or not attributes:
-            result.errors.append(f"players[{position}] ({shown}) has no attributes")
+            result.add_error(f"players[{position}] ({shown}) has no attributes")
             continue
         if not all(isinstance(attribute, str) for attribute in attributes):
             # Also guards the set() below against unhashable attribute values.
-            result.errors.append(f"players[{position}] ({shown}) has a non-string attribute")
+            result.add_error(f"players[{position}] ({shown}) has a non-string attribute")
             continue
         if len(set(attributes)) != len(attributes):
-            result.errors.append(f"players[{position}] ({shown}) has duplicate attributes")
+            result.add_error(f"players[{position}] ({shown}) has duplicate attributes")
         for attribute in attributes:
             if attribute not in KNOWN_ATTRIBUTES:
-                result.warnings.append(f"players[{position}] ({shown}) uses unknown attribute {_shown(attribute)}")
+                result.add_warning(f"players[{position}] ({shown}) uses unknown attribute {_shown(attribute)}")
 
         # The sync policy rewrites `proof` when demoting, so its shape is an
         # invariant this tool relies on: an array of strings, if present.
         proof = player.get("proof")
-        if proof is not None and (not isinstance(proof, list) or not all(isinstance(item, str) for item in proof)):
-            result.errors.append(f"players[{position}] ({shown}) has a malformed 'proof' (must be an array of strings)")
+        if "proof" in player and (not isinstance(proof, list) or not all(isinstance(item, str) for item in proof)):
+            result.add_error(f"players[{position}] ({shown}) has a malformed 'proof' (must be an array of strings)")
 
     return result

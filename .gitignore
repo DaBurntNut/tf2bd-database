@@ -6,8 +6,8 @@ __pycache__/
 .pyright_cache/
 
 # Atomic-write temporaries (..playerlist.garou3299.json.<random>.tmp). The
-# scripts always delete them, even when interrupted -- but a SIGKILL cannot
-# run that cleanup, so keep such a leftover out of `git add -A`.
+# scripts remove them on handled failures and Ctrl-C; SIGTERM/SIGKILL cannot run
+# that cleanup, so keep any leftover out of `git add -A`.
 .*.tmp
 
 # Local testing aid, deliberately not shipped: a catalogue of every message the

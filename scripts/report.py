@@ -9,6 +9,8 @@ untrusted-output as well as untrusted-input territory:
   list (names, proofs, SteamIDs) is escaped for a Markdown table cell --
   pipes and newlines cannot break the table, brackets cannot forge a link,
   angle brackets cannot inject HTML, and ``@`` cannot trigger a mention;
+* credentials in URLs embedded anywhere in upstream proof text are redacted
+  before they reach the report; changed text is not shown as a misleading link;
 * every table is row-capped, and the whole body has a hard length guard,
   because GitHub rejects pull request bodies over 65,536 characters. A report
   that would exceed the budget drops more rows (announced with an "and N more"
@@ -25,13 +27,14 @@ from __future__ import annotations
 
 import re
 import time
+import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from playerlist import account_id, display_path, steam_history_url, steam_profile_url
 from policy import Change
-from sources import SOURCE_REPO_URL, http_scheme, redact_url
+from sources import SOURCE_REPO_URL, redact_urls_in_text
 
 __all__ = [
     "MAX_ATTRIBUTE_CELLS",
@@ -198,6 +201,7 @@ _INVISIBLE_CONTROLS = re.compile("[\u00ad\u061c\u180e\u200b\u2060-\u2064\ufeff\u
 
 def _neutralise(value: str) -> str:
     """Make a value safe to put in front of a human or a terminal."""
+    value = redact_urls_in_text(value)
     value = _TEXT_CONTROLS.sub(" ", value)
     value = _BIDI_CONTROLS.sub("\ufffd", value)
     return _INVISIBLE_CONTROLS.sub("\ufffd", value)
@@ -307,13 +311,40 @@ def _name_cell(change: Change) -> str:
     return _markdown_link(url, label)
 
 
-def _is_url(text: str) -> bool:
-    """True for an http(s) URL -- the one thing safe to render as a link.
+_HTTP_SCHEME_IN_TEXT = re.compile(r"https?:", re.IGNORECASE)
+_SECOND_HTTP_URL = re.compile(r"\s+https?://", re.IGNORECASE)
+_MALFORMED_PERCENT_ESCAPE = re.compile(r"%(?![0-9a-fA-F]{2})")
 
-    Delegates to ``http_scheme`` so the report, the loader and the path guard
-    agree on what a URL is (schemes are case-insensitive).
+
+def _is_url(text: str) -> bool:
+    """True only for an unambiguous absolute HTTP(S) URL.
+
+    ``urlsplit`` is intentionally permissive: it accepts ``https:relative``,
+    empty authorities and invalid ports. Markdown/browser URL parsers also
+    disagree about backslashes and whitespace in authorities. Reject those
+    ambiguous forms rather than making untrusted evidence clickable. Spaces
+    in a path remain supported and are percent-encoded by ``_markdown_link``.
     """
-    return bool(http_scheme(text))
+    if not text or text != text.strip() or "\\" in text or any(char in text for char in "\r\n\t"):
+        return False
+    if any(char.isspace() and char != " " for char in text):
+        return False
+    if _SECOND_HTTP_URL.search(text) or _MALFORMED_PERCENT_ESCAPE.search(text):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(text)
+        hostname = parts.hostname
+        # Accessing .port performs the validation urlsplit defers, including
+        # rejecting non-numeric and out-of-range ports.
+        _ = parts.port
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc or not hostname:
+        return False
+    if any(char.isspace() for char in parts.netloc) or "%" in hostname:
+        return False
+    authority = parts.netloc.rsplit("@", 1)[-1]
+    return not authority.endswith(":")
 
 
 def _markdown_link(url: str, label: str) -> str:
@@ -331,6 +362,13 @@ def _markdown_link(url: str, label: str) -> str:
     return f"[{label}]({encoded})"
 
 
+def _evidence_link_status(link: str) -> tuple[str, bool]:
+    """Return safe display text and whether the value is a rendered link."""
+    safe_link = redact_urls_in_text(link)
+    clickable = len(link) <= MAX_EVIDENCE_LINK_CHARS and safe_link == link and _is_url(link)
+    return safe_link, clickable
+
+
 def _evidence_cell(links: Sequence[str]) -> str:
     """Proof column: real links where possible, escaped text otherwise.
 
@@ -339,19 +377,25 @@ def _evidence_cell(links: Sequence[str]) -> str:
     by side rather than separated by an HTML ``<br>``, because the report never
     emits raw HTML -- a cell then renders the same in a pull request, in a job
     summary and in any plain Markdown preview, where a tag would show as text.
+    Untrusted values that are redacted, malformed or merely prose are kept out
+    of Markdown's automatic-link parser too: a code span is literal, not a
+    second chance for GitHub to turn a supposedly non-clickable URL into one.
     """
     if not links:
         return "-"
     shown = links[:MAX_EVIDENCE_LINKS]
     single = len(shown) == 1
-    rendered = [
-        _markdown_link(link, "proof" if single else f"proof {position}")
-        if _is_url(link) and len(link) <= MAX_EVIDENCE_LINK_CHARS
-        # Too long to show faithfully (or not a URL at all): plain text. A
-        # truncated link would look clickable and go somewhere wrong.
-        else _cell(_shorten(link, MAX_EVIDENCE_LINK_CHARS))
-        for position, link in enumerate(shown, start=1)
-    ]
+    rendered: list[str] = []
+    for position, link in enumerate(shown, start=1):
+        safe_link, clickable = _evidence_link_status(link)
+        if clickable:
+            rendered.append(_markdown_link(link, "proof" if single else f"proof {position}"))
+        else:
+            preview = _shorten(safe_link, MAX_EVIDENCE_LINK_CHARS)
+            if safe_link != link or _HTTP_SCHEME_IN_TEXT.search(link):
+                rendered.append(_code(preview, in_table=True))
+            else:
+                rendered.append(_cell(preview))
     cell = ", ".join(rendered)
     hidden = len(links) - len(shown)
     if hidden:
@@ -613,7 +657,7 @@ def _header_lines(info: RunInfo) -> list[str]:
         "",
         f"- Database: {_code(display_path(info.database_path))}",
         f"- Vorobey hackerpolice list ({source_note}): {SOURCE_REPO_URL}",
-        f"- Fetched from: {_text(redact_url(info.source))}",
+        f"- Fetched from: {_text(redact_urls_in_text(info.source))}",
         f"- Run at: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
     ]
     if info.dry_run:
@@ -819,7 +863,11 @@ def _render_body(
     # Counted over the rows that are actually rendered: with a capped table the
     # evidence of row 200 is not on the page, and a note about "the proof link"
     # above no link at all is worse than no note.
-    total_links = sum(len(change.evidence) for change in promotions[:change_limit])
+    total_links = sum(
+        _evidence_link_status(link)[1]
+        for change in promotions[:change_limit]
+        for link in change.evidence[:MAX_EVIDENCE_LINKS]
+    )
     if total_links:
         # Deliberately the last line of the report.
         note = (

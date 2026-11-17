@@ -16,16 +16,17 @@ name: Sync Vorobey hackerpolice
 # never demoted. Everything else is never touched, and the hackerpolice proof
 # links are shown in the pull request only - they are never written into
 # playerlist.garou3299.json.
-# The pull request also lists EVERY SteamID removed from the hackerpolice list
-# since the previous snapshot (| SteamID | Profile Link | SteamHistory |, with
-# the Steam profile permalink), because that list stores no player names.
+# The removed-ID table lists up to 100 SteamIDs with their Steam profile and
+# SteamHistory links, followed by an overflow count; the report's snapshot diff
+# gives the full added/removed totals. The upstream list stores no player names.
 # The snapshot is only advanced when the removals it found were applied: a run
-# without --demote, or one vetoed by the mass-demotion guard, keeps the old
-# baseline so those removals stay demotion candidates. The snapshot is refreshed to the current list in the SAME
-# pull request, so the baseline only advances when the PR is merged - no
-# separate snapshot bot/PR is needed (a separate weekly snapshot PR would
-# race this workflow: merging it first would erase the very removals this
-# workflow is supposed to detect).
+# without --demote, one vetoed by either safety guard, or one with an incomplete
+# current list keeps the old baseline so removals stay candidates. When the
+# upstream bytes differ, the snapshot is refreshed alongside the database: both
+# are proposed in one pull request (so the baseline advances on merge) or
+# published together by the manual direct-commit mode. No separate snapshot
+# bot/PR is needed; a weekly snapshot PR could race this workflow and erase the
+# removals it is supposed to detect.
 #
 # Any pull request that touches the scripts, the tests or this workflow also
 # runs the lint + test job ("Lint and test the proposed change"), read-only and
@@ -69,7 +70,7 @@ on:
           - commit
         default: pull-request
       dry_run:
-        description: "Only report the changes, do not write or publish anything"
+        description: "Report the changes without updating the database or snapshot or opening a pull request"
         type: boolean
         default: false
       allow_mass_demotion:
@@ -79,14 +80,17 @@ on:
 
   # Lint and test every PROPOSED change too, so a pull request can never be
   # merged with broken code (the scheduled job below only checks the code
-  # after it already reached the default branch). Only files that can affect
-  # the bot are watched, so data-only bot pull requests skip this job.
+  # after it already reached the default branch). Watch both code/configuration
+  # and the database/snapshot the bot consumes; unrelated repository assets
+  # skip the full check matrix.
   pull_request:
     paths:
       - "scripts/**"
       - "tests/**"
       - "pyproject.toml"
       - ".gitattributes"
+      - "playerlist.garou3299.json"
+      - "snapshot/playerlist.vorobey-hackerpolice.json"
       # Both are read by the suite (the CLI inventory and the Dependabot
       # contract): without them here, a pull request touching only those files
       # runs no checks, and the tests that guard them can never fail.
@@ -333,10 +337,18 @@ jobs:
             echo "::error::Nothing was committed to $BOT_BRANCH and no such branch exists - nothing to push."
             exit 1
           fi
-          # --force-with-lease only works if the remote ref is known locally;
-          # a fresh checkout has never seen the bot branch.
-          git fetch --quiet origin "$BOT_BRANCH" || true
-          git push --force-with-lease --set-upstream origin "$BOT_BRANCH"
+          # Fetch the bot ref explicitly: checkout's narrow refspec only has
+          # the default branch. Derive the lease from that exact ref, rather
+          # than Git's implicit upstream selection (the fallback branch may
+          # have no upstream or may still track the default branch).
+          expected=''
+          if git fetch --quiet origin "+refs/heads/$BOT_BRANCH:refs/remotes/origin/$BOT_BRANCH" 2>/dev/null; then
+            expected=$(git rev-parse --verify "refs/remotes/origin/$BOT_BRANCH")
+          fi
+          # An empty expectation means the remote branch must not yet exist;
+          # if fetch failed for any other reason, this safely refuses an
+          # overwrite rather than weakening the lease.
+          git push --force-with-lease="refs/heads/$BOT_BRANCH:$expected" --set-upstream origin "$BOT_BRANCH"
 
           compare_url="https://github.com/$REPOSITORY/compare/$BASE_BRANCH...$BOT_BRANCH?expand=1"
           {
@@ -372,12 +384,11 @@ jobs:
 
       - name: Close a stale bot pull request
         # A previous run may have opened a pull request that was never merged.
-        # If TODAY'S run finds nothing left to do, that pull request is stale: it
-        # still offers the database and snapshot of an earlier day, and merging
-        # it now would undo whatever changed in between (a manual fix, or a
-        # later upstream change). A run that still has work never gets here --
-        # create-pull-request refreshes that same pull request instead.
-        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed != 'true' && env.MODE != 'commit' && env.DRY_RUN_INPUT != 'true'
+        # If a later run finds no work, that pull request is stale: merging its
+        # old database/snapshot could undo a manual fix or newer upstream state.
+        # A successful direct-commit run also supersedes any old bot PR, so
+        # close it after the commit as well. A dry run must never close one.
+        if: steps.sync.outcome == 'success' && env.DRY_RUN_INPUT != 'true' && (env.MODE == 'commit' || steps.sync.outputs.changed != 'true')
         # Cleanup must never turn an otherwise clean run red: a token without
         # pull-request access fails here and the failure stays visible, but the
         # database has already been synced correctly.
@@ -390,6 +401,6 @@ jobs:
           numbers=$(gh pr list --repo "$REPOSITORY" --head "$BOT_BRANCH" --state open --json number --jq '.[].number')
           for number in $numbers; do
             gh pr close "$number" --repo "$REPOSITORY" --delete-branch \
-              --comment "Closing: the latest sync run found nothing left to do, so this pull request is stale. A new one is opened automatically the next time the list changes."
+              --comment "Closing: the latest successful sync superseded this pull request. A new one is opened automatically the next time the list changes."
             echo "Closed stale bot pull request #$number." >> "$GITHUB_STEP_SUMMARY"
           done

@@ -75,11 +75,10 @@ def is_racist_proof(proof: str) -> bool:
     prefix = RACIST_PROOF_PREFIX.casefold()
     if not text.startswith(prefix):
         return False
-    # The prefix already consumed the OPENING quote, so a complete line still
-    # has its closing quote after it. Requiring one is what makes the sentence
-    # above true: a line that stops at the opening quote has no reason at all,
-    # and used to be accepted as a machine record anyway.
-    return '"' in text[len(prefix) :]
+    # The prefix already consumed the OPENING quote, so a complete line must
+    # end with the closing quote. Requiring only any later quote would accept
+    # an unfinished reason that happens to contain a quoted word.
+    return len(text) > len(prefix) and text.endswith('"')
 
 
 def _filter_racist_proofs(proofs: Any) -> list[str]:
