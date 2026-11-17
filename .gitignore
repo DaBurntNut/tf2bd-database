@@ -5,11 +5,8 @@ __pycache__/
 .coverage
 .pyright_cache/
 
-# Atomic-write temporaries (.tf2bd-sync-<random>.tmp). The scripts remove them
-# on handled failures and Ctrl-C; SIGTERM/SIGKILL cannot run that cleanup, so
-# keep any leftover out of `git add -A`.
+# Prevent abandoned atomic-write temporaries from being staged.
 .tf2bd-sync-*.tmp
 
-# Local, non-shipped catalogue for reviewing bot messages against documentation.
-# Keep it out of commits to avoid publishing stale message references.
+# Local review catalogue; do not publish stale message references.
 docs/bot-messages.md

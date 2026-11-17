@@ -243,8 +243,7 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     is parsed from exactly the bytes handed back.
     """
     try:
-        # Resolve symlinks first to detect loops while allowing a missing final target.
-        # strict=False permits a dangling link whose target may be created later.
+        # Resolve symlinks without requiring the final target to exist; this also detects loops.
         path.resolve(strict=False)
         # Unencodable paths cannot name a snapshot; preserve the missing-file behavior.
         # Use stat(), not exists(), so permission and I/O errors are not treated as missing.
@@ -267,8 +266,7 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     return HackerpoliceIndex.build(document, what=f"the previous snapshot {display_path(path)}"), raw
 
 
-# Redact values for credential-like query parameter names before logging or publishing.
-# Substring matching catches provider-specific variants; false positives are safer than missed credentials.
+# Match credential-like parameter names broadly; false positives are safer than leaks.
 _SECRET_QUERY_PARAM = re.compile(
     r"token|secret|passw|^pass$|pass$|auth|credential|session|sid|bearer|jwt|nonce|state|ticket|"
     r"apikey|api[_-]?key|sig|hmac|saml|key|x-amz|x-goog|code",
@@ -451,8 +449,7 @@ def _redact_url(url: str, depth: int) -> str:
     if len(url) > _MAX_URL_PARSE_CHARS:
         return "[URL omitted: too long to inspect safely]"
     original_url = url
-    # Parse a bounded decoded view so HTML entities cannot hide credentials.
-    # Preserve the original spelling when no redaction is needed.
+    # Inspect a bounded HTML-decoded view, but preserve the original spelling if unchanged.
     decoded_url = _html_unescape_bounded(url)
     if decoded_url is None:
         return "[URL omitted: too deeply encoded to inspect safely]"
@@ -471,7 +468,7 @@ def _redact_url(url: str, depth: int) -> str:
             host = f"[{host}]"
         try:
             port = parts.port
-        except ValueError:  # Ignore malformed ports rather than failing during redaction
+        except ValueError:  # Ignore malformed ports rather than failing during redaction.
             port = None
         if port is not None:
             host = f"{host}:{port}"
@@ -735,9 +732,7 @@ def _unwrap_github_contents_envelope(document: dict[str, Any]) -> bytes | None:
     if document.get("encoding") != "base64" or not isinstance(content, str):
         return None
     try:
-        # GitHub may wrap base64 in ASCII whitespace. Remove only those MIME
-        # separators, then validate every remaining character: the permissive
-        # default silently drops arbitrary garbage and can hide response corruption.
+        # Accept GitHub's MIME-style wrapping, but reject every non-Base64 character.
         compact = content.translate(str.maketrans("", "", " \t\r\n"))
         decoded = base64.b64decode(compact, validate=True)
     except (binascii.Error, ValueError):

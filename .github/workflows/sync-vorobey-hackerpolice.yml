@@ -1,28 +1,17 @@
 name: Sync Vorobey hackerpolice
 
-# Sync the upstream hackerpolice list against the Garou database.
-# Matching suspicious/racist entries gain cheater; suspicious is removed and racist retained.
-# Demote only IDs present in the previous snapshot and now absent upstream.
-# If racist remains, remove cheater and keep only TF2BD's automatic racist proofs.
-# Remove the full entry when racist is absent.
-# Never demote manually added cheaters or change unrelated entries.
-# Keep upstream proof links in the report; never write them to the database.
-# Report up to 100 removed IDs with Steam profile and SteamHistory links; show the overflow count.
-# Snapshot diffs show full totals; the upstream list has no player names.
-# Advance the snapshot only when removals were safely applied.
-# Refresh changed raw bytes alongside the database in the same PR or direct commit.
-# Read-only checks run for every trigger; publishing waits for both Python matrix legs.
-# PR creation requires the Actions setting 'Allow GitHub Actions to create and approve pull requests'.
-# Otherwise the workflow pushes a branch and adds a compare link to the job summary.
-# Alternatively, set BOT_TOKEN with contents and pull-requests write access.
-# Pin actions to full commit SHAs; Dependabot updates the pins and trailing version annotations.
+# Promote eligible matches; demote snapshot-confirmed removals only, preserving manually added cheaters.
+# Keep upstream evidence in the report, never in the database.
+# Advance the byte-exact snapshot only when safe.
+# Read-only checks gate the write-capable sync job.
+# PR creation needs the Actions PR setting or BOT_TOKEN with contents/pull-requests write access.
+# If PR creation fails, the fallback pushes a branch and adds a compare link.
+# Pin actions to commit SHAs; Dependabot updates the pins and release annotations.
 
 on:
   schedule:
     # Run daily at 05:23 UTC to avoid the busy top of the hour.
-    # For a weekly Monday run, use the following cron expression instead:
     - cron: "23 5 * * *"
-    # - cron: "23 5 * * 1"
   workflow_dispatch:
     inputs:
       mode:
@@ -53,7 +42,7 @@ on:
       - "playerlist.scammers.json"
       - "rules.garou3299.json"
       - "snapshot/playerlist.vorobey-hackerpolice.json"
-      # Tests cover the CLI inventory and Dependabot pins; changes to either must trigger checks.
+      # Tests read the README, Dependabot config, and workflow; include each in this filter.
       - "README.md"
       - ".github/dependabot.yml"
       - ".github/workflows/sync-vorobey-hackerpolice.yml"

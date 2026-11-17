@@ -205,8 +205,7 @@ class WorkflowContractTests(unittest.TestCase):
         sync = self.jobs()["sync"]
         self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", sync)
         self.assertIn("ref: ${{ github.event.repository.default_branch }}", sync)
-        # The checks job must not pin its ref; pull requests need their merge
-        # refs tested.
+        # Check pull requests on their merge refs; only sync pins the default branch.
         self.assertNotIn("ref: ${{ github.event.repository.default_branch }}", self.jobs()["checks"])
 
     def test_the_pull_request_targets_the_default_branch_explicitly(self):
@@ -247,8 +246,7 @@ class WorkflowContractTests(unittest.TestCase):
             checks,
         )  # The production runtime version.
         self.assertIn("python-version: ${{ matrix.python-version }}", checks)
-        # Include Python in the concurrency key so matrix legs cannot cancel
-        # each other when a run is superseded.
+        # Keep matrix legs in separate cancellation groups.
         group = next(line for line in checks.splitlines() if line.strip().startswith("group: checks-"))
         self.assertIn("matrix.python-version", group)
         # The production sync job intentionally uses a single Python version.
@@ -261,8 +259,7 @@ class WorkflowContractTests(unittest.TestCase):
             with self.subTest(path=path.relative_to(self.root)):
                 ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10))
 
-        # Verify that the Python 3.10 parser rejects newer syntax; otherwise
-        # this compatibility check could stop detecting unsupported syntax.
+        # Ensure the Python 3.10 parser rejects newer syntax.
         with self.assertRaises(SyntaxError):
             ast.parse("type Alias = int\n", feature_version=(3, 10))
 

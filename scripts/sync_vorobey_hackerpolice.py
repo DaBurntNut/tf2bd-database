@@ -140,7 +140,6 @@ def _open_github_output(path: str) -> TextIO:
     try:
         existing = target.stat()
     except FileNotFoundError:
-        # Create GITHUB_OUTPUT if the runner has not created it.
         pass
     else:
         if not stat.S_ISREG(existing.st_mode):
@@ -243,8 +242,7 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     an exact replica of the upstream file (no encoding/newline translation
     ever touches them).
     """
-    # Resolve symlinks before writing; replacing the link would leave its target unchanged.
-    # Detect loops explicitly so atomic replacement cannot destroy the link.
+    # Resolve symlinks to update their target; reject loops before replacing anything.
     target = path
     if path.is_symlink():
         try:
@@ -392,7 +390,7 @@ def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
             if _same_file(Path(github_output), path):
                 raise SyncError(f"GITHUB_OUTPUT must not be the same file as {flag}")
 
-    # Require existing output directories; a typo must not create a false baseline.
+    # Fail early when an output directory is missing.
     outputs = [("--snapshot", snapshot_path)]
     if args.report:
         outputs.append(("--report", Path(args.report)))
@@ -495,7 +493,6 @@ def run(args: argparse.Namespace) -> int:
     database, original = load_database(database_path)
     index, source, source_bytes = _load_index(args)
 
-    # --- Compare current list with the demotion baseline ---
     snapshot = load_snapshot(snapshot_path)
     previous_index, previous_bytes = snapshot if snapshot is not None else (None, None)
     # Compute the snapshot diff even when demotion is disabled; a first snapshot counts all IDs as new.
@@ -570,8 +567,8 @@ def run(args: argparse.Namespace) -> int:
             raise SyncError(f"cannot write report {display_path(args.report)}: {error_reason(exc)}") from exc
     print(body, end="")
 
-    # Write the database before the snapshot; a fresh baseline must not outlive unapplied changes.
-    # Refresh snapshot-only changes when safe, but retain the baseline when removals are unsafe.
+    # Write the database before advancing the snapshot; skipped demotions remain candidates.
+    # Safe snapshot-only changes still refresh the baseline.
     write_database(database_path, rendered, original, dry_run=args.dry_run)
     _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
     if update_snapshot:

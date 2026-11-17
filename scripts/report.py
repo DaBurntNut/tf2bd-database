@@ -244,8 +244,7 @@ def _name_cell(change: Change) -> str:
     since the SteamID (and therefore the profile) is known even when the
     name is not; only an unusable SteamID renders as plain text.
     """
-    # Show UNKNOWN only when no name is recorded; _cell() escapes link-text markup.
-    name = _shorten(change.name, MAX_NAME_CHARS)  # Apply the display limit before Markdown escaping
+    name = _shorten(change.name, MAX_NAME_CHARS)
     label = "UNKNOWN" if not name.strip() else _cell(name)
     url = steam_profile_url(change.steamid)
     if url is None:
@@ -504,7 +503,7 @@ def _with_removed_table(lines: list[str], steamids: Sequence[str], limit: int = 
     if not table:
         return lines
     while lines and not lines[-1].strip():
-        lines.pop()  # Ensure exactly one blank line before the new section.
+        lines.pop()
     return [*lines, "", *table]
 
 
@@ -536,7 +535,8 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
 
     def clause(head: str, target: str, steamids: list[str]) -> str:
         if database is None:
-            head = head[:1].upper() + head[1:]  # Capitalize standalone clauses
+            # Capitalize standalone clauses only.
+            head = head[:1].upper() + head[1:]
         return f"{head} for {target}: " + _steamid_list(steamids)
 
     parts: list[str] = []
@@ -577,8 +577,8 @@ class RunInfo:
     changes: tuple[Change, ...] = ()
     # Snapshot provenance and reasons a requested demotion was skipped.
     previous_source_total: int | None = None  # Raw entries in the previous snapshot
-    added_to_source: int = 0  # Distinct usable SteamIDs
-    removed_from_source: int = 0  # Distinct usable SteamIDs
+    added_to_source: int = 0  # Distinct usable IDs added upstream
+    removed_from_source: int = 0  # Distinct usable IDs removed upstream
     # IDs missing upstream since the previous snapshot, even when demotion is skipped.
     removed_upstream: tuple[str, ...] = ()
     demotion_note: str | None = None
@@ -601,7 +601,6 @@ class RunInfo:
         the headline always names the file the run actually writes and no
         repository name is hardcoded here.
         """
-        # Derive the label from the basename so long parent paths cannot change it.
         stem = self.database_path.stem
         head, _, owner = stem.partition(".")
         name = owner if head == "playerlist" and owner else stem
@@ -732,10 +731,9 @@ def _utf8_len(text: str) -> int:
 
 def _truncate_to_bytes(text: str, limit: int) -> str:
     """Longest prefix of ``text`` whose UTF-8 encoding fits in ``limit`` bytes."""
-    # Skip encoding when the byte budget is nonpositive.
     if limit <= 0:
         return ""
-    return text.encode("utf-8", "surrogatepass")[:limit].decode("utf-8", "ignore")  # Ignore invalid UTF-8 sequences
+    return text.encode("utf-8", "surrogatepass")[:limit].decode("utf-8", "ignore")
 
 
 def _fit_body(text: str) -> str:
@@ -815,7 +813,7 @@ def _render_body(
         closing_sentence = render_closing(info.changes, database=info.database_label)
 
     while lines and not lines[-1].strip():
-        lines.pop()  # Ensure one blank line before the closing sentence.
+        lines.pop()
     lines += ["", closing_sentence]
 
     # Count visible rows only; do not reference evidence omitted from the table.

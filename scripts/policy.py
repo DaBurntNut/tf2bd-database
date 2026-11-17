@@ -50,8 +50,7 @@ MAX_EVIDENCE_LINK_CHARS = 500
 MAX_EVIDENCE_LINKS = 10
 
 
-# Preserve only TF2BD's complete automatic racist records when removing the cheater tag.
-# The opening quote is part of the stored record format.
+# Prefix for TF2BD automatic racist records, including the opening reason quote.
 RACIST_PROOF_PREFIX = '[auto] automatically marked: Racist | reason: "'
 # Proof records are single-line; reject embedded separators.
 _LINE_BREAKS = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")

@@ -171,8 +171,7 @@ class UntouchedPathTests(unittest.TestCase):
         self.assertIsNone(sources._unwrap_github_contents_envelope({"encoding": "base64", "content": ""}))
 
     def test_envelope_content_with_line_breaks_still_decodes(self):
-        # GitHub may wrap base64 content across lines; strict validation would
-        # reject valid responses and prevent the fallback.
+        # Accept GitHub's line wrapping while validating the remaining Base64 characters.
         encoded = base64.encodebytes(b'{"players": []}').decode("ascii")
         self.assertIn("\n", encoded)
         self.assertEqual(
@@ -468,10 +467,7 @@ class UntouchedPathTests(unittest.TestCase):
         self.assertEqual(database.read_bytes(), before)  # A validation failure must leave the database unchanged.
 
     def test_policy_keeps_an_entry_whose_attributes_are_not_a_list(self):
-        # Strings are iterable, so an unguarded loop could treat each character as a tag.
-        # Tuples, sets, and dictionaries can also pass superficial shape checks.
-        # Policy helpers should leave these malformed values unchanged rather than
-        # rewriting hand-edited data or crashing while processing it.
+        # Strings and other iterables must not be mistaken for tag lists.
         for attributes in (
             "cheater",
             "suspicious",
@@ -532,10 +528,8 @@ class WriteOrderTests(unittest.TestCase):
             (root / "db.json").write_text(
                 '{"players":[{"attributes":["cheater"],"steamid":"[U:1:1]"}]}', encoding="utf-8"
             )
-            # The symlink targets a missing directory: path checks accept its existing
-            # parent, and snapshot loading treats the dangling link as absent. The write
-            # resolves the link and fails, deterministically exercising a final write
-            # failure even when tests run as root.
+            # A dangling link passes path checks and snapshot loading; writing resolves it
+            # and fails at the missing target, even when tests run as root.
             (root / "snap.json.link").symlink_to(root / "nodir" / "snap.json")
             with contextlib.redirect_stdout(io.StringIO()):  # The CLI prints the report even with --report set.
                 code = main(

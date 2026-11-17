@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-# Clear GitHub Actions' GITHUB_OUTPUT during test imports; output tests inject a temporary path.
+# Isolate tests from Actions output; output tests supply a temporary file.
 os.environ.pop("GITHUB_OUTPUT", None)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 

@@ -496,9 +496,7 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("LINEBREAK_TOKEN", shown)
         self.assertIn("?token=REDACTED.", shown)
 
-        # urlsplit() removes CR, LF, and TAB before parsing; malformed prose URLs
-        # must still redact queries when a control splits the parameter name,
-        # equals sign, or value.
+        # urlsplit() strips CR/LF/TAB; verify redaction when controls split a key, equals sign, or value.
         for split_parameter, secret in (
             ("?to ken=SPLIT_SPACE_NAME_SECRET", "SPLIT_SPACE_NAME_SECRET"),
             ("?to\u2002ken=SPLIT_UNICODE_SPACE_NAME_SECRET", "SPLIT_UNICODE_SPACE_NAME_SECRET"),

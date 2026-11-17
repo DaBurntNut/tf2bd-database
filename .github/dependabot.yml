@@ -1,6 +1,5 @@
-# Dependabot updates full-SHA action pins and their trailing release annotations.
-# It understands the `uses: owner/action@<sha> # vX.Y.Z` format.
-# Scripts use only the standard library; CI tool versions are pinned in the workflow.
+# Dependabot updates SHA-pinned actions and their release annotations.
+# Runtime scripts use only the standard library; CI tools are pinned in the workflow.
 version: 2
 
 updates:
@@ -10,10 +9,8 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
     commit-message:
-      # Reads as "ci: bump actions/checkout from v7.0.0 to v7.0.1".
       prefix: "ci"
-    # One pull request per week for all of them, not one per action: these are
-    # pins in a single file, and reviewing them together is the point.
+    # Group action pins into one weekly review.
     groups:
       github-actions:
         patterns:
