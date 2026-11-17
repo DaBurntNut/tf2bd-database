@@ -389,6 +389,8 @@ class DemoteTests(unittest.TestCase):
         self.assertTrue(is_racist_proof('  [AUTO] Automatically marked: RACIST | reason: "x"  '))
         for value in (
             '[auto] automatically marked: Cheater | reason: "aimbot"',
+            # Unicode long-s casefolds to ASCII "s", but is not part of the machine format.
+            '[auto] automatically marked: Raciſt | reason: "spoofed prefix"',
             "https://youtu.be/x",
             "Racist behavior in voice chat",
             "[auto] automatically marked: Racist",

@@ -66,22 +66,23 @@ def is_racist_proof(proof: str) -> bool:
         [auto] automatically marked: Racist | reason: "<the chat line>"
 
     Matching is forgiving about the ends only: leading/trailing whitespace and
-    letter case are ignored, so a future tool that writes ``[AUTO]
-    Automatically marked: RACIST`` still protects the line. Embedded line
-    breaks are rejected so another proof cannot be appended under the trusted
-    prefix. Anything else -- a video link, "Silent Aim & ESP", a hand-written
-    "Racist behavior..." note, or an auto line whose reason is missing/unquoted
-    -- is NOT a racist proof and is dropped when the cheater tag goes away.
+    ASCII letter case are ignored, so a future tool that writes ``[AUTO]
+    Automatically marked: RACIST`` still protects the line. Non-ASCII lookalikes
+    in the trusted prefix are rejected. Embedded line breaks are rejected so
+    another proof cannot be appended under that prefix. Anything else -- a
+    video link, "Silent Aim & ESP", a hand-written "Racist behavior..." note,
+    or an auto line whose reason is missing/unquoted -- is NOT a racist proof
+    and is dropped when the cheater tag goes away.
     """
     text = proof.strip()
     if _LINE_BREAKS.search(text):
         return False
-    text = text.casefold()
-    prefix = RACIST_PROOF_PREFIX.casefold()
-    if not text.startswith(prefix):
+    prefix_length = len(RACIST_PROOF_PREFIX)
+    prefix = text[:prefix_length]
+    if not prefix.isascii() or prefix.lower() != RACIST_PROOF_PREFIX.lower():
         return False
     # Require the closing quote of a complete record.
-    return len(text) > len(prefix) and text.endswith('"')
+    return len(text) > prefix_length and text.endswith('"')
 
 
 def _filter_racist_proofs(proofs: Any) -> list[str]:

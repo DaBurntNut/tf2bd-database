@@ -101,6 +101,23 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(raw, inner)  # Snapshot the decoded file bytes, not the GitHub API envelope.
         self.assertEqual(len(document["players"]), 1)
 
+    def test_malformed_github_contents_base64_is_rejected_and_uses_fallback(self):
+        inner = b'{"players": [{"steamid": "[U:1:200]", "attributes": ["cheater"]}]}'
+        encoded = base64.b64encode(inner).decode("ascii")
+        for malformed in (f"!{encoded}", f"{encoded}!!!", f"{encoded[:-1]}!"):
+            with self.subTest(content=malformed):
+                envelope = json.dumps(
+                    {
+                        "encoding": "base64",
+                        "content": malformed,
+                        "download_url": "https://example.invalid/raw.json",
+                    }
+                ).encode("utf-8")
+                (document, _, raw), calls = self.fetch([_FakeResponse(envelope), _FakeResponse(self.BODY)])
+                self.assertEqual(raw, self.BODY)
+                self.assertEqual(document["players"][0]["steamid"], "[U:1:100]")
+                self.assertEqual(calls, 2)
+
     def test_non_https_download_url_is_never_followed(self):
         # Treat download_url as untrusted response data; reject plaintext and local
         # targets before opening a follow-up request.
