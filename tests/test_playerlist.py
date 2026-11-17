@@ -92,6 +92,7 @@ class NormalizeSteamIdTests(unittest.TestCase):
     def test_space_warrior_and_steam64(self):
         self.assertEqual(normalize_steamid("STEAM_0:1:865008"), "[U:1:1730017]")
         self.assertEqual(normalize_steamid("steam_0:1:865008"), "[U:1:1730017]")
+        self.assertEqual(normalize_steamid("STEAM_1:1:865008"), "[U:1:1730017]")
         self.assertEqual(normalize_steamid("76561197961995745"), "[U:1:1730017]")
         self.assertEqual(normalize_steamid(76561197961995745), "[U:1:1730017]")
         self.assertEqual(normalize_steamid("https://steamcommunity.com/profiles/76561197961995745"), "[U:1:1730017]")
@@ -122,6 +123,7 @@ class NormalizeSteamIdTests(unittest.TestCase):
 
     def test_bare_account_id_as_string(self):
         self.assertEqual(normalize_steamid("1730017"), "[U:1:1730017]")
+        self.assertEqual(normalize_steamid("0" * 16 + "1"), "[U:1:1]")
         self.assertIsNone(normalize_steamid("0"))
 
     def test_out_of_range_account_ids_are_rejected(self):
@@ -135,6 +137,12 @@ class NormalizeSteamIdTests(unittest.TestCase):
         self.assertIsNone(normalize_steamid("STEAM_0:0:0"))
         self.assertIsNone(normalize_steamid("STEAM_0:1:99999999999"))
         self.assertEqual(normalize_steamid("STEAM_0:1:2147483647"), "[U:1:4294967295]")
+
+    def test_non_public_steam2_universes_cannot_alias_a_public_account(self):
+        """The universe is part of a SteamID; dropping it can name the wrong person."""
+        for universe in range(2, 6):
+            with self.subTest(universe=universe):
+                self.assertIsNone(normalize_steamid(f"STEAM_{universe}:1:865008"))
 
     def test_absurdly_large_int_is_rejected_without_crashing(self):
         self.assertIsNone(normalize_steamid(10**5000))

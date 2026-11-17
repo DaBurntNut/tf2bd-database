@@ -381,6 +381,9 @@ class DemoteTests(unittest.TestCase):
         self.assertFalse(is_racist_proof(prefix))
         self.assertFalse(is_racist_proof("[auto] automatically marked: Racist | reason:"))
         self.assertFalse(is_racist_proof(prefix + 'a "quoted" word but no final delimiter'))
+        for separator in ("\n", "\r", "\u2028", "\u0085"):
+            with self.subTest(separator=repr(separator)):
+                self.assertFalse(is_racist_proof(prefix + 'legitimate reason"' + separator + 'appended proof "'))
         # An empty but CLOSED reason is a complete line, and therefore stays.
         self.assertTrue(is_racist_proof(prefix + '"'))
 
@@ -416,6 +419,7 @@ class DemoteTests(unittest.TestCase):
                         "https://youtu.be/cheating-video",
                         "Silent Aim & ESP",
                         "Racist behavior in voice chat",
+                        '[auto] automatically marked: Racist | reason: "legitimate chat"\n[manual] cheating proof "',
                         "[auto] automatically marked: Racist | reason:",  # truncated
                         "[auto] automatically marked: Racist | reason: no quotes",
                     ],
@@ -602,6 +606,31 @@ class EvidenceTests(unittest.TestCase):
         database = {"players": [player("[U:1:100]", ["suspicious"])]}
         changes = promote(database, index)
         self.assertEqual(changes[0].evidence, ("https://x",))  # de-duplicated, junk dropped
+        self.assertEqual(changes[0].evidence_omitted, 0)
+
+    def test_a_change_retains_only_the_evidence_the_report_can_show(self):
+        links = [f"https://example.invalid/{number}" for number in range(policy.MAX_EVIDENCE_LINKS + 2)]
+        # Duplicates of a rendered link are ignored; remaining proof entries
+        # after the cap are counted without retaining their strings in Change.
+        proofs = [*links, links[0], links[-1]]
+        index = index_of(hackerpolice_entry("[U:1:100]", proofs))
+        database = {"players": [player("[U:1:100]", ["suspicious"])]}
+
+        change = promote(database, index)[0]
+
+        self.assertEqual(change.evidence, tuple(links[: policy.MAX_EVIDENCE_LINKS]))
+        self.assertEqual(change.evidence_omitted, 3)
+        self.assertNotIn(links[-1], change.evidence)
+
+    def test_an_oversized_evidence_value_is_bounded_before_it_is_retained(self):
+        link = "https://example.invalid/" + "x" * 100_000
+        index = index_of(hackerpolice_entry("[U:1:100]", [link]))
+        database = {"players": [player("[U:1:100]", ["suspicious"])]}
+
+        change = promote(database, index)[0]
+
+        self.assertEqual(len(change.evidence[0]), policy.MAX_EVIDENCE_LINK_CHARS + 1)
+        self.assertEqual(change.evidence_omitted, 0)
 
 
 class SyncInvariantTests(unittest.TestCase):

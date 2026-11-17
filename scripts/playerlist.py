@@ -7,9 +7,12 @@ hackerpolice list.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
+import os
 import re
+import stat
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,7 +50,10 @@ _U_BARE_RE = re.compile(rf"^U:1:({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE | re
 _U_INSTANCE_RE = re.compile(
     rf"^\[U:1:({_ACCOUNT_ID_RE.pattern}):({_ACCOUNT_ID_RE.pattern})\]$", re.IGNORECASE | re.ASCII
 )
-_STEAM2_RE = re.compile(rf"^STEAM_[0-5]:([01]):({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE | re.ASCII)
+# Public Steam accounts appear as STEAM_0 (legacy) or STEAM_1. Other
+# universes can reuse the same account number for different identities; dropping
+# their universe component would incorrectly match a public player.
+_STEAM2_RE = re.compile(rf"^STEAM_[01]:([01]):({_ACCOUNT_ID_RE.pattern})$", re.IGNORECASE | re.ASCII)
 _STEAMID64_RE = re.compile(r"^[0-9]{17}$")
 # An entire Steam Community permalink, not a matching substring in arbitrary
 # text or a lookalike host (either could silently alias a victim's SteamID).
@@ -135,6 +141,37 @@ def error_reason(exc: BaseException) -> str:
     return getattr(exc, "strerror", None) or str(exc)
 
 
+def _read_bounded_regular_file(path: Path, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes + 1`` from a regular file, without blocking on a FIFO.
+
+    Refuse known special files before opening them, then open non-blocking and
+    inspect the descriptor too: the path could be replaced after ``stat()``,
+    and a FIFO must never block the open. A device or FIFO is not a
+    database/source file; refusing it avoids a hang or side effect.
+    """
+    try:
+        path_status = path.stat()
+    except FileNotFoundError:
+        # Let os.open produce the same clean missing-path error as other
+        # failures; a broken symlink also follows this path.
+        pass
+    else:
+        if not stat.S_ISREG(path_status.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", os.fspath(path))
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", os.fspath(path))
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return handle.read(max_bytes + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 class PlayerListError(Exception):
     """Raised when a playerlist cannot be read or is structurally invalid."""
 
@@ -188,7 +225,8 @@ def normalize_steamid(value: Any) -> str | None:
     """Return canonical ``[U:1:<account id>]`` form, or ``None`` if unusable.
 
     Accepts canonical ``[U:1:x]``, bare ``U:1:x``, ``[U:1:x:instance]``,
-    ``STEAM_0:y:z``, SteamID64 integers/strings, and complete Steam Community
+    public/legacy ``STEAM_0:y:z`` or ``STEAM_1:y:z``, SteamID64 integers/strings,
+    and complete Steam Community
     ``/profiles/<SteamID64>`` permalinks (optionally with scheme/``www``/slash).
     """
     if isinstance(value, bool):  # bool is an int subclass; not a SteamID
@@ -236,7 +274,11 @@ def normalize_steamid(value: Any) -> str | None:
 
     if _STEAMID64_RE.match(text):
         account = _account_from_steamid64(int(text))
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
+        if account is not None:
+            return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+        # A 17-digit string below the SteamID64 range may still be a
+        # zero-padded bare account ID. Let the bounded account parser decide;
+        # it rejects values whose significant digits exceed the 32-bit range.
 
     if text.isascii() and text.isdigit():
         # Bare account id given as a string, e.g. "1730017" (the int form of
@@ -424,11 +466,10 @@ def load(path: Path) -> tuple[PlayerList, str]:
     matching what ``dumps()`` writes.
     """
     try:
-        # Read at most one byte past the limit: a special file (a device, a
-        # fifo) reports no size at all, so the budget is enforced on the bytes
-        # actually read, exactly like the download path.
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_FILE_BYTES + 1)
+        # Read at most one byte past the limit and reject non-regular files
+        # before reading: a FIFO can block forever, while a device may never
+        # end. The byte budget is still enforced on the bytes actually read.
+        raw = _read_bounded_regular_file(path, MAX_FILE_BYTES)
     except (OSError, ValueError) as exc:
         # ValueError covers a path the operating system cannot even encode (an
         # embedded NUL, a lone surrogate): "this file cannot be read",

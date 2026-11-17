@@ -47,6 +47,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TextIO
 
 from playerlist import PlayerList, PlayerListError, ValidationResult, display_path, dumps, error_reason, load, validate
 from policy import Change, sync
@@ -135,6 +136,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _open_github_output(path: str) -> TextIO:
+    """Open a regular GitHub output file for append without blocking on a special file."""
+    target = Path(path)
+    try:
+        existing = target.stat()
+    except FileNotFoundError:
+        # GITHUB_OUTPUT may not exist yet; O_CREAT below preserves open("a") behavior.
+        pass
+    else:
+        if not stat.S_ISREG(existing.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", os.fspath(target))
+
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(target, flags, 0o666)
+    try:
+        # Recheck the opened object: the path may have changed after stat(),
+        # and opening a FIFO without O_NONBLOCK can hang the whole sync.
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", os.fspath(target))
+        handle = os.fdopen(fd, "a", encoding="utf-8")
+        fd = -1  # the text handle now owns the descriptor
+        return handle
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _write_github_outputs(**outputs: str | int | bool) -> None:
     """Expose step outputs when running inside GitHub Actions."""
     path = os.environ.get("GITHUB_OUTPUT")
@@ -148,7 +177,7 @@ def _write_github_outputs(**outputs: str | int | bool) -> None:
         text = str(value).lower() if isinstance(value, bool) else str(value)
         lines.append(f"{key}={' '.join(text.splitlines())}")
     try:
-        with Path(path).open("a", encoding="utf-8") as handle:
+        with _open_github_output(path) as handle:
             handle.write("\n".join(lines) + "\n")
     except (OSError, ValueError) as exc:
         # Name the output file rather than exposing a bare or oversized OS path.
@@ -158,10 +187,10 @@ def _write_github_outputs(**outputs: str | int | bool) -> None:
 def _check_github_output() -> None:
     """Refuse obvious ``$GITHUB_OUTPUT`` path failures before reading inputs.
 
-    Append-open catches a directory, a missing parent, and permission errors
-    before network or database work begins. It cannot prove a later write will
-    succeed (for example, a full device accepts open), so the real append also
-    happens before the report, database, snapshot, or stdout is written.
+    Append-open catches a directory, special file, missing parent, and
+    permission errors before network or database work begins. It cannot prove
+    a later regular-file write will succeed, so the real append also happens
+    before the report, database, snapshot, or stdout is written.
     """
     path = os.environ.get("GITHUB_OUTPUT")
     if not path:
@@ -170,7 +199,7 @@ def _check_github_output() -> None:
         # Append mode creates the file if the runner has not, and fails exactly
         # the way the real write would (a directory, a missing parent, no
         # permission). Nothing is written.
-        with Path(path).open("a", encoding="utf-8"):
+        with _open_github_output(path):
             pass
     except (OSError, ValueError) as exc:
         raise SyncError(f"cannot write the GitHub step outputs at {display_path(path)}: {error_reason(exc)}") from exc
@@ -238,9 +267,10 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), os.fspath(path)) from exc
     # mkstemp creates the file with O_EXCL and a unique name, so concurrent
     # runs -- separate processes or threads -- never share (and interleave
-    # writes into) one temp file. The final replace is atomic, so readers
-    # only ever see complete files.
-    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    # writes into) one temp file. Keep the prefix short and independent of the
+    # target name: a valid basename near the filesystem's length limit must not
+    # become impossible to write because its temporary name is longer.
+    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".tf2bd-sync-", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -253,12 +283,20 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         # 0644 overrode the operator's umask, so under `umask 077` -- which
         # means "only I may read this" -- the snapshot and the report were
         # created world-readable on a shared machine.
-        if target.exists():
-            mode = stat.S_IMODE(target.stat().st_mode)
+        try:
+            existing = target.stat()
+        except FileNotFoundError:
+            existing_mode = None
         else:
+            if not stat.S_ISREG(existing.st_mode):
+                raise OSError(errno.EINVAL, "not a regular file", os.fspath(path))
+            existing_mode = stat.S_IMODE(existing.st_mode)
+        if existing_mode is None:
             mask = os.umask(0)
             os.umask(mask)  # set-and-restore: os.umask has no read-only form
             mode = 0o666 & ~mask
+        else:
+            mode = existing_mode
         tmp.chmod(mode)
         tmp.replace(target)
         _fsync_directory(target.parent)  # make the rename itself durable
@@ -563,7 +601,7 @@ def run(args: argparse.Namespace) -> int:
             source_skipped=index.skipped,
             dry_run=args.dry_run,
             changes=tuple(changes),
-            previous_source_total=len(previous_index.by_steamid) if previous_index is not None else None,
+            previous_source_total=previous_index.total if previous_index is not None else None,
             added_to_source=added_count,
             removed_from_source=removed_count,
             removed_upstream=tuple(removed_upstream),

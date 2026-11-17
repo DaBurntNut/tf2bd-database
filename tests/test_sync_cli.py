@@ -133,7 +133,7 @@ class UntouchedPathTests(unittest.TestCase):
         local.write_text("{}", encoding="utf-8")
         with (
             mock.patch("sources._OPENER.open", side_effect=[_FakeResponse(SOURCE_BODY)]),
-            mock.patch.object(Path, "open", side_effect=OSError("input/output error")) as open_file,
+            mock.patch("playerlist.os.open", side_effect=OSError("input/output error")) as open_file,
             mock.patch("sources.time.sleep"),
         ):
             _, source, _ = load_first_available_raw([str(local), SOURCE_URL])
@@ -277,6 +277,12 @@ class UntouchedPathTests(unittest.TestCase):
             sync_module._atomic_write_bytes(target, b"{}\n")
         self.assertEqual(list(self.root.iterdir()), [])  # no stale .tmp file
 
+    def test_a_valid_long_basename_can_still_be_written_atomically(self):
+        name_limit = os.pathconf(self.root, "PC_NAME_MAX")
+        target = self.root / ("x" * (name_limit - 5))
+        sync_module._atomic_write_bytes(target, b"long name\n")
+        self.assertEqual(target.read_bytes(), b"long name\n")
+
     def test_write_through_a_symlink_updates_the_target_and_keeps_the_link(self):
         """A symlinked playerlist must be edited, not replaced by a plain file.
 
@@ -310,6 +316,16 @@ class UntouchedPathTests(unittest.TestCase):
             sync_module.write_snapshot(link, b"new\n", None, dry_run=False)
         self.assertIn("too many levels of symbolic links", str(caught.exception).lower())
         self.assertTrue(link.is_symlink())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_atomic_write_refuses_a_fifo_instead_of_replacing_it(self):
+        fifo = self.root / "output.fifo"
+        os.mkfifo(fifo)
+        with self.assertRaises(OSError) as caught:
+            sync_module._atomic_write_bytes(fifo, b"new\n")
+        self.assertIn("not a regular file", str(caught.exception))
+        self.assertTrue(stat.S_ISFIFO(fifo.stat().st_mode))
+        self.assertEqual(list(self.root.iterdir()), [fifo])
 
     def test_a_failed_write_names_the_file_the_operator_asked_for(self):
         """The raw OSError names a temporary file, which explains nothing."""
@@ -694,6 +710,44 @@ class GithubOutputTests(unittest.TestCase):
                 sync_module._write_github_outputs(changed=True)
             self.assertIn("cannot write the GitHub step outputs", str(caught.exception))
 
+    def test_the_open_output_descriptor_is_rechecked_after_path_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "output"
+            target.touch()
+            directory_status = root.stat()
+            with (
+                mock.patch.object(sync_module.os, "fstat", return_value=directory_status),
+                self.assertRaises(OSError) as caught,
+            ):
+                sync_module._open_github_output(str(target))
+            self.assertIn("not a regular file", str(caught.exception))
+            self.assertEqual(target.read_bytes(), b"")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_fifo_output_is_refused_without_waiting_for_a_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp) / "output.fifo"
+            os.mkfifo(fifo)
+            scripts = Path(__file__).resolve().parents[1] / "scripts"
+            code = (
+                f"import sys; sys.path.insert(0, {str(scripts)!r})\n"
+                "import sync_vorobey_hackerpolice as sync\n"
+                "try:\n    sync._check_github_output()\n"
+                "except sync.SyncError as exc:\n    print(exc)\n"
+                "else:\n    raise SystemExit('FIFO unexpectedly accepted')\n"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env={**os.environ, "GITHUB_OUTPUT": str(fifo)},
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not a regular file", result.stdout)
+
     def test_without_the_environment_variable_nothing_is_written(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "output"
@@ -743,13 +797,9 @@ class CliTests(unittest.TestCase):
         return snapshot_file
 
     def test_an_unusable_step_output_file_changes_nothing(self):
-        """An output path that cannot even be opened must fail before any write.
-
-        The early preflight catches a directory deterministically; a separate
-        test covers a path that opens but fails when the actual append flushes.
-        """
+        """A directory output path must fail before any report or data write."""
         target = self.root / "outputs"
-        target.mkdir()  # opening a directory for append fails, like a full disk
+        target.mkdir()
         before = self.database.read_bytes()
         code, _, stderr = self.run_cli("--source", str(self.source), env={"GITHUB_OUTPUT": str(target)})
         self.assertEqual(code, 2)
@@ -758,18 +808,41 @@ class CliTests(unittest.TestCase):
         self.assertFalse((self.root / "snapshot.json").exists(), "nor the snapshot")
 
     @unittest.skipUnless(Path("/dev/full").exists(), "requires the Linux full-device test fixture")
-    def test_a_github_output_write_failure_changes_no_files(self):
-        """Opening GITHUB_OUTPUT can succeed even when its later write cannot.
-
-        /dev/full accepts append-open (so the early preflight passes), then
-        fails on flush with ENOSPC. The real output append must happen before
-        the report, database, or snapshot is written.
-        """
+    def test_a_special_github_output_is_refused_before_any_file_write(self):
+        """A device is not a step-output file, even if it accepts append-open."""
         before = self.database.read_bytes()
         report = self.root / "report.md"
         code, stdout, stderr = self.run_cli(
             "--source", str(self.source), "--report", str(report), env={"GITHUB_OUTPUT": "/dev/full"}
         )
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write the GitHub step outputs", stderr)
+        self.assertIn("not a regular file", stderr)
+        self.assertEqual(stdout, "")
+        self.assertEqual(self.database.read_bytes(), before)
+        self.assertFalse((self.root / "snapshot.json").exists())
+        self.assertFalse(report.exists())
+
+    def test_a_regular_output_write_failure_changes_no_files(self):
+        """A failure after the preflight append still precedes every data write."""
+        output = self.root / "github-output"
+        report = self.root / "report.md"
+        before = self.database.read_bytes()
+        preflight_handle = mock.MagicMock()
+        preflight_handle.__enter__.return_value = mock.MagicMock()
+        preflight_handle.__exit__.return_value = False
+        failing_handle = mock.MagicMock()
+        failing_handle.__enter__.return_value.write.side_effect = OSError("disk full")
+        failing_handle.__exit__.return_value = False
+        with mock.patch.object(
+            sync_module,
+            "_open_github_output",
+            side_effect=[preflight_handle, failing_handle],
+        ) as open_output:
+            code, stdout, stderr = self.run_cli(
+                "--source", str(self.source), "--report", str(report), env={"GITHUB_OUTPUT": str(output)}
+            )
+        self.assertEqual(open_output.call_count, 2)
         self.assertEqual(code, 2)
         self.assertIn("cannot write the GitHub step outputs", stderr)
         self.assertEqual(stdout, "")
@@ -956,6 +1029,17 @@ class CliTests(unittest.TestCase):
             "- Snapshot diff: **2 new SteamIDs added**, **2 SteamIDs removed** (2 → 2 entries; no net change)",
             stdout,
         )
+
+    def test_entry_totals_use_raw_rows_when_snapshot_contains_duplicate_ids(self):
+        self.write_snapshot_fixture(
+            hackerpolice_entry("[U:1:100]"),
+            hackerpolice_entry("[U:1:100]"),
+            hackerpolice_entry("[U:1:200]"),
+        )
+        code, stdout, stderr = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("Previous snapshot: 3 entries; 0 SteamIDs removed upstream", stdout)
+        self.assertIn("(3 → 2 entries; net -1)", stdout)
 
     def test_report_lists_every_removed_steamid_with_its_permalink(self):
         """Every ID gone from the list since the snapshot appears in the

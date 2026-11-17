@@ -7,8 +7,8 @@
 # together, and a reviewer sees which release it means.
 #
 # Nothing else is watched: the scripts have no runtime dependencies (standard
-# library only) and the tooling versions (ruff, mypy) are pinned in the
-# workflow's own `env:` block, where a bump is a visible one-line change.
+# library only), and CI tool versions are pinned in the workflow's `env:` block,
+# where a bump is a visible, reviewable change.
 version: 2
 
 updates:

@@ -21,9 +21,10 @@ Send a permanent Steam profile link or ID **with video evidence** to
 
 Every day at **05:23 UTC** (GitHub can delay the run) it compares this database
 with Vorobey's list and opens a pull request. Scheduled runs do not change the
-default branch until you merge that pull request. A manual run (**Actions → Run
-workflow**) can instead open a pull request, commit directly, or only report a
-dry run.
+default branch until you merge that pull request. A manual run from the default
+branch (**Actions → Run workflow**) can instead open a pull request, commit
+directly, or only report a dry run; a dispatch from another branch runs the
+read-only checks but never the write-capable sync.
 
 | On Vorobey's list | Result |
 | --- | --- |
@@ -74,7 +75,9 @@ it to know who was removed, and refreshes it alongside the database whenever
 the upstream bytes differ (in the same pull request or direct commit). Evidence
 links stay in the pull request: they are shown for review and are never written
 into the database.
-A promotion only ever changes `attributes` — never `proof`.
+A promotion only ever changes `attributes` — never `proof`. Each promotion row
+shows at most 10 distinct upstream evidence links; any remaining proof entries
+are counted as omitted rather than retained in the change record.
 
 The report is kept below GitHub's body limit: each change table stops at 150 rows
 and the removed-ID table at 100, with an `… and N more` overflow note. If needed,
@@ -103,10 +106,10 @@ remains the complete record.
   invalid numeric values, version-dependent integer parsing and silent data loss.
 - **Bounded reads** — HTTPS only (a redirect downgrade or a URL over 4,096
   characters is refused), 64 MiB per download, 30 s, 3 attempts, then the next
-  fallback. The same 64 MiB cap applies
-  to the database and snapshot files it reads from disk, so a runaway file is
-  refused instead of exhausting memory. Credentials in a URL (including nested
-  links in proof text) are redacted before anything is printed or published;
+  fallback. The same 64 MiB cap applies to database, snapshot and local-source
+  files. FIFOs/devices are refused before reading, so a local path cannot hang
+  the run or stream indefinitely. Credentials in a URL (including nested links
+  in proof text) are redacted before anything is printed or published;
   overlong URLs are omitted before parsing, and a URL cannot ping a user with
   `@handle`.
 - **Safe messages** — every value that reaches a log line or the pull request is
@@ -125,11 +128,14 @@ remains the complete record.
   If the runner's output file fails during the append, the run cannot leave an
   unpublished database or snapshot change behind.
 - **Checked changes** — a pull request touching `scripts/`, `tests/`,
-  `playerlist.garou3299.json`, the hackerpolice snapshot,
-  `pyproject.toml`, `.gitattributes`, `README.md`, `.github/dependabot.yml` or
+  `playerlist.garou3299.json`, `playerlist.scammers.json`, `rules.garou3299.json`,
+  the hackerpolice snapshot,
+  `pyproject.toml`, `.gitattributes`, `.gitignore`, `README.md`, `.github/dependabot.yml` or
   the workflow runs ruff, `mypy --strict`,
   a bandit security scan, vulture (dead code) and the tests under a coverage gate
-  that keeps statements *and branches* at 100 %, read-only.
+  that keeps statements *and branches* at 100 %, in a read-only job. The same
+  checks gate every scheduled/manual sync; only the separate sync job gets write
+  permissions.
 - **Pinned actions** — the workflow uses each action at a commit SHA, not at a
   movable tag, and Dependabot bumps those pins weekly; a compromised release in
   someone else's repository cannot run code here with a write token.
@@ -165,10 +171,11 @@ The interface (`--help` prints the long version):
 - `--quiet` / `--verbose` — log level (`-q` / `-v`)
 - `--version`, `--help`
 
-Exit `0` means success and `130` means you interrupted it (Ctrl-C; no output
-file is half-written, and the handler cleans up its temporaries). Exit `2` means
-the run refused or failed — bad input, two paths pointing at the same file, a
-source that is not HTTPS, or an output that cannot be written. Outputs are
+Exit `0` means success. Exit `130` means you interrupted it (Ctrl-C; no report,
+database or snapshot file is left half-written, and the handler cleans up its
+temporary files). Exit `2` means the run refused or failed: bad input, two paths
+pointing at the same file, an invalid/unreadable source (plain HTTP is refused),
+or an output that cannot be written. Outputs are
 written in report → database → snapshot order. A failure can leave an earlier
 atomic output updated (including the report, or the database if the final
 snapshot write fails), but the snapshot can never advance before the database.

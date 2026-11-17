@@ -5,10 +5,10 @@ __pycache__/
 .coverage
 .pyright_cache/
 
-# Atomic-write temporaries (..playerlist.garou3299.json.<random>.tmp). The
-# scripts remove them on handled failures and Ctrl-C; SIGTERM/SIGKILL cannot run
-# that cleanup, so keep any leftover out of `git add -A`.
-.*.tmp
+# Atomic-write temporaries (.tf2bd-sync-<random>.tmp). The scripts remove them
+# on handled failures and Ctrl-C; SIGTERM/SIGKILL cannot run that cleanup, so
+# keep any leftover out of `git add -A`.
+.tf2bd-sync-*.tmp
 
 # Local testing aid, deliberately not shipped: a catalogue of every message the
 # bot can print, used to spot drift between the code and its documentation. It

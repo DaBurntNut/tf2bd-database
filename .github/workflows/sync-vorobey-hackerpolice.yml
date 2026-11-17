@@ -28,9 +28,9 @@ name: Sync Vorobey hackerpolice
 # bot/PR is needed; a weekly snapshot PR could race this workflow and erase the
 # removals it is supposed to detect.
 #
-# Any pull request that touches the scripts, the tests or this workflow also
-# runs the lint + test job ("Lint and test the proposed change"), read-only and
-# without touching the database, so broken code cannot be merged unreviewed.
+# A read-only lint/test job runs on every trigger, including before any sync.
+# The write-capable job waits for both Python matrix legs and installs no
+# third-party Python tools, keeping publishing credentials away from those tools.
 #
 # Creating pull requests with the default GITHUB_TOKEN requires this repository
 # setting to be enabled (Settings -> Actions -> General -> Workflow permissions):
@@ -78,18 +78,18 @@ on:
         type: boolean
         default: false
 
-  # Lint and test every PROPOSED change too, so a pull request can never be
-  # merged with broken code (the scheduled job below only checks the code
-  # after it already reached the default branch). Watch both code/configuration
-  # and the database/snapshot the bot consumes; unrelated repository assets
-  # skip the full check matrix.
+  # Check every proposed change and every scheduled/manual sync against the
+  # exact files the job consumes. Unrelated repository assets skip PR checks.
   pull_request:
     paths:
       - "scripts/**"
       - "tests/**"
       - "pyproject.toml"
       - ".gitattributes"
+      - ".gitignore"
       - "playerlist.garou3299.json"
+      - "playerlist.scammers.json"
+      - "rules.garou3299.json"
       - "snapshot/playerlist.vorobey-hackerpolice.json"
       # Both are read by the suite (the CLI inventory and the Dependabot
       # contract): without them here, a pull request touching only those files
@@ -99,14 +99,12 @@ on:
       - ".github/workflows/sync-vorobey-hackerpolice.yml"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
-# Pinned tool versions, shared by EVERY job: the lint/type-check steps are
-# identical in both, and a version bumped in one place but not the other would
-# mean a pull request is validated against different tools than the sync runs.
-# The values reach the steps through the environment (never interpolated into
-# a shell line), so they are plain strings here.
+# Pinned tool versions for the read-only checks matrix. The same versions are
+# used on both supported Python legs, so a change cannot pass one leg only due
+# to tool drift. Values reach install steps through the environment, not shell
+# interpolation.
 env:
   RUFF_VERSION: "0.17.4"
   MYPY_VERSION: "2.4.1"
@@ -117,11 +115,11 @@ env:
   VULTURE_VERSION: "2.16"
 
 jobs:
-  # Read-only sibling of the sync job: runs the same lint + test steps on a
-  # proposed change, without touching any file, branch or pull request.
+  # Read-only preflight for every event. Publishing waits for this matrix, so
+  # failures cannot reach the write-capable sync job, and the test tools never
+  # run with a token that can write to the repository.
   checks:
-    name: Lint and test the proposed change
-    if: github.event_name == 'pull_request'
+    name: ${{ github.event_name == 'pull_request' && 'Lint and test the proposed change' || 'Lint and test before publishing' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -132,10 +130,9 @@ jobs:
       matrix:
         # Test the floor the README promises AND the version the bot runs on.
         # With only 3.12 in the matrix, a 3.11+ API (datetime.UTC, tomllib) or a
-        # 3.12-only f-string keeps CI green while breaking the promise for
-        # everyone on the floor -- and the sync job, which is the only place
-        # that really executes the code, also runs 3.12, so nothing would ever
-        # notice. The sync job stays on 3.12 on purpose: that is production.
+        # 3.12-only f-string would break the documented floor. The sync job
+        # itself stays on 3.12 as the production runtime; these checks exercise
+        # the code on both that version and the minimum supported version.
         python-version: ["3.10", "3.12"]
     # Own concurrency group: a pull request must never queue behind the nightly
     # sync (which shares the group below for up to 10 minutes), and a newer
@@ -150,6 +147,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tests need no GitHub token after checkout; do not leave even a
+          # read-only credential in .git/config for third-party tools or tests.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -189,9 +190,16 @@ jobs:
 
   sync:
     name: Check Vorobey hackerpolice list
-    if: github.event_name != 'pull_request'
+    needs: checks
+    # workflow_dispatch can target a non-default branch, whose workflow file
+    # may be modified independently. Only the default-branch workflow gets the
+    # write-capable sync job; pinning checkout alone would not pin this YAML.
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
     # Only sync runs share a group: two of them must never write the database
     # at once. This sits on the JOB, not on the workflow: a workflow-level
     # group would make pull-request check runs queue behind the nightly sync,
@@ -225,37 +233,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Lint (ruff)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "ruff==${RUFF_VERSION}"
-          python3 -m ruff check scripts tests
-          python3 -m ruff format --check scripts tests
-
-      - name: Type-check (mypy, strict)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "mypy==${MYPY_VERSION}"
-          python3 -m mypy scripts
-
-      - name: Security scan (bandit)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "bandit==${BANDIT_VERSION}"
-          python3 -m bandit -q -r scripts
-
-      - name: Run unit tests under the coverage gate
-        # `coverage report` reads its thresholds from pyproject.toml and fails
-        # below them: 100% of statements AND branches. A guard's error path is
-        # the code that runs when something has already gone wrong, so "every
-        # line ran" is not enough -- the branch has to run too.
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "coverage==${COVERAGE_VERSION}"
-          python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
-          python3 -m coverage report
-
-      - name: Dead code (vulture)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "vulture==${VULTURE_VERSION}"
-          python3 -m vulture scripts tests --min-confidence 60
-
       - name: Sync database with Vorobey hackerpolice list
         id: sync
         # No third-party dependencies at runtime: the scripts only use the
@@ -287,10 +264,8 @@ jobs:
         id: pr
         # A missing PR permission is handled by the fallback step below.
         continue-on-error: true
-        # steps.sync.outcome is what keeps a red run from publishing: without it
-        # these steps also run when the sync step was SKIPPED (e.g. a failing
-        # lint/test step above), printing a misleading "Nothing to publish"
-        # line -- or publishing from a run whose own checks failed.
+        # Explicitly gate on the sync result: this action publishes only after
+        # the data-changing step itself completed successfully.
         if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE != 'commit'
         uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
         with:
@@ -369,6 +344,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit directly to the default branch
+        id: direct_commit
         if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE == 'commit'
         run: |
           set -euo pipefail
@@ -386,9 +362,9 @@ jobs:
         # A previous run may have opened a pull request that was never merged.
         # If a later run finds no work, that pull request is stale: merging its
         # old database/snapshot could undo a manual fix or newer upstream state.
-        # A successful direct-commit run also supersedes any old bot PR, so
-        # close it after the commit as well. A dry run must never close one.
-        if: steps.sync.outcome == 'success' && env.DRY_RUN_INPUT != 'true' && (env.MODE == 'commit' || steps.sync.outputs.changed != 'true')
+        # A successful direct-commit run also supersedes any old bot PR. Do not
+        # close it if the commit or push failed, and never close one on a dry run.
+        if: steps.sync.outcome == 'success' && env.DRY_RUN_INPUT != 'true' && (steps.sync.outputs.changed != 'true' || (env.MODE == 'commit' && steps.direct_commit.outcome == 'success'))
         # Cleanup must never turn an otherwise clean run red: a token without
         # pull-request access fails here and the failure stays visible, but the
         # database has already been synced correctly.

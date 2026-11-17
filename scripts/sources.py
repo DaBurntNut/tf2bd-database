@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
+import html
 import http.client
 import json
 import logging
@@ -28,7 +30,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
-from playerlist import MAX_FILE_BYTES, display_path, error_reason, normalize_steamid, strict_json_loads
+from playerlist import (
+    MAX_FILE_BYTES,
+    _read_bounded_regular_file,
+    display_path,
+    error_reason,
+    normalize_steamid,
+    strict_json_loads,
+)
 
 SOURCE_REPO_URL = "https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json"
 
@@ -41,11 +50,12 @@ DEFAULT_SOURCES: tuple[str, ...] = (
 )
 
 # Single source of truth for the tool version (also used for --version and the
-# HTTP User-Agent). 4.3 is a minor bump: no flag was added or removed, but the
-# behaviour a user sees changed (an interrupted run now exits 130 with one line
-# instead of a stack trace, error messages name the file that is actually wrong,
-# and the review text is inert as Markdown).
-VERSION = "4.3"
+# HTTP User-Agent). 5.0 is a major bump: the unsafe --include-proof flag was
+# removed, so promotions can no longer write upstream evidence into the
+# database. The run's interruption/error handling and review text were also
+# hardened: Ctrl-C exits 130 without a traceback, errors name the relevant file,
+# and report text is inert as Markdown.
+VERSION = "5.0"
 
 USER_AGENT = (
     f"Garou3299-tf2bd-database-vorobey-hackerpolice-sync/{VERSION} (+https://github.com/Garou3299/tf2bd-database)"
@@ -277,8 +287,7 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     except (OSError, ValueError) as exc:
         raise SyncError(f"cannot read {display_path(path)}: {error_reason(exc)}") from exc
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_FILE_BYTES + 1)
+        raw = _read_bounded_regular_file(path, MAX_FILE_BYTES)
     except (OSError, ValueError) as exc:
         raise SyncError(f"cannot read {display_path(path)}: {error_reason(exc)}") from exc
     if len(raw) > MAX_FILE_BYTES:
@@ -307,6 +316,7 @@ _SECRET_QUERY_PARAM = re.compile(
     re.IGNORECASE,
 )
 _PERCENT_ESCAPE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
+_SAFE_QUERY_NAME = re.compile(r"[A-Za-z0-9_.-]+", re.ASCII)
 
 
 def _normalised_query_name(name: str) -> str | None:
@@ -321,16 +331,20 @@ def _normalised_query_name(name: str) -> str | None:
     # The first parse_qsl/unquote_plus pass has already happened for URL pairs.
     # A few consumers decode keys more than once, so inspect a small bounded
     # number of additional percent-encoding layers rather than allowing
-    # ``to%250Aken`` to disguise the same key as ``to\nken``.
+    # ``to%250Aken`` to disguise the same key as ``to\nken``. HTML character
+    # references can spell the same separators (``to&#x6e;ken``) and URL
+    # delimiters (``token&#x3d;SECRET``), so inspect those at every layer too.
     for _ in range(_MAX_NESTED_URL_DEPTH):
-        next_decoded = urllib.parse.unquote(decoded)
+        next_decoded = _html_unescape_bounded(urllib.parse.unquote(decoded))
+        if next_decoded is None:
+            return None
         if next_decoded == decoded:
             break
         decoded = next_decoded
     if _PERCENT_ESCAPE.search(decoded):
         # A later consumer may decode more layers. An unresolved escape in a
         # parameter name is ambiguous, so treat it as sensitive rather than
-        # risking a token hidden just beyond our inspection budget.
+        # risking a token hidden just beyond our budget.
         return None
     return "".join(char for char in decoded if unicodedata.category(char)[0] not in {"C", "Z"}).casefold()
 
@@ -358,26 +372,39 @@ def _no_surrogates(value: str) -> str:
     return _SURROGATES.sub("\ufffd", value)
 
 
-# Line terminators, bidi overrides and invisible format characters must never
-# appear raw in a URL that is printed. ``--source`` can carry any byte, and this
-# URL is written to the CI log and pull request: controls can forge a line,
-# bidi can reverse its apparent meaning, and invisible characters can disguise
-# a different target. Percent-encoding keeps it faithful and unambiguous.
-_URL_CONTROLS = re.compile(
-    r"[\x00-\x1f\x7f\x85\u00ad\u061c\u180e\u200b\u200e-\u200f\u2028-\u202e"
-    r"\u2060-\u2064\u2066-\u2069\ufeff\ufff9-\ufffb\U000e0000-\U000e007f]"
-)
+def _html_unescape_bounded(value: str) -> str | None:
+    """Decode a bounded number of nested HTML character-reference layers."""
+    for _ in range(_MAX_NESTED_URL_DEPTH):
+        decoded = html.unescape(value)
+        if decoded == value:
+            return value
+        value = decoded
+    # Do not inspect or echo a still-encoded value whose structure might appear
+    # only after another decoding pass.
+    return None if html.unescape(value) != value else value
+
+
+# Line terminators and invisible format characters must never appear raw in a
+# URL that is printed. ``--source`` can carry untrusted text, and URLs are
+# written to the CI log and pull request: controls can forge a line, bidi marks
+# can reverse its apparent meaning, and format characters (including joiners)
+# can disguise a different target. Detect Unicode categories rather than a
+# hand-maintained character list so newly assigned format characters are safe.
 _URL_IN_TEXT = re.compile(r"(?:(?:[a-z][a-z0-9+.-]*:)?//)[^\s<>\"'`]+", re.IGNORECASE | re.ASCII)
-# A malformed URL embedded in prose may be split across lines. The normal URL
-# scanner stops at whitespace, so separately redact query secrets even when a
-# newline split the URL just before its parameter.
+# A malformed URL embedded in prose may be split at whitespace. The normal
+# URL scanner stops there, so separately redact query secrets even when a
+# control or Unicode line separator breaks the URL before its parameter.
 _QUERY_PARAM_IN_TEXT = re.compile(
     r"(?P<separator>[?&#;])"
-    r"(?P<name>(?:[^\s?&#;=<>\"'`]|[\r\n\t])+)="
-    # urllib strips CR/LF/TAB from an embedded URL before parsing it. Treat
-    # those same controls as invisible inside a credential name/value here, or
-    # a prose URL split at that byte can expose the rest of the secret.
-    r"(?P<value>[^&;#\s<>\"'`]*(?:[\r\n\t]+[^&;#\s<>\"'`]+)*)"
+    # Query-key normalization drops whitespace and invisible separators, so
+    # include them here too: ``?to ken=secret`` can normalize to ``token`` in
+    # a downstream consumer. This scanner runs only on bounded display text.
+    r"(?P<name>[^?&#;=]+)="
+    # The value extends to the next query/fragment delimiter. Spaces, quotes,
+    # controls, and markup punctuation may be encoded or normalized by a URL
+    # consumer, so stopping at one could expose the rest of a credential. This
+    # can over-redact nearby prose in malformed text, but never leaks a suffix.
+    r"(?P<value>[^&;#]*)"
 )
 # urlsplit() ignores raw newlines while parsing, but the prose scanner treats
 # them as boundaries. Catch a userinfo password split by one before scanning.
@@ -388,8 +415,20 @@ _MULTILINE_USERINFO_IN_TEXT = re.compile(
 
 
 def _one_line(value: str) -> str:
-    """Percent-encode line-breaking, bidi and invisible characters in a URL."""
-    return _URL_CONTROLS.sub(lambda match: "".join(f"%{byte:02X}" for byte in match.group().encode("utf-8")), value)
+    """Percent-encode controls, separators, and every Unicode format character.
+
+    Format characters include zero-width joiners/non-joiners. They are kept in
+    player names where they can be meaningful, but must be visible when they
+    appear in a URL target. ``_no_surrogates`` runs before this function, so
+    every encoded character has a valid UTF-8 representation.
+    """
+    pieces: list[str] = []
+    for char in value:
+        if unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"}:
+            pieces.extend(f"%{byte:02X}" for byte in char.encode("utf-8"))
+        else:
+            pieces.append(char)
+    return "".join(pieces)
 
 
 # How much of a URL is ever shown. Every URL that reaches a log line or the
@@ -428,7 +467,9 @@ def _redact_nested_url(value: str, depth: int) -> str:
 
     if not has_url_markers(candidate):
         for _ in range(_MAX_NESTED_URL_DEPTH):
-            decoded = urllib.parse.unquote(candidate)
+            decoded = _html_unescape_bounded(urllib.parse.unquote(candidate))
+            if decoded is None:
+                return "[nested URL omitted: too deep to inspect safely]"
             if decoded == candidate:
                 break
             candidate = decoded
@@ -438,7 +479,7 @@ def _redact_nested_url(value: str, depth: int) -> str:
     if not has_url_markers(candidate):
         if _PERCENT_ESCAPE.search(candidate):
             # A nested URL can be encoded more times than this bounded scan.
-            # Do not echo the still-encoded value: a downstream decoder could
+            # Do not echo a still-encoded value: a downstream decoder could
             # reveal credentials that we have not inspected.
             return "[nested URL omitted: too deep to inspect safely]"
         return value
@@ -461,8 +502,14 @@ def _sanitised_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tup
     safe_items: list[tuple[str, str]] = []
     changed = False
     for name, value in items:
-        safe_name = _no_surrogates(name)
-        safe_value = REDACTED if _has_sensitive_query_name(name) else _no_surrogates(_redact_nested_url(value, depth))
+        sensitive = _has_sensitive_query_name(name)
+        # Keep ordinary credential parameter names readable, but don't echo an
+        # obfuscated key that contains a second delimiter or embedded value
+        # (for example ``token%3DSECRET``). The secret may be in the *name*, not
+        # only after the parser's first equals sign.
+        safe_name = name if not sensitive or _SAFE_QUERY_NAME.fullmatch(name) else "REDACTED"
+        safe_name = _no_surrogates(safe_name)
+        safe_value = REDACTED if sensitive else _no_surrogates(_redact_nested_url(value, depth))
         changed |= safe_name != name or safe_value != value
         safe_items.append((safe_name, safe_value))
     return safe_items, changed
@@ -482,6 +529,16 @@ def _redact_url(url: str, depth: int) -> str:
     """
     if len(url) > _MAX_URL_PARSE_CHARS:
         return "[URL omitted: too long to inspect safely]"
+    original_url = url
+    # URL values are also rendered inside Markdown. HTML character references
+    # can spell structural delimiters there, bypassing urlsplit's userinfo
+    # detection (``user&#x3a;PASS&#x40;host``) or the query parser's equals sign
+    # (``?token&#x3d;SECRET``). Parse a bounded decoded view for redaction; when
+    # no credentials are found, the original spelling is preserved below.
+    decoded_url = _html_unescape_bounded(url)
+    if decoded_url is None:
+        return "[URL omitted: too deeply encoded to inspect safely]"
+    url = decoded_url
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
@@ -522,7 +579,7 @@ def _redact_url(url: str, depth: int) -> str:
             fragment = urllib.parse.urlencode(safe_items)
 
     if netloc == parts.netloc and query == parts.query and fragment == parts.fragment:
-        shown = url  # nothing to hide: hand back the caller's string untouched
+        shown = original_url  # nothing to hide: hand back the caller's string untouched
     else:
         shown = urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
     # Always encodable and always one line, whatever the caller passed.
@@ -556,9 +613,14 @@ def _redact_multiline_userinfo(match: re.Match[str]) -> str:
 
 def _redact_text_query_parameter(match: re.Match[str]) -> str:
     """Redact secret-looking query pairs even if malformed URL text is split."""
-    name = urllib.parse.unquote_plus(_no_surrogates(match.group("name")))
+    raw_name = match.group("name")
+    name = urllib.parse.unquote_plus(_no_surrogates(raw_name))
     if not _has_sensitive_query_name(name):
         return match.group()
+    # As in _sanitised_pairs, a sensitive key can itself carry an encoded
+    # delimiter and the secret after it. Keep only an ordinary parameter name;
+    # otherwise replace the whole name rather than exposing that text.
+    safe_name = raw_name if _SAFE_QUERY_NAME.fullmatch(raw_name) else "REDACTED"
     value = match.group("value")
     end = len(value)
     while end and value[end - 1] in ".,:!?":
@@ -568,20 +630,35 @@ def _redact_text_query_parameter(match: re.Match[str]) -> str:
         while end and value[end - 1] == closer and balance > 0:
             end -= 1
             balance -= 1
-    return f"{match.group('separator')}{match.group('name')}=REDACTED{value[end:]}"
+    return f"{match.group('separator')}{safe_name}=REDACTED{value[end:]}"
 
 
-def _redact_urls_in_text(text: str, depth: int) -> str:
+def _redact_urls_in_text(text: str, depth: int, *, decode_entities: bool = True) -> str:
     """Redact text while carrying the current nested-URL depth."""
     if len(text) > _MAX_URL_PARSE_CHARS:
         return "[URL omitted: too long to inspect safely]"
+    if decode_entities:
+        decoded = _html_unescape_bounded(text)
+        if decoded is None:
+            return "[URL omitted: too deeply encoded to inspect safely]"
+        if decoded != text:
+            # A character reference can hide even the URL scheme's colon, so
+            # inspect a decoded view too. Keep the caller's original prose if
+            # no redaction was needed; entity spellings in ordinary text are
+            # data and are escaped by the report renderer separately.
+            safe_decoded = _redact_urls_in_text(decoded, depth, decode_entities=False)
+            if safe_decoded != decoded:
+                return safe_decoded
     text = _MULTILINE_USERINFO_IN_TEXT.sub(_redact_multiline_userinfo, text)
     # Avoid parsing arbitrary prose as a URL: urlsplit can treat "Context:" as
     # a scheme and normalize its casing. A standalone query/fragment-shaped
     # value is still passed through the regular redactor; embedded URLs are
     # handled one at a time so surrounding prose stays byte-for-byte intact.
     stripped = text.strip()
-    if not any(char.isspace() for char in stripped) and ("?" in stripped or "#" in stripped):
+    has_html_reference = html.unescape(stripped) != stripped
+    if not any(char.isspace() for char in stripped) and (
+        "?" in stripped or ("#" in stripped and not has_html_reference)
+    ):
         text = _redact_url(text, depth)
     text = _URL_IN_TEXT.sub(lambda match: _redact_url_occurrence(match, depth), text)
     return _QUERY_PARAM_IN_TEXT.sub(_redact_text_query_parameter, text)
@@ -703,6 +780,11 @@ def _fetch_bytes(url: str) -> bytes:
                 raise _ShortRead(f"received {len(body):,} of {declared:,} bytes")
             return body
         except urllib.error.HTTPError as exc:
+            # HTTPError owns the response body. Close it before retrying or
+            # falling back so failed requests do not retain sockets/file handles.
+            if exc.fp is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    exc.close()
             last_error = exc
             if exc.code != 429 and not 500 <= exc.code < 600:
                 break  # permanent: don't waste attempts, fall back sooner
@@ -734,17 +816,16 @@ def _read_bytes(source: str) -> bytes:
     """Return the raw bytes of an HTTP(S) URL or a local path, raising SyncError.
 
     The size limit is enforced on the bytes ACTUALLY READ, not on the size the
-    filesystem reports: a file can grow between the two calls, and a special
-    file (a device, a fifo) reports 0 while yielding endless data. Reading at
-    most ``MAX_SOURCE_BYTES + 1`` bytes makes the local path obey exactly the
-    same budget as a download.
+    filesystem reports: a file can grow between calls. Only regular files are
+    accepted, opened non-blocking, so a FIFO cannot hang the sync and a device
+    cannot yield an endless stream. Reading at most ``MAX_SOURCE_BYTES + 1``
+    bytes makes the local path obey the same budget as a download.
     """
     if http_scheme(source):
         return _fetch_bytes(source)
     LOGGER.debug("Reading %s from disk.", _redact_source(source))
     try:
-        with Path(source).open("rb") as handle:
-            raw = handle.read(MAX_SOURCE_BYTES + 1)
+        raw = _read_bounded_regular_file(Path(source), MAX_SOURCE_BYTES)
     except (OSError, ValueError) as exc:
         # ValueError: a path the OS cannot encode (embedded NUL, lone
         # surrogate) -- a refusal like any other unreadable source.
@@ -797,12 +878,18 @@ def _github_blob_url(source: str, sha: Any) -> str | None:
 
 
 def _document_from(raw: bytes, source: str) -> tuple[dict[str, Any], bytes] | None:
-    """Parse ``raw`` and return it only when it is a playerlist document."""
+    """Parse ``raw`` and return it only when it has a usable SteamID.
+
+    An empty or all-malformed inline playerlist is not a successful resolution:
+    the Contents API envelope may still offer a valid download URL or blob.
+    """
     try:
         document = _parse_document(raw, source)
     except SyncError:
         return None
-    return (document, raw) if isinstance(document.get("players"), list) else None
+    if not isinstance(document.get("players"), list) or not _has_usable_steamids(document):
+        return None
+    return document, raw
 
 
 def _resolve_indirect_document(document: dict[str, Any], source: str) -> tuple[dict[str, Any], bytes] | None:

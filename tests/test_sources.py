@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import base64
 import http.client
+import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from email.message import Message
 from pathlib import Path
@@ -130,12 +135,37 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(len(document["players"]), 1)
         self.assertEqual(calls, 2)
 
+    def test_unusable_inline_playerlist_falls_back_to_download_url(self):
+        for inner in (b'{"players": []}', b'{"players": [{"steamid": "not-a-steamid"}]}'):
+            with self.subTest(inner=inner):
+                envelope = json.dumps(
+                    {
+                        "encoding": "base64",
+                        "content": base64.b64encode(inner).decode("ascii"),
+                        "download_url": "https://example.invalid/raw.json",
+                    }
+                ).encode("utf-8")
+                (document, source, raw), calls = self.fetch([_FakeResponse(envelope), _FakeResponse(self.BODY)])
+                self.assertEqual(source, self.URL)
+                self.assertEqual(raw, self.BODY)
+                self.assertEqual(len(document["players"]), 1)
+                self.assertEqual(calls, 2)
+
     def test_redact_url_strips_credentials_only(self):
         self.assertEqual(sources.redact_url("https://u:secret@h.example/x?y=1"), "https://h.example/x?y=1")
         self.assertEqual(sources.redact_url("https://u:secret@[::1]/x"), "https://[::1]/x")
         self.assertEqual(sources.redact_url("https://u:secret@[::1]:8443/x"), "https://[::1]:8443/x")
         self.assertEqual(sources.redact_url("https://h.example:8443/x"), "https://h.example:8443/x")
         self.assertEqual(sources.redact_url("playerlist.garou3299.json"), "playerlist.garou3299.json")
+
+    def test_all_unicode_format_characters_are_visible_in_url_output(self):
+        """Future or rarely used format characters must not disguise targets."""
+        for character in ("\u200c", "\u200d", "\u206a", "\u070f"):
+            with self.subTest(character=f"U+{ord(character):04X}"):
+                shown = sources.redact_url(f"https://example.invalid/{character}path")
+                encoded = "".join(f"%{byte:02X}" for byte in character.encode("utf-8"))
+                self.assertIn(encoded, shown)
+                self.assertNotIn(character, shown)
 
     def test_redact_url_hides_a_token_carried_in_the_query_string(self):
         """This URL is published in the pull request body: ?token=... must not be."""
@@ -145,6 +175,70 @@ class SourceFetchTests(unittest.TestCase):
         # A harmless parameter keeps its value, so the line still identifies
         # what was fetched.
         self.assertIn("ref=main", redacted)
+
+    def test_html_character_references_cannot_hide_url_credentials(self):
+        """Markdown's character references can spell URL delimiters."""
+        probes = (
+            (
+                "https://example.invalid/list?token&#x3d;HTML_QUERY_SECRET",
+                "HTML_QUERY_SECRET",
+                "token=REDACTED",
+            ),
+            (
+                "https://example.invalid/list?ref&#x3d;main&#x26;access_token&#x3d;HTML_TOKEN_SECRET",
+                "HTML_TOKEN_SECRET",
+                "ref=main",
+            ),
+            (
+                "https://user&#x3a;HTML_USERINFO_PASSWORD&#x40;example.invalid/watch",
+                "HTML_USERINFO_PASSWORD",
+                "https://example.invalid/watch",
+            ),
+        )
+        for url, secret, safe_text in probes:
+            with self.subTest(url=url):
+                shown = sources.redact_url(url)
+                self.assertNotIn(secret, shown)
+                self.assertIn(safe_text, shown)
+
+        harmless = "https://example.invalid/list?ref&#x3d;main"
+        self.assertEqual(sources.redact_url(harmless), harmless)
+
+        embedded = sources.redact_urls_in_text(
+            "Proof: https&#x3a;//user&#x3a;HTML_TEXT_PASSWORD&#x40;example.invalid/watch"
+        )
+        self.assertNotIn("HTML_TEXT_PASSWORD", embedded)
+        self.assertIn("https://example.invalid/watch", embedded)
+
+    def test_over_encoded_html_delimiters_are_omitted_fail_closed(self):
+        def overencode(entity):
+            for _ in range(sources._MAX_NESTED_URL_DEPTH + 2):
+                entity = entity.replace("&", "&amp;")
+            return entity
+
+        delimiter = overencode("&#x3d;")
+        shown = sources.redact_url(f"https://example.invalid/x?token{delimiter}OVER_ENCODED_HTML_SECRET")
+        self.assertNotIn("OVER_ENCODED_HTML_SECRET", shown)
+        self.assertIn("too deeply encoded", shown)
+
+        # A percent-encoded query key is decoded by parse_qsl before the
+        # sensitive-name check; unresolved entities there must fail closed too.
+        key = urllib.parse.quote(f"token{delimiter}KEY_SECRET", safe="")
+        shown = sources.redact_url(f"https://example.invalid/x?{key}=ignored")
+        self.assertNotIn("KEY_SECRET", shown)
+        self.assertNotIn("ignored", shown)
+        self.assertIn("REDACTED=REDACTED", shown)
+
+        # Encoded scheme separators in a nested URL are bounded independently.
+        nested = f"https{overencode('&colon;')}{overencode('&sol;&sol;')}user:NESTED_HTML_PASSWORD@client.invalid/path"
+        nested_url = "https://example.invalid/?redirect_uri=" + urllib.parse.quote(nested, safe="")
+        shown = sources.redact_url(nested_url)
+        self.assertNotIn("NESTED_HTML_PASSWORD", shown)
+        self.assertIn("nested URL omitted", urllib.parse.unquote_plus(shown))
+
+        text = sources.redact_urls_in_text(f"?token{delimiter}TEXT_HTML_SECRET")
+        self.assertNotIn("TEXT_HTML_SECRET", text)
+        self.assertIn("too deeply encoded", text)
 
     def test_redact_url_hides_presigned_s3_credentials(self):
         url = (
@@ -218,6 +312,18 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("OVER_ENCODED_SECRET", shown)
         self.assertIn("REDACTED", shown)
 
+    def test_an_encoded_equals_cannot_hide_a_secret_inside_a_parameter_name(self):
+        shown = sources.redact_url("https://example.invalid/x?token%3DKEY_SECRET=ignored")
+        self.assertNotIn("KEY_SECRET", shown)
+        self.assertNotIn("ignored", shown)
+        self.assertIn("REDACTED=REDACTED", shown)
+
+        # The malformed/prose fallback must not echo the same obfuscated key.
+        shown = sources.redact_urls_in_text("Context: ?token%3DPROSE_KEY_SECRET=VALUE")
+        self.assertNotIn("PROSE_KEY_SECRET", shown)
+        self.assertNotIn("VALUE", shown)
+        self.assertIn("?REDACTED=REDACTED", shown)
+
     def test_a_harmless_parameter_keeps_its_value(self):
         for name in ("ref", "dl", "y", "client_id", "path", "download", "branch"):
             with self.subTest(name=name):
@@ -269,7 +375,7 @@ class SourceFetchTests(unittest.TestCase):
         report = render_report(RunInfo(Path("db.json"), "https://example.invalid/list.json", 1, 0, False, (change,)))
         self.assertNotIn("NAME_PASSWORD", report)
         self.assertNotIn("NAME_TOKEN", report)
-        self.assertIn("clip https://example.invalid/watch?token=REDACTED", report)
+        self.assertIn("clip `https://example.invalid/watch?token=REDACTED`", report)
 
     def test_redact_url_matches_a_secret_parameter_name_case_insensitively(self):
         self.assertIn("REDACTED", sources.redact_url("https://example.invalid/x?Token=abc"))
@@ -377,10 +483,21 @@ class SourceFetchTests(unittest.TestCase):
         # URLs must therefore redact the same query even when a control splits
         # the parameter name, its equals sign, or its value.
         for split_parameter, secret in (
+            ("?to ken=SPLIT_SPACE_NAME_SECRET", "SPLIT_SPACE_NAME_SECRET"),
+            ("?to\u2002ken=SPLIT_UNICODE_SPACE_NAME_SECRET", "SPLIT_UNICODE_SPACE_NAME_SECRET"),
             ("?to\nken=SPLIT_NAME_SECRET", "SPLIT_NAME_SECRET"),
+            ("?to\tken=SPLIT_TAB_NAME_SECRET", "SPLIT_TAB_NAME_SECRET"),
+            ("?to\vken=SPLIT_VERTICAL_TAB_NAME_SECRET", "SPLIT_VERTICAL_TAB_NAME_SECRET"),
+            ("?to\fken=SPLIT_FORM_FEED_NAME_SECRET", "SPLIT_FORM_FEED_NAME_SECRET"),
             ("?token\n=SPLIT_EQUALS_SECRET", "SPLIT_EQUALS_SECRET"),
             ("?token=\nSPLIT_VALUE_SECRET", "SPLIT_VALUE_SECRET"),
             ("?token=LEFT\nRIGHT_VALUE_SECRET", "RIGHT_VALUE_SECRET"),
+            ("?token=LEFT RIGHT_SPACE_SECRET", "RIGHT_SPACE_SECRET"),
+            ("?token=LEFT\tRIGHT_TAB_SECRET", "RIGHT_TAB_SECRET"),
+            ("?token=LEFT\vRIGHT_VERTICAL_TAB_SECRET", "RIGHT_VERTICAL_TAB_SECRET"),
+            ("?token=LEFT\fRIGHT_FORM_FEED_SECRET", "RIGHT_FORM_FEED_SECRET"),
+            ('?token=LEFT"RIGHT_QUOTED_SECRET', "RIGHT_QUOTED_SECRET"),
+            ("?token=LEFT<RIGHT_MARKUP_SECRET", "RIGHT_MARKUP_SECRET"),
         ):
             with self.subTest(split_parameter=split_parameter):
                 shown = sources.redact_urls_in_text("Proof: https://example.invalid/" + split_parameter)
@@ -549,6 +666,7 @@ class SourceFetchTests(unittest.TestCase):
             "https://example.invalid/x?y=\nforged",
             "https://example.invalid/a\u2028b",
             "https://example.invalid/a\x85b",
+            "https://example.invalid/a\u009b31mb",
             "https://example.invalid/a\x00b",
             "https://example.invalid/a\u202eb",
             "https://example.invalid/a\u200bb",
@@ -559,6 +677,7 @@ class SourceFetchTests(unittest.TestCase):
             self.assertNotIn("\n", shown)
             self.assertNotIn("\u202e", shown)
             self.assertNotIn("\u200b", shown)
+            self.assertNotIn("\u009b", shown)
 
     def test_http_scheme_is_case_insensitive_and_blank_for_a_local_path(self):
         """RFC 3986 schemes are case-insensitive, and urllib agrees."""
@@ -819,12 +938,54 @@ class SourceFetchTests(unittest.TestCase):
             with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError):
                 load_first_available_raw([str(path)])
 
-    @unittest.skipUnless(Path("/dev/zero").exists(), "needs a zero-size endless file")
-    def test_special_file_reporting_zero_size_is_still_capped(self):
-        """/dev/zero reports st_size 0 but never ends: the cap must apply to bytes READ."""
-        with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError) as raised:
-            load_first_available_raw(["/dev/zero"])
-        self.assertIn("larger than the", str(raised.exception))
+    @unittest.skipUnless(Path("/dev/zero").exists(), "needs a special file")
+    def test_special_files_are_refused_before_opening(self):
+        """A device is not a source file, even if a byte cap could bound its output."""
+        real_open = os.open
+        with (
+            mock.patch("playerlist.os.open", wraps=real_open) as open_file,
+            self.assertRaises(SyncError) as raised,
+        ):
+            sources._read_bytes("/dev/zero")
+        self.assertIn("not a regular file", str(raised.exception))
+        open_file.assert_not_called()
+
+    @unittest.skipUnless(Path("/dev/zero").exists(), "needs a special file")
+    def test_the_open_descriptor_is_checked_against_a_path_replacement(self):
+        """The fstat check closes the race after the initial path stat."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "source.json"
+            path.write_bytes(b'{"players": []}')
+            special_status = Path("/dev/zero").stat()
+            with (
+                mock.patch("playerlist.os.fstat", return_value=special_status),
+                self.assertRaises(SyncError) as raised,
+            ):
+                sources._read_bytes(str(path))
+        self.assertIn("not a regular file", str(raised.exception))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_fifo_input_is_refused_without_waiting_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp) / "source.fifo"
+            os.mkfifo(fifo)
+            scripts = Path(__file__).resolve().parents[1] / "scripts"
+            code = (
+                f"import sys; sys.path.insert(0, {str(scripts)!r})\n"
+                "import sources\n"
+                f"try:\n    sources._read_bytes({str(fifo)!r})\n"
+                "except sources.SyncError as exc:\n    print(exc)\n"
+                "else:\n    raise SystemExit('FIFO unexpectedly accepted')\n"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not a regular file", result.stdout)
 
     def test_malformed_urls_are_clean_errors_not_crashes(self):
         # Bad IPv6 literals / control characters make urllib raise
@@ -906,6 +1067,30 @@ class SourceFetchTests(unittest.TestCase):
         ):
             load_first_available_raw([self.URL])
         self.assertEqual(urlopen.call_count, 1)
+
+    def test_http_error_response_body_is_closed(self):
+        body = io.BytesIO(b"server error body")
+        error = urllib.error.HTTPError(self.URL, 503, "unavailable", Message(), body)
+        with (
+            mock.patch("sources._OPENER.open", side_effect=[error]),
+            mock.patch("sources.FETCH_ATTEMPTS", 1),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
+        self.assertTrue(body.closed)
+
+    def test_http_error_without_a_response_body_is_still_handled(self):
+        error = urllib.error.HTTPError(self.URL, 404, "not found", Message(), None)
+        # urllib's constructor substitutes an empty StringIO for None; mimic an
+        # error with no owned response stream to exercise the cleanup guard.
+        error.fp = None
+        with (
+            mock.patch("sources._OPENER.open", side_effect=[error]),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
 
     def test_https_downgrade_redirect_is_refused(self):
         """A redirect from HTTPS to plain HTTP must never be followed: the

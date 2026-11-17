@@ -31,6 +31,7 @@ from report import (
     MAX_ATTRIBUTE_CHARS,
     MAX_CHANGE_TABLE_ROWS,
     MAX_EVIDENCE_LINK_CHARS,
+    MAX_EVIDENCE_LINKS,
     MAX_REMOVED_TABLE_ROWS,
     MAX_REPORT_BYTES,
     RunInfo,
@@ -86,13 +87,14 @@ def _code_span_ranges(text):
 
 class ReportTests(unittest.TestCase):
     def info(self, changes=(), *, source="https://example.invalid/list.json", **kwargs):
-        return RunInfo(
-            database_path=Path("playerlist.garou3299.json"),
-            source=source,
-            source_total=10,
-            changes=tuple(changes),
-            **{"source_skipped": 0, "dry_run": False, **kwargs},
-        )
+        values = {
+            "source_total": 10,
+            "source_skipped": 0,
+            "dry_run": False,
+            "changes": tuple(changes),
+            **kwargs,
+        }
+        return RunInfo(database_path=Path("playerlist.garou3299.json"), source=source, **values)
 
     def test_ansi_escapes_cannot_repaint_the_job_log(self):
         """The workflow `cat`s this report into the job log: ESC must not survive."""
@@ -149,6 +151,8 @@ class ReportTests(unittest.TestCase):
             "\u00ad",  # soft hyphen
             "\u061c",  # Arabic letter mark
             "\u180e",  # Mongolian vowel separator
+            "\u206a",  # deprecated invisible formatting control
+            "\u070f",  # Syriac abbreviation mark
             "\U000e0041",  # Unicode tag character
             "\ufff9",  # interlinear annotation anchor
         ):
@@ -171,6 +175,13 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("\x07", report)
         self.assertNotIn("\x08", report)
 
+    def test_c1_controls_in_names_are_neutralised(self):
+        """U+009B is the 8-bit CSI control, not a printable name character."""
+        change = Change("[U:1:100]", "Good\u009b31mBAD", ("suspicious",), ("cheater",))
+        report = render_report(self.info([change]))
+        self.assertNotIn("\u009b", report)
+        self.assertIn("Good 31mBAD", report)
+
     def test_legitimate_unicode_is_left_alone(self):
         """Hardening must not mangle real names: Cyrillic, emoji, ZWJ sequences."""
         names = ["Игрок", "名前", "\U0001f468\u200d\U0001f469\u200d\U0001f467", "Ünïcode"]
@@ -186,13 +197,19 @@ class ReportTests(unittest.TestCase):
             "p",
             ("suspicious",),
             ("cheater",),
-            evidence=("https://example.invalid/\x1b[31mx", "https://example.invalid/a\u202eb"),
+            evidence=(
+                "https://example.invalid/\x1b[31mx",
+                "https://example.invalid/a\u202eb",
+                "https://example.invalid/csi\u009b31m",
+            ),
         )
         report = render_report(self.info([change]))
         self.assertNotIn("\x1b", report)
         self.assertNotIn("\u202e", report)
+        self.assertNotIn("\u009b", report)
         self.assertIn("%1B", report)  # ESC
         self.assertIn("%E2%80%AE", report)  # U+202E, as UTF-8 bytes
+        self.assertIn("%C2%9B", report)  # U+009B, as UTF-8 bytes
 
     def test_attributes_cannot_carry_control_characters_into_the_report(self):
         change = Change("[U:1:100]", "p", ("suspicious\x1b",), ("cheater",))
@@ -383,7 +400,13 @@ class ReportTests(unittest.TestCase):
 
     def test_snapshot_diff_shows_added_removed_and_net(self):
         report = render_report(
-            self.info(previous_source_total=100, added_to_source=12, removed_from_source=3, snapshot_changed=True)
+            self.info(
+                source_total=109,
+                previous_source_total=100,
+                added_to_source=12,
+                removed_from_source=3,
+                snapshot_changed=True,
+            )
         )
         self.assertIn(
             "- Snapshot diff: **12 new SteamIDs added**, **3 SteamIDs removed** (100 → 109 entries; net +9)",
@@ -391,8 +414,17 @@ class ReportTests(unittest.TestCase):
         )
 
     def test_snapshot_diff_singular_and_negative_net(self):
-        report = render_report(self.info(previous_source_total=100, added_to_source=1, removed_from_source=2))
+        report = render_report(
+            self.info(source_total=99, previous_source_total=100, added_to_source=1, removed_from_source=2)
+        )
         self.assertIn("**1 new SteamID added**, **2 SteamIDs removed** (100 → 99 entries; net -1)", report)
+
+    def test_entry_totals_use_actual_rows_when_duplicate_ids_change_the_count(self):
+        """Raw row totals can differ from unique-ID additions/removals."""
+        report = render_report(
+            self.info(source_total=2, previous_source_total=3, added_to_source=1, removed_from_source=1)
+        )
+        self.assertIn("(3 → 2 entries; net -1)", report)
 
     def test_snapshot_diff_initial_snapshot_without_previous(self):
         report = render_report(self.info(added_to_source=10, snapshot_changed=True))
@@ -401,6 +433,7 @@ class ReportTests(unittest.TestCase):
     def test_counts_use_thousands_separators(self):
         report = render_report(
             self.info(
+                source_total=13542,
                 previous_source_total=12345,
                 added_to_source=1200,
                 removed_from_source=3,
@@ -408,7 +441,7 @@ class ReportTests(unittest.TestCase):
                 snapshot_changed=True,
             )
         )
-        self.assertIn("Vorobey hackerpolice list (10 entries)", report)  # source_total stays exact
+        self.assertIn("Vorobey hackerpolice list (13,542 entries)", report)  # raw row total stays exact
         self.assertIn("- Previous snapshot: 12,345 entries", report)
         self.assertIn("**1,200 new SteamIDs added**", report)
         self.assertIn("(12,345 → 13,542 entries; net +1,197)", report)
@@ -448,6 +481,14 @@ class ReportTests(unittest.TestCase):
         report = render_report(info)
         self.assertIn("- Fetched from: https://example.invalid/list.json?x=1", report)
         self.assertNotIn("ghp_secret", report)
+
+    def test_html_entities_cannot_hide_fetch_url_credentials(self):
+        report = render_report(
+            self.info(source="https://example.invalid/list.json?token&#x3d;HTML_QUERY_SECRET&amp;ref&#x3d;main")
+        )
+        self.assertNotIn("HTML_QUERY_SECRET", report)
+        self.assertIn("token=REDACTED", report)
+        self.assertIn("ref=main", report)
 
     def test_snapshot_only_change_is_reported_as_such(self):
         report = render_report(self.info(snapshot_changed=True))
@@ -648,6 +689,37 @@ class ReportTests(unittest.TestCase):
             headline = next(line for line in report.split("\n") if "promoted to" in line)
             self.assertIn("database:**", headline)
 
+    def test_untrusted_labels_and_notes_cannot_autolink(self):
+        """Names, file labels, and path-bearing notes are data, not links."""
+        for name in ("https://evil.example", "www.evil.example"):
+            with self.subTest(name=name):
+                change = Change("[U:1:1]", name, ("suspicious",), ("cheater",))
+                row = next(
+                    line for line in render_report(self.info([change])).splitlines() if line.startswith("| `[U:1:1]`")
+                )
+                self.assertIn(f"[`{name}`](https://steamcommunity.com/", row)
+
+        for path, label in (
+            ("playerlist.https:evil.example.json", "Https:evil.example"),
+            ("playerlist.www.evil.example.json", "Www.evil.example"),
+        ):
+            with self.subTest(path=path):
+                info = RunInfo(
+                    database_path=Path("/tmp") / path,
+                    source="https://example.invalid/list.json",
+                    source_total=1,
+                    source_skipped=0,
+                    dry_run=False,
+                    changes=(Change("[U:1:1]", "player", ("suspicious",), ("cheater",)),),
+                    demotion_note="skipped because of https://evil.example and www.evil.example",
+                )
+                report = render_report(info)
+                headline = next(line for line in report.splitlines() if "promoted to" in line)
+                note = next(line for line in report.splitlines() if "Demotion:" in line)
+                self.assertIn(f"`{label}`", headline)
+                self.assertIn("`https://evil.example`", note)
+                self.assertIn("`www.evil.example`", note)
+
     def test_a_url_cannot_inject_a_link_into_the_fetch_line(self):
         """The "Fetched from" line carries a URL, which can come from upstream.
 
@@ -659,6 +731,12 @@ class ReportTests(unittest.TestCase):
         self.assertIn("\\[click\\]", line)
         self.assertNotIn("[click](https://elsewhere.example)", report)
 
+    def test_a_local_source_that_looks_like_a_url_is_not_autolinked(self):
+        source = "www.evil.example/playerlist.json"
+        report = render_report(self.info(source=source))
+        line = next(line for line in report.splitlines() if "Fetched from" in line)
+        self.assertIn(f"Fetched from: `{source}`", line)
+
     def test_report_never_emits_raw_html(self):
         """Markdown previews that escape HTML would show the tag as literal text."""
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://x/1", "https://x/2"))
@@ -667,22 +745,38 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("<br/>", report)
         self.assertNotIn("<br />", report)
 
-    def test_prose_evidence_is_not_turned_into_a_link(self):
-        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("seen spinbotting",))
-        report = render_report(self.info([change]))
-        self.assertIn("| seen spinbotting |", report)
-        self.assertNotIn("[proof](seen spinbotting)", report)
+    def test_prose_evidence_is_not_turned_into_a_link_or_unnecessarily_fenced(self):
+        for proof in ("seen spinbotting", "Reason: watched in-game"):
+            with self.subTest(proof=proof):
+                change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), (proof,))
+                report = render_report(self.info([change]))
+                self.assertIn(f"| {proof} |", report)
+                self.assertNotIn(f"[proof]({proof})", report)
 
-    def test_invisible_characters_are_percent_encoded_in_link_targets(self):
-        """A proof URL is a link target too, so it gets the same treatment.
+    def test_autolink_literals_cannot_make_invalid_evidence_clickable(self):
+        """GFM can link URI schemes and bare www.*; invalid proof stays inert."""
+        for proof in ("www.evil.example/tracker", "ftp://evil.example/tracker", "mailto:evil@example.com"):
+            with self.subTest(proof=proof):
+                report = render_report(self.info([Change("[U:1:1]", "a", ("suspicious",), ("cheater",), (proof,))]))
+                row = next(line for line in report.splitlines() if line.startswith("| `[U:1:1]`"))
+                self.assertIn(f"`{proof}`", row)
+                self.assertNotIn(f"]({proof})", report)
+                self.assertNotIn("Proof link", report)
 
-        A zero-width space in a URL is invisible; two different targets then
-        look identical, and the raw character lands in the published body.
-        """
-        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://youtu.be/\u200babc",))
-        report = render_report(self.info([change]))
-        self.assertIn("%E2%80%8B", report)
-        self.assertNotIn("\u200b", report)
+    def test_invisible_format_characters_are_encoded_in_link_targets(self):
+        """Even meaningful joiners must be visible when they alter a URL."""
+        for character in ("\u200b", "\u200c", "\u200d", "\u206a", "\u070f"):
+            with self.subTest(character=f"U+{ord(character):04X}"):
+                url = f"https://youtu.be/{character}abc"
+                change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), (url,))
+                report = render_report(self.info([change]))
+                encoded = "".join(f"%{byte:02X}" for byte in character.encode("utf-8"))
+                self.assertIn(encoded, report)
+                self.assertNotIn(character, report)
+
+                # Defense in depth: even direct link rendering must make every
+                # Unicode format character visible in the destination.
+                self.assertIn(encoded, report_module._markdown_link(url, "proof"))
 
     def test_link_targets_are_escaped(self):
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://example.invalid/a (b)",))
@@ -714,6 +808,7 @@ class ReportTests(unittest.TestCase):
             "https://example.invalid/\u00a0b",
             "https://bad%host.invalid/path",
             "https://example.invalid/%GG",
+            "https://example.invalid/?ref&#x3d;main",
             "https://[::1/path",
             "//example.invalid/path",
         ):
@@ -748,6 +843,21 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("Proof link", report)
         row = next(line for line in report.splitlines() if line.startswith("| `[U:1:1]`"))
         self.assertIn("`https://example.invalid/x?access_token=REDACTED`", row)
+
+    def test_html_entities_cannot_hide_credentials_in_a_proof_link(self):
+        links = (
+            "https://user&#x3a;HTML_USERINFO_PASSWORD&#x40;example.invalid/watch",
+            "https://example.invalid/watch?token&#x3d;HTML_QUERY_SECRET",
+            "https://example.invalid/watch?ref&#x3d;main",
+        )
+        report = render_report(self.info([Change("[U:1:1]", "a", ("suspicious",), ("cheater",), links)]))
+        self.assertNotIn("HTML_USERINFO_PASSWORD", report)
+        self.assertNotIn("HTML_QUERY_SECRET", report)
+        self.assertNotIn("[proof 1]", report)
+        self.assertNotIn("[proof 2]", report)
+        self.assertNotIn("[proof 3]", report)
+        self.assertIn("https://example.invalid/watch", report)
+        self.assertIn("token=REDACTED", report)
 
     def test_newline_in_the_fetch_url_cannot_inject_a_report_line(self):
         # The fetch URL can be an upstream-supplied download_url, so a newline
@@ -1071,6 +1181,23 @@ class ReportTests(unittest.TestCase):
             self.assertNotIn(" more", report)
             self.assertEqual(report.count("https://discord.com/channels/1/2/"), count)
 
+    def test_omitted_upstream_evidence_is_counted_after_policy_caps_storage(self):
+        links = tuple(f"https://discord.com/channels/1/2/{n}" for n in range(MAX_EVIDENCE_LINKS))
+        change = Change(
+            "[U:1:1000]",
+            "name",
+            ("suspicious",),
+            ("cheater",),
+            evidence=links,
+            evidence_omitted=3,
+        )
+
+        report = render_report(self.info([change]))
+        row = next(line for line in report.splitlines() if line.startswith("| `[U:1:1000]`"))
+
+        self.assertEqual(row.count("https://discord.com/channels/1/2/"), MAX_EVIDENCE_LINKS)
+        self.assertIn("and 3 more evidence entries", row)
+
     def test_a_report_that_already_fits_is_never_shrunk(self):
         """The reduced caps only kick in when the body really is too big."""
         changes = [Change(f"[U:1:{1000 + n}]", f"n{n}", ("suspicious",), ("cheater",)) for n in range(5)]
@@ -1342,6 +1469,7 @@ class ClosingMessageTests(unittest.TestCase):
         cases = {
             "playerlist.garou3299.json": "Garou3299",
             "/tmp/some/dir/playerlist.garou3299.json": "Garou3299",
+            f"/{'a' * 220}/playerlist.garou3299.json": "Garou3299",
             "mylist.json": "Mylist",
             "playerlist.json": "Playerlist",
             # A file whose owner part is empty falls back to the whole stem.
@@ -1357,6 +1485,18 @@ class ClosingMessageTests(unittest.TestCase):
                     dry_run=False,
                 )
                 self.assertEqual(info.database_label, expected)
+
+        info = RunInfo(
+            database_path=Path("x" * (report_module.MAX_DATABASE_LABEL_CHARS + 10) + ".json"),
+            source="https://example.invalid/list.json",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+        )
+        self.assertEqual(
+            info.database_label,
+            "X" + "x" * (report_module.MAX_DATABASE_LABEL_CHARS - 1) + "…",
+        )
 
     def test_headlines_name_the_database_and_read_as_sentences(self):
         promote = Change("[U:1:400]", "a", ("suspicious",), ("cheater",), kind="promote")

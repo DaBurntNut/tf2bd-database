@@ -15,6 +15,7 @@ request only, so a promotion can never add a proof line to an entry.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +35,8 @@ DROPPED_ATTRIBUTE = "suspicious"
 PROMOTED_TO = "cheater"
 
 __all__ = [
+    "MAX_EVIDENCE_LINKS",
+    "MAX_EVIDENCE_LINK_CHARS",
     "RACIST_PROOF_PREFIX",
     "Change",
     "demote",
@@ -41,6 +44,14 @@ __all__ = [
     "promote",
     "sync",
 ]
+
+# Keep only evidence the report can render. The upstream proof list is
+# untrusted and can be very large; copying every unique URL into each Change
+# record needlessly amplifies memory use during report generation. One extra
+# character beyond the report's display cap lets the renderer mark a shortened
+# value with an ellipsis without retaining an arbitrarily large upstream string.
+MAX_EVIDENCE_LINK_CHARS = 500
+MAX_EVIDENCE_LINKS = 10
 
 
 # The ONLY proof lines that justify the ``racist`` tag on their own. When a
@@ -54,6 +65,9 @@ __all__ = [
 # hand-mangled one ("... | reason:" with nothing after it) is not the machine
 # record that justifies a racist tag, and it goes with the rest.
 RACIST_PROOF_PREFIX = '[auto] automatically marked: Racist | reason: "'
+# A TF2BD chat-message proof is a single line. Reject line separators so a
+# forged prefix cannot shelter unrelated evidence on a later line.
+_LINE_BREAKS = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
 def is_racist_proof(proof: str) -> bool:
@@ -66,12 +80,16 @@ def is_racist_proof(proof: str) -> bool:
 
     Matching is forgiving about the ends only: leading/trailing whitespace and
     letter case are ignored, so a future tool that writes ``[AUTO]
-    Automatically marked: RACIST`` still protects the line. Anything else -- a
-    video link, "Silent Aim & ESP", a hand-written "Racist behavior..." note, or
-    an auto line whose reason is missing/unquoted -- is NOT a racist proof and
-    is dropped when the cheater tag goes away.
+    Automatically marked: RACIST`` still protects the line. Embedded line
+    breaks are rejected so another proof cannot be appended under the trusted
+    prefix. Anything else -- a video link, "Silent Aim & ESP", a hand-written
+    "Racist behavior..." note, or an auto line whose reason is missing/unquoted
+    -- is NOT a racist proof and is dropped when the cheater tag goes away.
     """
-    text = proof.strip().casefold()
+    text = proof.strip()
+    if _LINE_BREAKS.search(text):
+        return False
+    text = text.casefold()
     prefix = RACIST_PROOF_PREFIX.casefold()
     if not text.startswith(prefix):
         return False
@@ -111,15 +129,37 @@ class Change:
     after: tuple[str, ...]
     evidence: tuple[str, ...] = ()
     kind: str = "promote"
+    evidence_omitted: int = 0
 
 
-def _evidence_links(entry: dict[str, Any]) -> tuple[str, ...]:
-    """Proof links the Vorobey hackerpolice list recorded for one player (de-duplicated)."""
+def _evidence_links(entry: dict[str, Any]) -> tuple[tuple[str, ...], int]:
+    """Return bounded, de-duplicated evidence links and the omitted-entry count."""
     proofs = entry.get("proof")
     if not isinstance(proofs, list):
-        return ()
-    links = (item.strip() for item in proofs if isinstance(item, str) and item.strip())
-    return tuple(dict.fromkeys(links))
+        return (), 0
+
+    links: list[str] = []
+    shown: set[str] = set()
+    omitted = 0
+    for item in proofs:
+        if not isinstance(item, str):
+            continue
+        link = item.strip()
+        if not link:
+            continue
+        if len(link) > MAX_EVIDENCE_LINK_CHARS + 1:
+            link = link[: MAX_EVIDENCE_LINK_CHARS + 1]
+        if link in shown:
+            continue
+        if len(links) < MAX_EVIDENCE_LINKS:
+            shown.add(link)
+            links.append(link)
+        else:
+            # Once the display budget is full, don't retain every distinct
+            # upstream URL just to compute a count. Count additional entries;
+            # duplicates of already-shown links are filtered above.
+            omitted += 1
+    return tuple(links), omitted
 
 
 def promote(database: PlayerList, index: HackerpoliceIndex) -> list[Change]:
@@ -168,7 +208,7 @@ def promote(database: PlayerList, index: HackerpoliceIndex) -> list[Change]:
         after = tuple(order_attributes({*before, PROMOTED_TO} - {DROPPED_ATTRIBUTE}))
         player["attributes"] = list(after)
 
-        evidence = _evidence_links(entry)
+        evidence, evidence_omitted = _evidence_links(entry)
 
         changes.append(
             Change(
@@ -177,6 +217,7 @@ def promote(database: PlayerList, index: HackerpoliceIndex) -> list[Change]:
                 before=before,
                 after=after,
                 evidence=evidence,
+                evidence_omitted=evidence_omitted,
             )
         )
 

@@ -23,6 +23,7 @@ import sync_vorobey_hackerpolice as sync_module
 from playerlist import (
     dumps,
     load,
+    strict_json_loads,
     validate,
 )
 from policy import is_racist_proof
@@ -32,12 +33,12 @@ from sources import (
 
 
 class WorkflowContractTests(unittest.TestCase):
-    """The workflow is code too, and only the schedule ever executes it.
+    """The workflow is code too, and part of the bot's behavior and security.
 
     A renamed CLI flag, a step output nobody writes any more, a report path that
-    drifted from the pull-request body, an unpinned action or a job that stopped
-    running the tests would all break the bot silently -- GitHub only finds out
-    when the cron fires. Pin the contract in the suite instead.
+    drifted from the pull-request body, an unpinned action or a check that no
+    longer gates publishing could break the bot silently. Pin the contract in
+    the suite instead.
     """
 
     root = Path(__file__).resolve().parent.parent
@@ -124,8 +125,8 @@ class WorkflowContractTests(unittest.TestCase):
     def test_a_change_to_any_file_the_suite_reads_runs_the_checks(self):
         """Every file these tests read must be able to trigger them.
 
-        README/dependabot contracts and the shipped database/snapshot are
-        validated here. If any of those paths fall out of the workflow filter,
+        README/dependabot contracts and the shipped JSON data are validated
+        here. If any of those paths fall out of the workflow filter,
         a data- or documentation-only pull request could bypass its assertion.
         """
         block = self.workflow.split("  pull_request:\n", 1)[1].split("\npermissions:", 1)[0]
@@ -138,7 +139,10 @@ class WorkflowContractTests(unittest.TestCase):
         for name in (
             "README.md",
             ".gitattributes",
+            ".gitignore",
             "playerlist.garou3299.json",
+            "playerlist.scammers.json",
+            "rules.garou3299.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
             ".github/dependabot.yml",
             ".github/workflows/sync-vorobey-hackerpolice.yml",
@@ -160,34 +164,46 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIsNotNone(match, f"{key} is not defined")
             self.assertTrue((self.root / match.group(1)).is_file(), match.group(1))
 
-    def test_both_jobs_run_the_full_check_suite(self):
+    def test_read_only_checks_gate_the_write_capable_sync_job(self):
+        """Third-party test tools must never run with credentials that can write."""
         jobs = self.jobs()
         self.assertEqual(set(jobs), {"checks", "sync"})
+        checks, sync = jobs["checks"], jobs["sync"]
+        self.assertIn("Lint and test the proposed change", checks)  # preserve the existing PR check context
+        self.assertIn("Lint and test before publishing", checks)
+        self.assertRegex(self.workflow, r"(?m)^permissions:\n  contents: read$")
+        for command in (
+            "python3 -m ruff check scripts tests",
+            "python3 -m ruff format --check scripts tests",
+            "python3 -m mypy scripts",
+            "python3 -m bandit -q -r scripts",
+            "python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v",
+            "python3 -m coverage report",
+            "python3 -m vulture scripts tests --min-confidence 60",
+        ):
+            self.assertIn(command, checks)
+            self.assertNotIn(command, sync)
+        self.assertIn("needs: checks", sync)
+        self.assertIn("contents: read", checks)
+        self.assertIn("persist-credentials: false", checks)
+        self.assertNotIn("pull-requests: write", checks)
+        self.assertIn("contents: write", sync)
+        self.assertIn("pull-requests: write", sync)
+        self.assertNotIn("pip install", sync)
         for name, block in jobs.items():
-            for command in (
-                "python3 -m ruff check scripts tests",
-                "python3 -m ruff format --check scripts tests",
-                "python3 -m mypy scripts",
-                "python3 -m bandit -q -r scripts",
-                "python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v",
-                "python3 -m coverage report",
-                "python3 -m vulture scripts tests --min-confidence 60",
-            ):
-                self.assertIn(command, block, f"the {name} job does not run: {command}")
             self.assertIn("timeout-minutes:", block, f"the {name} job has no timeout")
             self.assertIn("concurrency:", block, f"the {name} job has no concurrency group")
 
     def test_the_sync_job_always_acts_on_the_default_branch(self):
-        """A dispatch from a feature branch must not commit or open a PR there.
+        """A non-default workflow ref must never reach the write-capable job.
 
-        actions/checkout follows the branch a workflow_dispatch was started
-        from. With no explicit ref, "commit the change" would commit to that
-        branch, and create-pull-request (whose base defaults to the checked-out
-        branch) would open a pull request against it -- a bot commit on someone's
-        feature branch, or a pull request that can never be merged into the
-        default branch. The sync maintains the default branch, and says so.
+        Pinning actions/checkout protects the data being updated, but does not
+        pin the workflow YAML that GitHub loaded for a manual dispatch. Only a
+        run whose workflow ref is the default branch may receive write
+        permissions; checkout and PR base are also explicitly pinned there.
         """
         sync = self.jobs()["sync"]
+        self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", sync)
         self.assertIn("ref: ${{ github.event.repository.default_branch }}", sync)
         # The checks job must NOT pin it: a pull request has to be tested on its
         # own merge ref.
@@ -210,17 +226,18 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("steps.sync.outcome == 'success'", block)
         self.assertIn("steps.sync.outputs.changed != 'true'", block)
         self.assertIn("env.MODE == 'commit'", block)
+        self.assertIn("steps.direct_commit.outcome == 'success'", block)
         self.assertIn("||", block)
         self.assertIn("env.DRY_RUN_INPUT != 'true'", block)
         self.assertIn("continue-on-error: true", block)
         self.assertIn('gh pr list --repo "$REPOSITORY" --head "$BOT_BRANCH" --state open', block)
 
     def test_the_checks_job_tests_the_python_floor_the_readme_promises(self):
-        """3.10 is promised in the README and was never exercised by CI.
+        """Keep the 3.10 floor and production 3.12 in the checks matrix.
 
-        A 3.11+ API (``datetime.UTC``, ``tomllib``) or a 3.12-only f-string would
-        keep CI green while breaking that promise for every user on the floor --
-        and the only job that really runs the code (sync) also runs 3.12.
+        Without the floor leg, a 3.11+ API (``datetime.UTC``, ``tomllib``) or a
+        3.12-only f-string could pass CI while breaking the documented promise.
+        The write-capable sync job stays on 3.12 as the production runtime.
         """
         checks = self.jobs()["checks"]
         self.assertIn("matrix:", checks)
@@ -310,10 +327,11 @@ class WorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(f'"{tool}==${{{name}}}"', self.workflow)
 
-    def test_the_checks_job_runs_on_proposed_code_only(self):
+    def test_checks_run_for_all_events_and_only_pull_requests_run_no_sync(self):
         jobs = self.jobs()
-        self.assertIn("github.event_name == 'pull_request'", jobs["checks"])
-        self.assertIn("github.event_name != 'pull_request'", jobs["sync"])
+        self.assertNotIn("if: github.event_name == 'pull_request'", jobs["checks"])
+        self.assertIn("if: github.event_name != 'pull_request'", jobs["sync"])
+        self.assertIn("needs: checks", jobs["sync"])
         for watched in ("scripts/**", "tests/**", ".github/workflows/sync-vorobey-hackerpolice.yml"):
             self.assertIn(watched, self.workflow)
 
@@ -354,10 +372,65 @@ class RepositoryDataTests(unittest.TestCase):
         # a hand-reformatted list would show up as a thousands-line diff.
         self.assertEqual(dumps(database), original)
 
+    def test_the_shipped_standalone_playerlist_is_valid_and_canonical(self):
+        """The separate scammer list is still shipped, even though the bot ignores it."""
+        database, original = load(self.ROOT / "playerlist.scammers.json")
+        self.assertEqual(validate(database).errors, [])
+        self.assertEqual(dumps(database), original)
+
+    def test_the_shipped_racist_rule_still_justifies_automatic_racist_proofs(self):
+        """The demotion policy relies on TF2BD's rule continuing to mark racist."""
+        document = strict_json_loads((self.ROOT / "rules.garou3299.json").read_bytes())
+        self.assertIsInstance(document, dict)
+        rules = document.get("rules")
+        self.assertIsInstance(rules, list)
+        racist_rules = [
+            rule
+            for rule in rules
+            if isinstance(rule, dict)
+            and isinstance(rule.get("actions"), dict)
+            and isinstance(rule["actions"].get("mark"), list)
+            and "racist" in rule["actions"]["mark"]
+        ]
+        self.assertTrue(racist_rules, "the shipped rule no longer marks racist")
+        self.assertTrue(
+            any(
+                isinstance(rule.get("triggers"), dict)
+                and isinstance(rule["triggers"].get("chatmsg_text_match"), dict)
+                and rule["triggers"]["chatmsg_text_match"].get("case_sensitive") is False
+                and rule["triggers"]["chatmsg_text_match"].get("mode") == "word"
+                and isinstance(rule["triggers"]["chatmsg_text_match"].get("patterns"), list)
+                and bool(rule["triggers"]["chatmsg_text_match"]["patterns"])
+                and all(
+                    isinstance(pattern, str) and pattern
+                    for pattern in rule["triggers"]["chatmsg_text_match"]["patterns"]
+                )
+                for rule in racist_rules
+            ),
+            "the racist rule must remain case-insensitive, word-matched, and non-empty",
+        )
+
+    def test_atomic_write_temporaries_are_ignored_by_git(self):
+        """A SIGTERM/SIGKILL can leave a temp file that must not be staged."""
+        command = ["git", "check-ignore", "-q", "--no-index", "--"]
+        generated = subprocess.run(
+            [*command, ".tf2bd-sync-review.tmp"],
+            cwd=self.ROOT,
+            timeout=30,
+        )
+        unrelated = subprocess.run(
+            [*command, ".release-notes.tmp"],
+            cwd=self.ROOT,
+            timeout=30,
+        )
+        self.assertEqual(generated.returncode, 0, "atomic-write leftovers must stay out of commits")
+        self.assertEqual(unrelated.returncode, 1, "the temporary-file rule must not hide unrelated dotfiles")
+
     def test_git_does_not_apply_line_ending_conversion_to_json_data(self):
         """The snapshot must remain the exact upstream byte sequence."""
         for name in (
             "playerlist.garou3299.json",
+            "playerlist.scammers.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
             "rules.garou3299.json",
         ):
@@ -533,9 +606,15 @@ class RepositoryDataTests(unittest.TestCase):
         condition = next(line.strip() for line in stale_step.splitlines() if line.strip().startswith("if:"))
         self.assertIn("steps.sync.outcome == 'success'", condition)
         self.assertIn("env.DRY_RUN_INPUT != 'true'", condition)
-        self.assertIn("env.MODE == 'commit'", condition)
-        self.assertIn("steps.sync.outputs.changed != 'true'", condition)
-        self.assertIn("||", condition)
+        self.assertIn(
+            "(steps.sync.outputs.changed != 'true' || "
+            "(env.MODE == 'commit' && steps.direct_commit.outcome == 'success'))",
+            condition,
+        )
+        commit_step = next(
+            block for block in sync_block.split("\n      - ") if block.startswith("name: Commit directly")
+        )
+        self.assertIn("id: direct_commit", commit_step)
         close_command = "\n".join(
             line for line in stale_step.splitlines() if "gh pr close" in line or "--comment" in line
         )

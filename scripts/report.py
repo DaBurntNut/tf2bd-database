@@ -25,15 +25,17 @@ finally the closing sentence + proof note.
 
 from __future__ import annotations
 
+import html
 import re
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from playerlist import account_id, display_path, steam_history_url, steam_profile_url
-from policy import Change
+from policy import MAX_EVIDENCE_LINK_CHARS, MAX_EVIDENCE_LINKS, Change
 from sources import SOURCE_REPO_URL, redact_urls_in_text
 
 __all__ = [
@@ -41,6 +43,7 @@ __all__ = [
     "MAX_ATTRIBUTE_CHARS",
     "MAX_CHANGE_TABLE_ROWS",
     "MAX_CLOSING_STEAMIDS",
+    "MAX_DATABASE_LABEL_CHARS",
     "MAX_EVIDENCE_LINKS",
     "MAX_EVIDENCE_LINK_CHARS",
     "MAX_NAME_CHARS",
@@ -83,9 +86,8 @@ MAX_REPORT_BYTES = 60_000
 #     longer one is abnormal -- the profile link still carries the identity),
 #   * attributes per row (the TF2BD schema has four; anything beyond a handful
 #     is malformed) and their length (the longest known one is 10 characters).
-MAX_EVIDENCE_LINKS = 10
-MAX_EVIDENCE_LINK_CHARS = 500
 MAX_NAME_CHARS = 80
+MAX_DATABASE_LABEL_CHARS = 80
 MAX_ATTRIBUTE_CHARS = 40
 MAX_ATTRIBUTE_CELLS = 8
 
@@ -177,11 +179,11 @@ DEFAULT_SNAPSHOT_LABEL = "snapshot/playerlist.vorobey-hackerpolice.json"
 # newline in it would otherwise start a new Markdown line (e.g. an extra bullet
 # in the report header), and an ESC would repaint the terminal that `cat`s it.
 #
-# U+0085 (NEL) and U+2028/U+2029 are line terminators too -- ``str.splitlines``
-# and CSS both treat them as a line break -- so a player name containing one
-# would split a table row in the rendered pull request. They are neutralised
-# with the ASCII control characters, not left to the renderer.
-_TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f\x85\u2028\u2029]")
+# U+0080-U+009F are C1 controls (including U+009B, the 8-bit CSI escape), and
+# U+0085 (NEL) plus U+2028/U+2029 are line terminators too -- ``str.splitlines``
+# and CSS both treat them specially. Neutralise the whole control range rather
+# than leaving a terminal control or an extra Markdown table line raw.
+_TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 # Bidirectional overrides flip how the rest of the line is displayed, so a name
 # like "abc\u202eDEF" shows as "abcFED" and can make the NEXT table cell read
@@ -189,14 +191,12 @@ _TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f\x85\u2028\u2029]")
 # joiner does (emoji, Indic scripts), so only the bidi controls are replaced.
 _BIDI_CONTROLS = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
-# The rest of Unicode's FORMAT characters are invisible rather than
-# line-flipping: a zero-width space, a word joiner, a BOM, a soft hyphen or a
-# Unicode tag character makes two different names render identically in the
-# review table, and tag characters are a known way to hide text outright. They
-# become the same visible placeholder as a bidi override, so a reader can see
-# that the value holds something. ZWNJ/ZWJ stay (U+200C/U+200D): invisible but
-# meaningful -- Persian and Indic orthography, and emoji sequences.
-_INVISIBLE_CONTROLS = re.compile("[\u00ad\u061c\u180e\u200b\u2060-\u2064\ufeff\ufff9-\ufffb\U000e0000-\U000e007f]")
+# Unicode FORMAT characters are generally invisible and can make two names
+# look alike. Replace every current or future FORMAT character except ZWNJ/ZWJ,
+# which carry meaning in Persian/Indic text and emoji sequences. In URLs those
+# joiners are percent-encoded instead, because a hidden character can disguise
+# a link target.
+_MEANINGFUL_JOINERS = frozenset(("\u200c", "\u200d"))
 
 
 def _neutralise(value: str) -> str:
@@ -204,7 +204,9 @@ def _neutralise(value: str) -> str:
     value = redact_urls_in_text(value)
     value = _TEXT_CONTROLS.sub(" ", value)
     value = _BIDI_CONTROLS.sub("\ufffd", value)
-    return _INVISIBLE_CONTROLS.sub("\ufffd", value)
+    return "".join(
+        "\ufffd" if unicodedata.category(char) == "Cf" and char not in _MEANINGFUL_JOINERS else char for char in value
+    )
 
 
 def _safe(text: str) -> str:
@@ -224,11 +226,11 @@ def _shorten(value: str, limit: int) -> str:
 
 def _cell(value: str) -> str:
     """Make a string safe inside a Markdown table cell."""
-    return _neutralise(value).translate(_CELL_ESCAPES).strip() or "-"
+    return _data_text(value, in_table=True).strip() or "-"
 
 
-def _text(value: str) -> str:
-    """Make a value safe as running text (the fetch URL line).
+def _text(value: str, *, allow_autolinks: bool = False) -> str:
+    """Make a value safe as running text, with autolinks opt-in for the fetch URL.
 
     ``<``/``>`` become entities, so they render identically but cannot open a
     tag; control characters become spaces, so they cannot start a new line.
@@ -240,9 +242,13 @@ def _text(value: str) -> str:
     else) must not be able to ping a stranger from the bot's pull request.
     Every character in ``_ESCAPES`` is escaped here too -- the same single map
     the table cells use, so a value cannot be safe in one place and not the
-    other.
+    other. Autolinks are disabled for data (database labels and demotion notes)
+    by default; only the explicitly selected fetch URL is allowed to remain a
+    clickable URI.
     """
-    return _neutralise(value).translate(_TEXT_ESCAPES)
+    if allow_autolinks:
+        return _neutralise(value).translate(_TEXT_ESCAPES)
+    return _data_text(value, in_table=False)
 
 
 def _code(value: str, *, in_table: bool = False) -> str:
@@ -311,9 +317,33 @@ def _name_cell(change: Change) -> str:
     return _markdown_link(url, label)
 
 
-_HTTP_SCHEME_IN_TEXT = re.compile(r"https?:", re.IGNORECASE)
+# GitHub Flavored Markdown auto-links URI literals and bare ``www.`` text;
+# non-clickable evidence containing either must be fenced as code. Requiring
+# non-whitespace after the colon avoids fencing ordinary prose like "Reason: ".
+_AUTOLINK_IN_TEXT = re.compile(r"(?:[a-z][a-z0-9+.-]*:[^\s]+|www\.[^\s]+)", re.IGNORECASE | re.ASCII)
 _SECOND_HTTP_URL = re.compile(r"\s+https?://", re.IGNORECASE)
 _MALFORMED_PERCENT_ESCAPE = re.compile(r"%(?![0-9a-fA-F]{2})")
+
+
+def _data_text(value: str, *, in_table: bool) -> str:
+    """Escape untrusted Markdown text and fence URI literals against autolinking.
+
+    GitHub auto-links URI schemes and bare ``www.`` text even when ordinary
+    Markdown punctuation is escaped. Fence those substrings as code rather than
+    weakening the visible text: a database label or player name can contain a
+    URL without becoming a link of its own. The intentional fetch URL uses
+    ``_text(..., allow_autolinks=True)`` instead.
+    """
+    escaped = _CELL_ESCAPES if in_table else _TEXT_ESCAPES
+    value = _neutralise(value)
+    parts: list[str] = []
+    position = 0
+    for match in _AUTOLINK_IN_TEXT.finditer(value):
+        parts.append(value[position : match.start()].translate(escaped))
+        parts.append(_code(match.group(), in_table=in_table))
+        position = match.end()
+    parts.append(value[position:].translate(escaped))
+    return "".join(parts)
 
 
 def _is_url(text: str) -> bool:
@@ -325,7 +355,13 @@ def _is_url(text: str) -> bool:
     ambiguous forms rather than making untrusted evidence clickable. Spaces
     in a path remain supported and are percent-encoded by ``_markdown_link``.
     """
-    if not text or text != text.strip() or "\\" in text or any(char in text for char in "\r\n\t"):
+    if (
+        not text
+        or text != text.strip()
+        or "\\" in text
+        or html.unescape(text) != text
+        or any(char in text for char in "\r\n\t")
+    ):
         return False
     if any(char.isspace() and char != " " for char in text):
         return False
@@ -357,8 +393,12 @@ def _markdown_link(url: str, label: str) -> str:
     would make two different targets look identical).
     """
     encoded = url.translate(_LINK_ESCAPES)
-    for pattern in (_TEXT_CONTROLS, _BIDI_CONTROLS, _INVISIBLE_CONTROLS):
-        encoded = pattern.sub(lambda match: "".join(f"%{byte:02X}" for byte in match.group().encode("utf-8")), encoded)
+    encoded = "".join(
+        "".join(f"%{byte:02X}" for byte in char.encode("utf-8"))
+        if unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"}
+        else char
+        for char in encoded
+    )
     return f"[{label}]({encoded})"
 
 
@@ -369,7 +409,7 @@ def _evidence_link_status(link: str) -> tuple[str, bool]:
     return safe_link, clickable
 
 
-def _evidence_cell(links: Sequence[str]) -> str:
+def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     """Proof column: real links where possible, escaped text otherwise.
 
     Each link is labelled "proof" (or "proof 1", "proof 2" when there are
@@ -392,15 +432,16 @@ def _evidence_cell(links: Sequence[str]) -> str:
             rendered.append(_markdown_link(link, "proof" if single else f"proof {position}"))
         else:
             preview = _shorten(safe_link, MAX_EVIDENCE_LINK_CHARS)
-            if safe_link != link or _HTTP_SCHEME_IN_TEXT.search(link):
+            if safe_link != link or _AUTOLINK_IN_TEXT.search(link):
                 rendered.append(_code(preview, in_table=True))
             else:
                 rendered.append(_cell(preview))
     cell = ", ".join(rendered)
-    hidden = len(links) - len(shown)
+    hidden = max(0, len(links) - len(shown)) + max(0, omitted)
     if hidden:
-        # Plain text, not a link: it must never look clickable.
-        cell += f", and {_count(hidden)} more"
+        # Plain text, not a link: it must never look clickable. ``omitted``
+        # counts additional upstream proof entries that policy did not retain.
+        cell += f", and {_count(hidden)} more evidence entries"
     return cell
 
 
@@ -599,15 +640,15 @@ class RunInfo:
 
     database_path: Path
     source: str
-    source_total: int
-    source_skipped: int
+    source_total: int  # raw rows in the current list, including duplicates
+    source_skipped: int  # rows without a usable SteamID
     dry_run: bool
     changes: tuple[Change, ...] = ()
     # Demotion provenance: how many IDs disappeared upstream vs. the snapshot,
     # and (when demotion was skipped despite --demote) the reason why.
-    previous_source_total: int | None = None
-    added_to_source: int = 0
-    removed_from_source: int = 0
+    previous_source_total: int | None = None  # raw rows in the previous snapshot
+    added_to_source: int = 0  # distinct usable SteamIDs
+    removed_from_source: int = 0  # distinct usable SteamIDs
     # SteamIDs that were in the previous snapshot but are gone from the
     # current list. Reported whether or not demotion ran (and even when the
     # mass-demotion guard skipped demotion), because it is the raw fact the
@@ -640,9 +681,13 @@ class RunInfo:
         the headline always names the file the run actually writes and no
         repository name is hardcoded here.
         """
-        stem = Path(display_path(self.database_path)).stem
+        # Derive the label from the actual basename, not the bounded display
+        # path: clipping a long parent directory first can remove the filename
+        # and make the report name the wrong database.
+        stem = self.database_path.stem
         head, _, owner = stem.partition(".")
         name = owner if head == "playerlist" and owner else stem
+        name = _shorten(name, MAX_DATABASE_LABEL_CHARS)
         return name[:1].upper() + name[1:]
 
 
@@ -651,20 +696,25 @@ def _header_lines(info: RunInfo) -> list[str]:
     source_note = f"{_count(info.source_total)} entries"
     if info.source_skipped:
         source_note += f", {_count(info.source_skipped)} unusable"
+    source = redact_urls_in_text(info.source)
+    source_display = _text(source, allow_autolinks=True) if _is_url(source) else _code(source)
 
     lines = [
         "## Vorobey hackerpolice sync",
         "",
         f"- Database: {_code(display_path(info.database_path))}",
         f"- Vorobey hackerpolice list ({source_note}): {SOURCE_REPO_URL}",
-        f"- Fetched from: {_text(redact_urls_in_text(info.source))}",
+        f"- Fetched from: {source_display}",
         f"- Run at: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
     ]
     if info.dry_run:
         lines.append("- Mode: **dry run** (no database or snapshot written)")
     if info.previous_source_total is not None:
-        current_total = info.previous_source_total + info.added_to_source - info.removed_from_source
-        delta = info.added_to_source - info.removed_from_source
+        # Totals count raw list entries; added/removed counts are distinct
+        # SteamIDs. Duplicates or unusable rows mean one cannot be derived from
+        # the other, so use the current list's actual entry count here.
+        current_total = info.source_total
+        delta = current_total - info.previous_source_total
         # "+0" reads like a change was made; name the no-change case instead.
         net = "no net change" if delta == 0 else f"net {delta:+,d}"
         lines.append(
@@ -718,7 +768,7 @@ def _promotion_lines(promotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE
                 _name_cell(change),
                 _attributes_cell(change.before),
                 _attributes_cell(change.after),
-                _evidence_cell(change.evidence),
+                _evidence_cell(change.evidence, change.evidence_omitted),
                 _steam_history_cell(change.steamid),
             )
         )
