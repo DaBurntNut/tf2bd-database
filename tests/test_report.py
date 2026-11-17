@@ -101,7 +101,7 @@ class ReportTests(unittest.TestCase):
         change = Change("[U:1:100]", "\x1b[31mRED\x1b[0m", ("suspicious",), ("cheater",))
         report = render_report(self.info([change]))
         self.assertNotIn("\x1b", report)
-        self.assertIn("RED", report)  # the name itself is still readable
+        self.assertIn("RED", report)  # The name remains readable.
 
     def test_a_directory_name_cannot_forge_a_link_in_the_demotion_note(self):
         """The demotion note embeds the snapshot PATH -- data, not code.
@@ -114,8 +114,8 @@ class ReportTests(unittest.TestCase):
         note = "skipped - no snapshot at /tmp/a[x](https://evil.example)/s.json yet"
         report = render_report(self.info(demotion_note=note))
         line = next(line for line in report.splitlines() if line.startswith("- Demotion:"))
-        self.assertIn("\\[x\\]", line)  # escaped, so it renders as literal text
-        self.assertNotIn("[x](https://evil.example)", line)  # never a link
+        self.assertIn("\\[x\\]", line)  # Escaped text renders literally.
+        self.assertNotIn("[x](https://evil.example)", line)  # It must not become a link.
 
     def test_the_snapshot_note_keeps_its_own_markdown(self):
         """Unlike the demotion note, this one is authored in code.
@@ -145,16 +145,16 @@ class ReportTests(unittest.TestCase):
         the bidi set was neutralised, so these sailed into the pull request body.
         """
         for character in (
-            "\u200b",  # zero-width space
-            "\u2060",  # word joiner
-            "\ufeff",  # zero-width no-break space / BOM
-            "\u00ad",  # soft hyphen
-            "\u061c",  # Arabic letter mark
-            "\u180e",  # Mongolian vowel separator
-            "\u206a",  # deprecated invisible formatting control
-            "\u070f",  # Syriac abbreviation mark
-            "\U000e0041",  # Unicode tag character
-            "\ufff9",  # interlinear annotation anchor
+            "\u200b",  # Zero-width space.
+            "\u2060",  # Word joiner.
+            "\ufeff",  # Zero-width no-break space / BOM.
+            "\u00ad",  # Soft hyphen.
+            "\u061c",  # Arabic letter mark.
+            "\u180e",  # Mongolian vowel separator.
+            "\u206a",  # Deprecated invisible format control.
+            "\u070f",  # Syriac abbreviation mark.
+            "\U000e0041",  # Unicode tag character.
+            "\ufff9",  # Interlinear annotation anchor.
         ):
             with self.subTest(character=f"U+{ord(character):04X}"):
                 change = Change("[U:1:100]", f"Pla{character}yer", ("suspicious",), ("cheater",))
@@ -207,9 +207,9 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("\x1b", report)
         self.assertNotIn("\u202e", report)
         self.assertNotIn("\u009b", report)
-        self.assertIn("%1B", report)  # ESC
-        self.assertIn("%E2%80%AE", report)  # U+202E, as UTF-8 bytes
-        self.assertIn("%C2%9B", report)  # U+009B, as UTF-8 bytes
+        self.assertIn("%1B", report)  # ESC control.
+        self.assertIn("%E2%80%AE", report)  # U+202E encoded as UTF-8.
+        self.assertIn("%C2%9B", report)  # U+009B encoded as UTF-8.
 
     def test_attributes_cannot_carry_control_characters_into_the_report(self):
         change = Change("[U:1:100]", "p", ("suspicious\x1b",), ("cheater",))
@@ -270,13 +270,13 @@ class ReportTests(unittest.TestCase):
 
     def test_report_links_the_human_friendly_blob_page_and_names_the_fetch_source(self):
         report = render_report(self.info())
-        # Main reference: the readable GitHub blob page, not a raw/API URL.
+        # Link to the human-readable GitHub blob page, not a raw/API URL.
         self.assertIn(
             "Vorobey hackerpolice list (10 entries): "
             "https://github.com/Nocrex/Tom/blob/main/playerlist.vorobey-hackerpolice.json",
             report,
         )
-        # The actual URL the bytes were fetched from stays visible for debugging.
+        # Keep the actual fetch URL visible for troubleshooting.
         self.assertIn("- Fetched from: https://example.invalid/list.json", report)
 
     def test_the_fetch_line_never_publishes_a_credential(self):
@@ -284,8 +284,7 @@ class ReportTests(unittest.TestCase):
         report = render_report(
             self.info(source="https://user:secret@example.invalid/list.json?token=ghp_SECRET&ref=main")
         )
-        # "&" and "_" are markdown-escaped in running text (they render as
-        # themselves; the escape is what stops a URL from forging emphasis).
+        # Escape '&' and '_' so URL data cannot introduce Markdown formatting.
         self.assertIn("- Fetched from: https://example.invalid/list.json?token=REDACTED&amp;ref=main", report)
         self.assertNotIn("secret", report)
         self.assertNotIn("ghp_SECRET", report)
@@ -295,7 +294,7 @@ class ReportTests(unittest.TestCase):
         promote = Change("[U:1:100]", "a", ("suspicious",), ("cheater",))
         demote = Change("[U:1:200]", "b", ("cheater",), ("racist",), kind="demote")
         report = render_report(self.info([promote, demote]))
-        self.assertIn("| SteamHistory |", report)  # column header, in both tables
+        self.assertIn("| SteamHistory |", report)  # Header used by both tables.
         rows = [line for line in report.splitlines() if line.startswith("| `[U:1:")]
         self.assertEqual(len(rows), 2)
         self.assertTrue(rows[0].endswith("| [SteamHistory](https://steamhistory.net/id/76561197960265828) |"))
@@ -315,7 +314,7 @@ class ReportTests(unittest.TestCase):
         report = render_report(self.info([promote, demote], removed_upstream=("[U:1:5]",)))
 
         def cells(line: str) -> int:
-            # An escaped "\\|" is part of a cell, not a separator.
+            # An escaped pipe remains part of a cell.
             return len(_UNESCAPED_PIPE.findall(line)) - 1
 
         header_cells = None
@@ -388,13 +387,13 @@ class ReportTests(unittest.TestCase):
         both = render_report(self.info(database_changed=True, snapshot_changed=True))
         self.assertIn("the snapshot was refreshed too", both)
 
-        # A dry run writes nothing, so the sentence must be conditional there.
+        # Dry-run wording must be conditional.
         dry = render_report(self.info(database_changed=True, snapshot_changed=True, dry_run=True))
         self.assertIn("would be normalised", dry)
         self.assertIn("the snapshot would be refreshed too", dry)
         self.assertNotIn("was normalised", dry)
 
-        # A snapshot-only run keeps its existing wording.
+        # Snapshot-only runs retain their existing wording.
         snapshot_only = render_report(self.info(snapshot_changed=True))
         self.assertIn("**No database changes** (snapshot refresh only).", snapshot_only)
 
@@ -441,7 +440,7 @@ class ReportTests(unittest.TestCase):
                 snapshot_changed=True,
             )
         )
-        self.assertIn("Vorobey hackerpolice list (13,542 entries)", report)  # raw row total stays exact
+        self.assertIn("Vorobey hackerpolice list (13,542 entries)", report)  # Raw row totals remain exact.
         self.assertIn("- Previous snapshot: 12,345 entries", report)
         self.assertIn("**1,200 new SteamIDs added**", report)
         self.assertIn("(12,345 → 13,542 entries; net +1,197)", report)
@@ -514,7 +513,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Proof link comes from the Vorobey hackerpolice list", report)
 
     def test_name_links_to_the_steam_profile_permalink(self):
-        # [U:1:269327660] -> SteamID64 76561198229593388 (base + account id).
+        # SteamID64 = base + account ID.
         change = Change("[U:1:269327660]", "KNNU", ("suspicious",), ("cheater",), (HACKERPOLICE_PROOF,))
         report = render_report(self.info([change]))
         self.assertIn("[KNNU](https://steamcommunity.com/profiles/76561198229593388)", report)
@@ -524,7 +523,7 @@ class ReportTests(unittest.TestCase):
         unnamed = Change("[U:1:2]", "", ("suspicious",), ("cheater",))
         report = render_report(self.info([demoted, unnamed]))
         self.assertIn("[KNNU](https://steamcommunity.com/profiles/76561198229593388)", report)
-        # No recorded name -> UNKNOWN, still linked to the profile permalink.
+        # An unnamed player remains linked as UNKNOWN.
         self.assertIn("| `[U:1:2]` | [UNKNOWN](https://steamcommunity.com/profiles/76561197960265730) |", report)
 
     def test_a_player_literally_named_dash_keeps_their_name(self):
@@ -539,12 +538,12 @@ class ReportTests(unittest.TestCase):
         self.assertIn("[a \\[b\\] c](https://steamcommunity.com/profiles/76561197960265729)", report)
 
     def test_lone_surrogates_in_names_and_proofs_cannot_crash_the_report(self):
-        # "\ud800" is legal JSON and loads fine, but cannot be encoded as
-        # UTF-8: it must be replaced, not crash writing/printing the report.
+        # JSON permits lone surrogates, but UTF-8 cannot encode them.
+        # Replace them to keep report output encodable.
         change = Change("[U:1:1]", "bad\ud800name", ("suspicious",), ("cheater",), ("https://x/\udfff",))
         report = render_report(self.info([change]))
         self.assertIn("bad\ufffdname", report)
-        report.encode("utf-8")  # must not raise
+        report.encode("utf-8")  # The rendered report must remain UTF-8 encodable.
 
     def test_carriage_returns_in_names_cannot_break_the_table(self):
         change = Change("[U:1:1]", "a\rb", ("suspicious",), ("cheater",), (HACKERPOLICE_PROOF,))
@@ -577,9 +576,9 @@ class ReportTests(unittest.TestCase):
         }
         changes = demote(database, ["[U:1:200]"])
         report = render_report(self.info(changes, removed_upstream=("[U:1:200]",)))
-        # the proof itself survives in the database ...
+        # The proof remains in the database.
         self.assertEqual(database["players"][0]["proof"], [line])
-        # ... and never appears in the report
+        # The report must not expose it.
         self.assertNotIn(marker, report)
         self.assertNotIn("[auto] automatically marked", report)
 
@@ -595,8 +594,7 @@ class ReportTests(unittest.TestCase):
         report = render_report(self.info([change]))
         for terminator in ("\u2028", "\u2029", "\x85", "\x0b", "\x0c"):
             self.assertNotIn(terminator, report)
-        # splitlines() must see exactly the same lines as a plain split: any
-        # extra break would mean an unneutralised terminator survived.
+        # No unneutralised line terminator may add a split line.
         self.assertEqual(len(report.rstrip("\n").split("\n")), len(report.splitlines()))
         row = next(line for line in report.split("\n") if line.startswith("| `[U:1:1]`"))
         self.assertIn("evil name other nel lf cr vt ff", row)
@@ -615,8 +613,7 @@ class ReportTests(unittest.TestCase):
         outside = "".join(
             character for index, character in enumerate(report) if not any(start <= index < end for start, end in spans)
         )
-        # Outside code spans every backtick must still be escaped: strip the
-        # "\\<punct>" escapes, then nothing may be left to open a span.
+        # No unescaped backtick may remain outside a code span.
         stripped = re.sub(r"\\" + "[" + re.escape(string.punctuation) + "]", "", outside)
         self.assertNotIn("`", stripped)
 
@@ -643,7 +640,7 @@ class ReportTests(unittest.TestCase):
         for start, end in spans:
             self.assertNotIn("\n", report[start:end], "a code span ran past the end of its line")
         row = next(line for line in report.split("\n") if line.startswith("| `[U:1:1]`"))
-        self.assertEqual(row.count("|"), 7)  # six cells, still six
+        self.assertEqual(row.count("|"), 7)  # The row still has six cells.
         self.assertIn("[SteamHistory](", row)
         self.assertIn("tick\\` here", row)
 
@@ -682,7 +679,7 @@ class ReportTests(unittest.TestCase):
                 changes=(change,),
             )
             report = render_report(info)
-            # Code spans are literal, so only the text OUTSIDE them matters.
+            # Only Markdown outside code spans is parsed.
             outside_code = re.sub(r"`+[^`]*`+", "", report)
             self.assertNotIn("<", outside_code)
             self.assertNotIn("](https://elsewhere.example)", outside_code)
@@ -774,8 +771,7 @@ class ReportTests(unittest.TestCase):
                 self.assertIn(encoded, report)
                 self.assertNotIn(character, report)
 
-                # Defense in depth: even direct link rendering must make every
-                # Unicode format character visible in the destination.
+                # Direct link rendering must also encode format characters.
                 self.assertIn(encoded, report_module._markdown_link(url, "proof"))
 
     def test_link_targets_are_escaped(self):
@@ -785,7 +781,7 @@ class ReportTests(unittest.TestCase):
 
     def test_url_classification_requires_a_valid_absolute_http_url(self):
         for url in (
-            "https://example.invalid/a (b)",  # path spaces are escaped before Markdown parsing
+            "https://example.invalid/a (b)",  # Path spaces are percent-encoded before Markdown parsing
             "HTTP://example.invalid/path",
         ):
             with self.subTest(valid=url):
@@ -860,25 +856,22 @@ class ReportTests(unittest.TestCase):
         self.assertIn("token=REDACTED", report)
 
     def test_newline_in_the_fetch_url_cannot_inject_a_report_line(self):
-        # The fetch URL can be an upstream-supplied download_url, so a newline
-        # in it must not start a new Markdown line in the pull request body.
+        # Newlines in upstream URLs must not create extra report lines.
         report = render_report(self.info(source="https://example.invalid/a\n- **injected**\r\n- second"))
         self.assertFalse(any(line.startswith("- **injected**") for line in report.splitlines()))
-        self.assertIn("injected", report)  # flattened onto one line, not dropped
+        self.assertIn("injected", report)  # Flatten the newline rather than dropping the URL
 
     def test_pipe_in_a_proof_url_cannot_split_the_table_row(self):
-        # Upstream proof links are third-party data; a raw "|" inside a table
-        # cell ends the cell, so GitHub would render a truncated row with an
-        # extra column. The URL keeps working because %7C decodes to "|".
+        # Percent-encode raw pipes; they split table cells, while %7C preserves the URL.
         change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",), ("https://example.invalid/a|b",))
         report = render_report(self.info([change]))
         self.assertIn("https://example.invalid/a%7Cb", report)
         rows = [line for line in report.splitlines() if line.startswith("| `[U:1:1]`")]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].count("|"), 7)  # six cells, no stray separator
+        self.assertEqual(rows[0].count("|"), 7)  # The row still has six cells.
 
     def test_no_proof_note_without_evidence_links(self):
-        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))  # no evidence links
+        change = Change("[U:1:1]", "a", ("suspicious",), ("cheater",))  # No evidence links.
         report = render_report(self.info([change]))
         self.assertNotIn("Proof links come from", report)
 
@@ -897,8 +890,7 @@ class ReportTests(unittest.TestCase):
             ("https://proof.example/1",),
             kind="demote",
         )
-        # The exact shape that raised the question: no promotion table at all,
-        # a demotion table and the removed-from-the-list table.
+        # This case has no promotion table, only demotion and removal tables.
         report = render_report(self.info([change], removed_upstream=("[U:1:2]",)))
         self.assertNotIn("promoted to", report)
         self.assertIn("demoted", report)
@@ -919,7 +911,7 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("@here", report)
         self.assertNotIn("@everyone", report)
         self.assertNotIn("<b>", report)
-        self.assertIn("&lt;b&gt;this&lt;/b&gt;", report)  # rendered literally, not as HTML
+        self.assertIn("&lt;b&gt;this&lt;/b&gt;", report)  # Render it literally, not as HTML.
 
     def test_the_table_and_the_running_text_share_one_escape_policy(self):
         """Two hand-maintained lists is how a hole gets missed.
@@ -932,15 +924,14 @@ class ReportTests(unittest.TestCase):
         for character, replacement in report_module._ESCAPES.items():
             with self.subTest(character=character):
                 if character.isspace():
-                    # Both turn a line break into a space; the cell then trims
-                    # it away and falls back to its "-" placeholder.
+                    # Both breaks become spaces, then trimming yields the '-' placeholder.
                     self.assertEqual(report_module._text(character), " ")
                     self.assertEqual(report_module._cell(character), "-")
                     continue
-                self.assertNotEqual(replacement, character)  # actually an escape
+                self.assertNotEqual(replacement, character)  # The output is an escape sequence.
                 self.assertEqual(report_module._text(character), replacement)
                 self.assertEqual(report_module._cell(character), replacement)
-        # The one intentional difference: a pipe ends a table cell.
+        # Pipes are the only intentional difference between the maps.
         self.assertNotIn("|", report_module._ESCAPES)
         self.assertNotEqual(report_module._cell("|"), report_module._text("|"))
 
@@ -961,7 +952,7 @@ class ReportTests(unittest.TestCase):
             with self.subTest(name=name):
                 cell = report_module._cell(name)
                 self.assertEqual(cell, marker)
-                # and an ordinary underscore survives, visibly unchanged:
+                # Ordinary underscores remain readable after escaping.
                 self.assertEqual(report_module._cell("a_b_c"), "a\\_b\\_c")
 
     def test_a_name_cannot_smuggle_an_html_entity_past_the_guards(self):
@@ -977,7 +968,7 @@ class ReportTests(unittest.TestCase):
             with self.subTest(name=name):
                 cell = report_module._cell(name)
                 self.assertNotIn("&#", cell.replace("&#64;", "").replace("&amp;", ""))
-                self.assertIn("&amp;#", cell)  # the entity spelling is now inert text
+                self.assertIn("&amp;#", cell)  # Entity syntax is now inert text.
 
     def test_change_tables_are_capped(self):
         changes = [
@@ -995,13 +986,11 @@ class ReportTests(unittest.TestCase):
         report = render_report(self.info(changes, removed_upstream=tuple(f"[U:1:{5000 + n}]" for n in range(100))))
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
         self.assertNotIn("report truncated to fit the pull request body limit", report)
-        # The two lines the pull request exists for are still there, in full.
+        # Preserve the closing sentence and removed-ID table.
         self.assertIn("; nothing else is modified.", report)
         self.assertIn("100 SteamIDs removed from the Vorobey hackerpolice list", report)
         self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
-        # Rows beyond the reduced cap are announced rather than silently dropped,
-        # and the removed-SteamID list keeps every row: the change tables shrink
-        # first, because those changes are visible in the PR's own diff too.
+        # Reduced change-table rows are announced; the removed-ID list is preserved.
         self.assertIn("more entries not shown here", report)
         self.assertEqual(report.count("| [Profile]("), 100)
         report.encode("utf-8")
@@ -1044,7 +1033,7 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("report truncated", report)
         self.assertIn("nothing else is modified.", report)
         self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
-        report.encode("utf-8")  # always UTF-8 encodable
+        report.encode("utf-8")  # Confirm that UTF-8 encoding succeeds.
 
     def test_a_body_that_would_be_too_long_shrinks_its_tables_instead(self):
         """150 rows of maximal cells overflow the budget: drop rows, never cut.
@@ -1079,7 +1068,7 @@ class ReportTests(unittest.TestCase):
             Change(f"[U:1:{number}]", "name", ("suspicious",), ("cheater",), ("https://example.invalid/p",))
             for number in range(1, 6)
         )
-        budget = 700  # below one shrunken row plus the header
+        budget = 700  # Set the budget below the header plus one reduced row.
         with mock.patch.object(report_module, "MAX_REPORT_BYTES", budget):
             report = report_module.render_report(self.info(changes=changes))
         self.assertLessEqual(len(report.encode("utf-8")), budget)
@@ -1118,16 +1107,14 @@ class ReportTests(unittest.TestCase):
             source_total=10,
             source_skipped=0,
             dry_run=False,
-            # A change matters here: the path reaches the promotion HEADLINE as
-            # well as the header bullet, and the headline is what used to push
-            # the body past its budget and drop the closing sentence.
+            # Include a promotion because the path also appears in its headline.
             changes=(Change("[U:1:1]", "name", ("suspicious",), ("cheater",)),),
         )
         report = render_report(info)
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
         self.assertNotIn("report truncated to fit the pull request body limit", report)
         self.assertIn("; nothing else is modified.", report)
-        self.assertIn("…", report)  # the path itself is the thing clipped
+        self.assertIn("…", report)  # The path itself is clipped.
         self.assertTrue(report.startswith("## Vorobey hackerpolice sync"))
         database_line = next(line for line in report.splitlines() if line.startswith("- Database:"))
         self.assertLessEqual(len(database_line), 300)
@@ -1144,7 +1131,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("…", report)
         longest = max(len(line) for line in report.splitlines())
         self.assertLess(longest, 1_000, "a single row is still enormous")
-        # The cap is applied to the raw name, so no escape sequence is cut in half.
+        # Apply the cap before Markdown escaping to avoid cutting an escape sequence.
         self.assertEqual(report.count("| `[U:1:1"), 3)
 
     def test_the_number_of_proof_links_in_a_row_is_capped(self):
@@ -1155,8 +1142,7 @@ class ReportTests(unittest.TestCase):
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
         self.assertNotIn("report truncated to fit the pull request body limit", report)
         self.assertIn("; nothing else is modified.", report)
-        # Pin the policy value itself: a test that only compares against the
-        # constant would pass no matter how high the cap were raised.
+        # Pin the cap directly; a test derived from it would miss policy changes.
         self.assertEqual(report_module.MAX_EVIDENCE_LINKS, 10)
         row = next(line for line in report.splitlines() if line.startswith("| `[U:1:1000]`"))
         self.assertEqual(row.count("https://discord.com/channels/1/2/"), 10)
@@ -1263,7 +1249,7 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         report = render_report(self.info(removed_upstream=("[U:1:2]",)))
         self.assertNotIn("Last known name", report)
         self.assertNotIn("UNKNOWN", report)
-        # No explanatory filler above the table either: heading, then the table.
+        # No filler appears between the heading and table.
         self.assertNotIn("stores no player names", report)
         self.assertLess(
             report.index("removed from the Vorobey hackerpolice list"),
@@ -1289,7 +1275,7 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         )
 
     def test_table_is_shown_even_when_the_database_changed_nothing(self):
-        # Snapshot-only PR (e.g. none of the removed IDs was a cheater here).
+        # Snapshot-only run with no affected database entries.
         report = render_report(self.info(snapshot_changed=True, removed_upstream=("[U:1:5]",)))
         self.assertIn("snapshot refresh only", report)
         self.assertIn("| `[U:1:5]` | [Profile](", report)
@@ -1326,8 +1312,7 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
                     sorted(report.index(marker) for marker in present),
                     f"{title}: {present}",
                 )
-                # A demotion is an upstream removal the database still contains,
-                # so the raw removed table is always printed with it.
+                # Demotions retain the raw upstream-removal table in the report.
                 if "demoted (present" in report:
                     self.assertIn(markers[2], report)
 
@@ -1337,7 +1322,7 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         lines = [line for line in report.splitlines() if line.strip()]
         self.assertIn("Proof link", lines[-1])
         self.assertIn("nothing else is modified.", lines[-2])
-        # The removed table sits above the closing sentence, not below it.
+        # The removed table precedes the closing sentence.
         self.assertLess(report.index("| Profile Link | SteamHistory |"), report.index("nothing else is modified."))
 
     def test_closing_sentence_names_the_database_that_changed(self):
@@ -1347,10 +1332,10 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         report = render_report(self.info(changes=(change, other, removed_entry)))
         self.assertIn("In the Garou3299 database: attributes are changed for these SteamIDs", report)
         self.assertIn("entry is removed for this SteamID: [U:1:500]", report)
-        # ... and only that once (the header bullet is a separate line):
+        # The closing sentence names the database exactly once.
         closing = next(line for line in report.splitlines() if "nothing else is modified" in line)
         self.assertEqual(closing.count("Garou3299"), 1)
-        # Only the file name -- never an absolute/temporary path.
+        # Report the basename, not an absolute or temporary path.
         self.assertNotIn(str(Path("playerlist.garou3299.json").resolve()), report)
 
     def test_no_table_without_removals(self):
@@ -1433,7 +1418,7 @@ class ClosingMessageTests(unittest.TestCase):
     def test_database_label_scopes_the_sentence(self):
         promote_change = Change("[U:1:400]", "a", ("suspicious",), ("cheater",), kind="promote")
         demote_change = Change("[U:1:300]", "b", ("cheater",), (), kind="demote")
-        # The label scopes the whole sentence and is named exactly once.
+        # The label scopes the sentence and appears exactly once.
         self.assertEqual(
             render_closing([promote_change], database="Garou3299"),
             "In the Garou3299 database: attribute is changed for this SteamID: [U:1:400]; nothing else is modified.",
@@ -1472,7 +1457,7 @@ class ClosingMessageTests(unittest.TestCase):
             f"/{'a' * 220}/playerlist.garou3299.json": "Garou3299",
             "mylist.json": "Mylist",
             "playerlist.json": "Playerlist",
-            # A file whose owner part is empty falls back to the whole stem.
+            # Numeric owner names are accepted as labels.
             "playerlist.2024.json": "2024",
         }
         for path, expected in cases.items():
@@ -1549,14 +1534,14 @@ class ClosingMessageTests(unittest.TestCase):
         limit = report_module.MAX_CLOSING_STEAMIDS
         at_limit = [Change(f"[U+{n}]", "n", ("suspicious",), ("cheater",)) for n in range(limit)]
         over = [Change(f"[U+{n}]", "n", ("suspicious",), ("cheater",)) for n in range(limit + 25)]
-        # Exactly at the cap: every ID is named, no "more" suffix.
+        # At the cap, list every ID without an overflow suffix.
         at_cap = render_closing(at_limit, database="db.json")
         self.assertNotIn("more", at_cap)
-        self.assertIn(f"[U+{limit - 1}]", at_cap)  # the last one is not dropped
+        self.assertIn(f"[U+{limit - 1}]", at_cap)  # The final ID is included.
         closing = render_closing(over, database="db.json")
         self.assertIn(" and 25 more", closing)
-        self.assertIn(f"[U+{limit - 1}]", closing)  # everything up to the cap is named
-        self.assertNotIn(f"[U+{limit}]", closing)  # and nothing past it
+        self.assertIn(f"[U+{limit - 1}]", closing)  # IDs up to the cap are listed.
+        self.assertNotIn(f"[U+{limit}]", closing)  # IDs above the cap are omitted.
         self.assertLess(len(closing), 4_000)
 
     def test_closing_sentence_counts_hidden_ids_with_thousands_separators(self):
@@ -1600,17 +1585,17 @@ class ReportBoundaryTests(unittest.TestCase):
         fitted = report_module._fit_body(text)
         self.assertLessEqual(len(fitted.encode("utf-8")), MAX_REPORT_BYTES)
         self.assertIn("report truncated to fit the pull request body limit", fitted)
-        # Exactly at the budget in bytes stays untouched.
+        # An exact byte-budget fit must remain unchanged.
         exact = "\u044b" * (MAX_REPORT_BYTES // 2)
         self.assertEqual(report_module._fit_body(exact), exact)
 
     def test_truncation_helper_handles_a_zero_or_negative_budget(self):
         self.assertEqual(report_module._truncate_to_bytes("abc", 0), "")
         self.assertEqual(report_module._truncate_to_bytes("abc", -5), "")
-        # A negative limit must mean "nothing", not "drop that many bytes from the end".
+        # A negative limit means no output, not a slice from the end.
         self.assertEqual(report_module._truncate_to_bytes("abcdefghij", -1), "")
         self.assertEqual(report_module._truncate_to_bytes("abc", 3), "abc")
-        self.assertEqual(report_module._truncate_to_bytes("\u044b\u044b", 1), "")  # cannot split a character
+        self.assertEqual(report_module._truncate_to_bytes("\u044b\u044b", 1), "")  # Do not split a multibyte character.
 
     def test_truncation_survives_lone_surrogates(self):
         """Measured before the surrogates are replaced, so it must not encode and crash."""
@@ -1661,7 +1646,7 @@ class ReportBoundaryTests(unittest.TestCase):
                     after=("cheater",),
                     evidence=("https://proof.example/1",) if n == proof_on else (),
                 )
-                # Starts at 1, so proof_on=0 is the run with no link at all.
+                # The range starts at 1; proof_on=0 means no entry has evidence.
                 for n in range(1, limit + 2)
             )
 
@@ -1674,11 +1659,11 @@ class ReportBoundaryTests(unittest.TestCase):
         self.assertEqual(len(shown), limit)
         hidden = next(f"[U:1:{n}]" for n in range(1, limit + 2) if f"[U:1:{n}]" not in shown)
 
-        # The only link rides on the entry the cap drops.
+        # This link belongs only to the entry omitted by the row cap.
         dropped = render_report(self._info(changes=promotions(account_id(hidden))))
         self.assertIn("1 more entry not shown", dropped)
         self.assertNotIn("Proof link", dropped)
-        # In a visible row the same link is annotated again.
+        # A visible copy of the entry should restore the attribution note.
         kept = render_report(self._info(changes=promotions(account_id(shown[0]))))
         self.assertIn("Proof link comes from", kept)
 
@@ -1758,9 +1743,9 @@ class CapBoundaryTests(unittest.TestCase):
         prefix = "https://example.invalid/"
         link = prefix + "x" * (MAX_EVIDENCE_LINK_CHARS - len(prefix))
         self.assertEqual(len(link), MAX_EVIDENCE_LINK_CHARS)
-        self.assertIn("](", report_module._evidence_cell([link]))  # a real link
+        self.assertIn("](", report_module._evidence_cell([link]))  # A valid link.
         longer = link + "x"
-        self.assertNotIn("](", report_module._evidence_cell([longer]))  # plain text, not a dead link
+        self.assertNotIn("](", report_module._evidence_cell([longer]))  # Plain text, not a link.
 
     def test_redact_url_is_exact_at_the_display_limit(self):
         prefix = "https://example.invalid/"
@@ -1809,10 +1794,10 @@ class CapBoundaryTests(unittest.TestCase):
             changes=changes,
         )
         full = render_report(info)
-        self.assertEqual(full.count("| `[U:1:"), 150)  # nothing was dropped
+        self.assertEqual(full.count("| `[U:1:"), 150)  # No entries were dropped.
         budget = len(full.encode("utf-8"))
         with mock.patch.object(report_module, "MAX_REPORT_BYTES", budget):
-            self.assertEqual(render_report(info), full)  # fits exactly: no shrink, no cut
+            self.assertEqual(render_report(info), full)  # Exact fit: no shrink or truncation.
 
 
 if __name__ == "__main__":

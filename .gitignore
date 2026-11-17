@@ -10,9 +10,6 @@ __pycache__/
 # keep any leftover out of `git add -A`.
 .tf2bd-sync-*.tmp
 
-# Local testing aid, deliberately not shipped: a catalogue of every message the
-# bot can print, used to spot drift between the code and its documentation. It
-# is a manual, not part of the bot -- nothing reads it at runtime -- and a
-# stale copy would describe messages the code no longer sends, so it stays out
-# of the repository and out of every pull request.
+# Local, non-shipped catalogue for reviewing bot messages against documentation.
+# Keep it out of commits to avoid publishing stale message references.
 docs/bot-messages.md

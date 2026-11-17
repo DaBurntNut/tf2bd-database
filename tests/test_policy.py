@@ -61,7 +61,7 @@ class MassDemotionGuardTests(unittest.TestCase):
             return sync_module._plan_demotion(args, previous, removed, Path("snapshot.json"))
 
     def test_exactly_fifty_removals_are_not_a_mass_removal(self):
-        # 50 of 100 is 50% of the snapshot, but the floor is "more than 50".
+        # Exactly 50 stays below the guard; the count must exceed 50.
         removed, update_snapshot, note, _ = self.plan(50, 100)
         self.assertEqual(len(removed), 50)
         self.assertTrue(update_snapshot)
@@ -75,14 +75,14 @@ class MassDemotionGuardTests(unittest.TestCase):
         self.assertIn("not refreshed", snapshot_note)
 
     def test_many_removals_from_a_large_snapshot_are_normal(self):
-        # 100 IDs is above the floor, but only 10% of 1000: real drift, not a break.
+        # 100 exceeds the count floor but is only 10% of this snapshot.
         removed, update_snapshot, note, _ = self.plan(100, 1000)
         self.assertEqual(len(removed), 100)
         self.assertTrue(update_snapshot)
         self.assertIsNone(note)
 
     def test_the_fraction_threshold_alone_can_trip_the_guard(self):
-        # 201 of 1000 is just over 20%.
+        # 201 of 1,000 exceeds the 20% threshold.
         removed, update_snapshot, note, _ = self.plan(201, 1000)
         self.assertEqual(removed, set())
         self.assertFalse(update_snapshot)
@@ -127,8 +127,7 @@ class MassDemotionGuardTests(unittest.TestCase):
         self.assertIn("cannot be confirmed safely", note)
         self.assertIn("demotion candidates", snapshot_note)
 
-        # A skipped entry is not itself a reason to hold the baseline when no
-        # valid snapshot ID disappeared; there is nothing ambiguous to demote.
+        # Skipped input matters only when removals need confirmation.
         with self.quiet():
             _, update_snapshot, note, _ = sync_module._plan_demotion(
                 args, previous, set(), Path("snapshot.json"), source_skipped=1
@@ -149,8 +148,7 @@ class MassDemotionGuardTests(unittest.TestCase):
         self.assertIn("--no-update-snapshot", snapshot_note)
 
     def test_pending_removals_are_the_more_useful_reason_to_show(self):
-        # With both --no-update-snapshot and unapplied removals, the report
-        # names the removals: that is the information the reviewer needs.
+        # Prefer reporting pending removals over the no-update flag; reviewers need the reason.
         _, update_snapshot, _, snapshot_note = self.plan(1, 10, demote=False, no_update=True)
         self.assertFalse(update_snapshot)
         self.assertIn("could not be applied", snapshot_note)
@@ -276,8 +274,7 @@ class RemovedSteamIdsTests(unittest.TestCase):
     def test_removed_is_previous_minus_current(self):
         previous = index_of(hackerpolice_entry("[U:1:100]"), hackerpolice_entry("[U:1:200]"))
         current = index_of(hackerpolice_entry("[U:1:200]"), hackerpolice_entry("[U:1:300]"))
-        # 100 disappeared upstream; 300 is new upstream (not a removal);
-        # an ID in neither list can never appear here.
+        # Only previous-minus-current IDs qualify; new and never-listed IDs do not.
         self.assertEqual(removed_steamids(previous, current), {"[U:1:100]"})
 
     def test_added_is_current_minus_previous(self):
@@ -290,7 +287,7 @@ class RemovedSteamIdsTests(unittest.TestCase):
 class DemoteTests(unittest.TestCase):
     """Demotion applies ONLY to IDs handed in as removed upstream."""
 
-    # [U:1:200] was in the snapshot and is gone now; [U:1:100] is still listed.
+    # [U:1:200] disappeared upstream; [U:1:100] remains listed.
     REMOVED = frozenset({"[U:1:200]"})
 
     def setUp(self):
@@ -337,8 +334,7 @@ class DemoteTests(unittest.TestCase):
                 )
             ]
         )
-        # Not "proof": [] -- no entry in the database spells it that way, and the
-        # demotion must not invent a shape the rest of the file does not use.
+        # Omit the key when no proofs survive; absence represents no proof in this database.
         self.assertNotIn("proof", database["players"][0])
 
     def test_cheater_and_racist_keeps_only_auto_racist_prefixed_proofs(self):
@@ -384,12 +380,12 @@ class DemoteTests(unittest.TestCase):
         for separator in ("\n", "\r", "\u2028", "\u0085"):
             with self.subTest(separator=repr(separator)):
                 self.assertFalse(is_racist_proof(prefix + 'legitimate reason"' + separator + 'appended proof "'))
-        # An empty but CLOSED reason is a complete line, and therefore stays.
+        # A closed empty reason still matches the stored format.
         self.assertTrue(is_racist_proof(prefix + '"'))
 
     def test_is_racist_proof(self):
         self.assertTrue(is_racist_proof('[auto] automatically marked: Racist | reason: "x"'))
-        # whitespace at the ends and letter case are still forgiven
+        # Matching trims surrounding whitespace and ignores case.
         self.assertTrue(is_racist_proof('  [AUTO] Automatically marked: RACIST | reason: "x"  '))
         for value in (
             '[auto] automatically marked: Cheater | reason: "aimbot"',
@@ -397,8 +393,7 @@ class DemoteTests(unittest.TestCase):
             "Racist behavior in voice chat",
             "[auto] automatically marked: Racist",
             "",
-            # The quote is part of the prefix: an auto line whose reason is
-            # missing, unquoted or differently spaced is NOT the machine record.
+            # The opening quote is part of the prefix; incomplete or unquoted reasons are rejected.
             "[auto] automatically marked: Racist | reason:",
             "[auto] automatically marked: Racist | reason: no quotes here",
             '[auto] automatically marked: Racist | reason:"x"',
@@ -420,7 +415,7 @@ class DemoteTests(unittest.TestCase):
                         "Silent Aim & ESP",
                         "Racist behavior in voice chat",
                         '[auto] automatically marked: Racist | reason: "legitimate chat"\n[manual] cheating proof "',
-                        "[auto] automatically marked: Racist | reason:",  # truncated
+                        "[auto] automatically marked: Racist | reason:",  # Missing closing quote.
                         "[auto] automatically marked: Racist | reason: no quotes",
                     ],
                 )
@@ -517,7 +512,7 @@ class MalformedProofTests(unittest.TestCase):
                 player = {"steamid": "[U:1:1]", "attributes": ["cheater", "racist"], "proof": proof}
                 changes = policy.demote({"players": [player]}, ["[U:1:1]"])
                 self.assertEqual(player["attributes"], ["racist"])
-                self.assertNotIn("proof", player)  # nothing survived, so the key goes
+                self.assertNotIn("proof", player)  # No proofs remain; remove the key.
                 self.assertEqual([change.kind for change in changes], ["demote"])
 
 
@@ -563,26 +558,23 @@ class PolicyPropertyTests(unittest.TestCase):
                 was, has = set(original["attributes"]), "cheater" in original["attributes"]
                 entry = after.get(steamid)
                 if not was:
-                    # No attributes at all: malformed, left alone by the policy
-                    # (the CLI refuses such a database before writing anything).
+                    # Malformed entries stay unchanged; the CLI rejects them before writing.
                     self.assertEqual(entry, original)
                     continue
                 if steamid in listed and has:
-                    # Still listed: never demoted, even if also in removed_ids.
+                    # Still listed upstream: never demote, even if also in removed_ids.
                     self.assertEqual(entry, original)
                 elif steamid in listed and was & {"suspicious", "racist"}:
-                    # Promoted: cheater added, suspicious settled, everything else kept
-                    # -- proofs included: a promotion never adds or rewrites one.
+                    # Promotion adds cheater, removes suspicious, and preserves other fields.
+                    # Existing proofs are not added or rewritten.
                     self.assertEqual(entry["attributes"], order_attributes((was | {"cheater"}) - {"suspicious"}))
                     self.assertEqual(entry["last_seen"], original["last_seen"])
                     self.assertEqual(entry.get("proof"), original.get("proof"), "promotion changed the proofs")
                 elif steamid in removed and has and "racist" not in was:
-                    # Removed upstream without a racist tag: the entry is gone.
+                    # Removed upstream without racist: remove the full entry.
                     self.assertIsNone(entry)
                 elif steamid in removed and has:
-                    # Only the cheater tag goes (other tags survive); the proofs that
-                    # remain are exactly the [auto] racist lines -- nothing else
-                    # (no video link, no hand-written note, no gibberish) survives.
+                    # Remove cheater, retain other attributes, and keep only automatic racist proofs.
                     self.assertEqual(entry["attributes"], order_attributes(was - {"cheater"}))
                     if "proof" in original:
                         kept = [line for line in original["proof"] if isinstance(line, str) and is_racist_proof(line)]
@@ -605,13 +597,12 @@ class EvidenceTests(unittest.TestCase):
         index = index_of(hackerpolice_entry("[U:1:100]", [1, "  ", None, "https://x", "https://x"]))
         database = {"players": [player("[U:1:100]", ["suspicious"])]}
         changes = promote(database, index)
-        self.assertEqual(changes[0].evidence, ("https://x",))  # de-duplicated, junk dropped
+        self.assertEqual(changes[0].evidence, ("https://x",))  # Deduplicate links; ignore invalid proof values.
         self.assertEqual(changes[0].evidence_omitted, 0)
 
     def test_a_change_retains_only_the_evidence_the_report_can_show(self):
         links = [f"https://example.invalid/{number}" for number in range(policy.MAX_EVIDENCE_LINKS + 2)]
-        # Duplicates of a rendered link are ignored; remaining proof entries
-        # after the cap are counted without retaining their strings in Change.
+        # Ignore duplicates among displayed links; count overflow entries without retaining them.
         proofs = [*links, links[0], links[-1]]
         index = index_of(hackerpolice_entry("[U:1:100]", proofs))
         database = {"players": [player("[U:1:100]", ["suspicious"])]}
@@ -644,7 +635,7 @@ class SyncInvariantTests(unittest.TestCase):
             [(c.steamid, c.kind, c.after) for c in changes], [("[U:1:100]", "promote", ("cheater", "racist"))]
         )
         self.assertEqual(database["players"][0]["attributes"], ["cheater", "racist"])
-        # ... and a second run must be a no-op.
+        # A second sync must be a no-op.
         self.assertEqual(sync(database, index, enable_demote=True, removed_ids={"[U:1:100]"}), [])
 
 
@@ -654,18 +645,18 @@ class MalformedEntryTests(unittest.TestCase):
     def test_demote_keeps_entries_it_cannot_interpret(self):
         players = [
             "not a dict",
-            {"attributes": ["cheater"]},  # no steamid
-            player("nope", ["cheater"]),  # unusable steamid
-            player("[U:1:400]", []),  # no attributes
-            player("[U:1:401]", [1]),  # non-string attribute
-            player("[U:1:402]", ["suspicious"]),  # not a cheater
-            player("[U:1:100]", ["cheater"]),  # the only real demotion
+            {"attributes": ["cheater"]},  # Missing SteamID.
+            player("nope", ["cheater"]),  # Unusable SteamID.
+            player("[U:1:400]", []),  # Missing attributes.
+            player("[U:1:401]", [1]),  # Non-string attribute.
+            player("[U:1:402]", ["suspicious"]),  # Not a cheater.
+            player("[U:1:100]", ["cheater"]),  # Only this entry is demoted.
         ]
         database = {"players": list(players)}
         changes = demote(database, {"[U:1:100]", "[U:1:999]"})
         self.assertEqual(len(changes), 1)
-        # [U:1:999] is "removed upstream" but absent locally: nothing to do.
-        self.assertEqual(len(database["players"]), 6)  # only [U:1:100] dropped
+        # Removed upstream but absent locally: nothing to remove.
+        self.assertEqual(len(database["players"]), 6)  # Only [U:1:100] is removed.
         self.assertEqual(database["players"][0], "not a dict")
 
     def test_promote_skips_entries_it_cannot_interpret(self):
@@ -677,9 +668,9 @@ class MalformedEntryTests(unittest.TestCase):
                 player("nope", ["suspicious"]),
                 player("[U:1:200]", []),
                 player("[U:1:201]", [1]),
-                player("[U:1:202]", ["cheater"]),  # already a cheater
+                player("[U:1:202]", ["cheater"]),  # Already a cheater.
                 player("[U:1:203]", ["suspicious"]),
-                player("[U:1:999]", ["suspicious"]),  # not on the list
+                player("[U:1:999]", ["suspicious"]),  # Not listed upstream.
             ]
         }
         changes = promote(database, index)
@@ -723,16 +714,16 @@ class PolicyFuzzTests(unittest.TestCase):
             after = {p["steamid"]: p for p in database["players"]}
 
             ids = [int(p["steamid"][5:-1]) for p in database["players"]]
-            self.assertEqual(ids, sorted(ids))  # always sorted, whatever happened
+            self.assertEqual(ids, sorted(ids))  # Entries remain sorted, regardless of the changes.
             self.assertFalse(validate(database).errors)
             for steamid, before in original.items():
                 demoted = steamid in removed and "cheater" in before["attributes"]
                 if demoted and "racist" not in before["attributes"]:
-                    self.assertNotIn(steamid, after)  # cheater-only: entry gone
+                    self.assertNotIn(steamid, after)  # Remove a cheater-only entry.
                     continue
-                self.assertIn(steamid, after)  # nothing else may ever vanish
+                self.assertIn(steamid, after)  # Preserve unrelated entries.
                 got = after[steamid]
-                if demoted:  # cheater+racist: racist kept, only auto-racist proofs survive
+                if demoted:  # Remove cheater; retain racist and only the automatic racist proofs.
                     self.assertNotIn("cheater", got["attributes"])
                     self.assertIn("racist", got["attributes"])
                     for proof in got.get("proof", []):
@@ -746,7 +737,7 @@ class PolicyFuzzTests(unittest.TestCase):
                     self.assertNotIn("suspicious", got["attributes"])
                     self.assertEqual("racist" in got["attributes"], "racist" in before["attributes"])
                 else:
-                    self.assertEqual(got, before)  # untouched means byte-identical
+                    self.assertEqual(got, before)  # Unchanged entries remain identical
 
 
 class OwnerAcceptanceTests(unittest.TestCase):
@@ -766,7 +757,7 @@ class OwnerAcceptanceTests(unittest.TestCase):
         self.database = self.root / "playerlist.garou3299.json"
         self.upstream = self.root / "upstream.json"
         self.snapshot = self.root / "snapshot" / "playerlist.vorobey-hackerpolice.json"
-        self.snapshot.parent.mkdir(parents=True, exist_ok=True)  # the CLI will not invent it
+        self.snapshot.parent.mkdir(parents=True, exist_ok=True)  # The CLI must not create missing parent directories.
 
     def write(self, path, players):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -817,7 +808,7 @@ class OwnerAcceptanceTests(unittest.TestCase):
 
         entry = self.entry(after, "[U:1:101]")
         self.assertEqual(entry["attributes"], ["cheater"])
-        self.assertNotIn("proof", entry)  # nothing was invented
+        self.assertNotIn("proof", entry)  # Promotion must not invent proof.
 
     def test_rule_2_suspicious_and_racist_becomes_cheater_and_racist_without_new_proofs(self):
         self.write(self.database, [player("[U:1:200]", ["suspicious", "racist"], proof=[self.RACIST_LINE])])
@@ -832,7 +823,7 @@ class OwnerAcceptanceTests(unittest.TestCase):
     def test_rule_3_cheater_only_removed_upstream_drops_the_whole_entry(self):
         self.write(self.database, [player("[U:1:300]", ["cheater"], proof=["Silent Aim & ESP"])])
         self.write(self.snapshot, [player("[U:1:300]", ["cheater"])])
-        self.write(self.upstream, [hackerpolice_entry("[U:1:399]")])  # 300 is gone from upstream
+        self.write(self.upstream, [hackerpolice_entry("[U:1:399]")])  # [U:1:300] is absent upstream.
 
         after = self.run_sync("--demote")
 
@@ -859,7 +850,7 @@ class OwnerAcceptanceTests(unittest.TestCase):
             ],
         )
         self.write(self.snapshot, [player("[U:1:400]", ["cheater", "racist"])])
-        self.write(self.upstream, [hackerpolice_entry("[U:1:499]")])  # 400 is gone from upstream
+        self.write(self.upstream, [hackerpolice_entry("[U:1:499]")])  # [U:1:400] is absent upstream.
 
         after = self.run_sync("--demote")
 
@@ -876,8 +867,8 @@ class OwnerAcceptanceTests(unittest.TestCase):
 
         after = self.run_sync()
 
-        self.assertEqual(self.entry(after, "[U:1:500]")["attributes"], ["cheater"])  # the run did something
-        self.assertEqual(self.snapshot.read_bytes(), raw)  # ... and the copy is exact
+        self.assertEqual(self.entry(after, "[U:1:500]")["attributes"], ["cheater"])  # The sync promoted the entry.
+        self.assertEqual(self.snapshot.read_bytes(), raw)  # The snapshot remains an exact byte copy.
 
     def test_rule_5_snapshot_keeps_being_updated_when_the_database_does_not_change(self):
         """A run that changes no entry must still advance the baseline."""
@@ -897,8 +888,8 @@ class OwnerAcceptanceTests(unittest.TestCase):
         self.upstream.write_bytes(second)
         after = self.run_sync("--demote")
 
-        self.assertEqual(after["players"][0]["attributes"], ["cheater"])  # no database change
-        self.assertEqual(self.snapshot.read_bytes(), second)  # baseline still advanced
+        self.assertEqual(after["players"][0]["attributes"], ["cheater"])  # The database is unchanged.
+        self.assertEqual(self.snapshot.read_bytes(), second)  # The snapshot baseline still advances.
 
 
 if __name__ == "__main__":

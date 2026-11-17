@@ -1,5 +1,4 @@
-# Tooling configuration only: the scripts run on a bare Python 3.10+ install,
-# ruff is used by contributors and by CI to keep the code tidy.
+# Tooling only; scripts run on Python 3.10+. Ruff is used locally and in CI.
 
 [tool.ruff]
 line-length = 120

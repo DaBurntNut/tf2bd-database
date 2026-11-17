@@ -84,7 +84,7 @@ class WriteSnapshotTests(unittest.TestCase):
     def test_returns_false_and_leaves_the_file_alone_when_identical(self):
         changed = sync_module.write_snapshot(self.path, b"same\n", b"same\n", dry_run=False)
         self.assertFalse(changed)
-        self.assertFalse(self.path.exists())  # nothing written
+        self.assertFalse(self.path.exists())  # No file is written when the snapshot already matches.
 
     def test_dry_run_reports_the_change_without_writing(self):
         changed = sync_module.write_snapshot(self.path, b"new\n", b"old\n", dry_run=True)
@@ -109,7 +109,7 @@ class UntouchedPathTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
 
     def test_oversize_body_is_rejected_then_the_next_source_is_used(self):
-        # A body past the download budget must be refused, not written to disk.
+        # Reject a body over the download limit rather than writing it to disk.
         with (
             mock.patch.object(sources, "MAX_SOURCE_BYTES", 100),
             mock.patch(
@@ -137,8 +137,8 @@ class UntouchedPathTests(unittest.TestCase):
             mock.patch("sources.time.sleep"),
         ):
             _, source, _ = load_first_available_raw([str(local), SOURCE_URL])
-        self.assertEqual(source, SOURCE_URL)  # the I/O error became a clean skip
-        open_file.assert_called_once()  # the first local read really failed
+        self.assertEqual(source, SOURCE_URL)  # Report the I/O error as a skipped source.
+        open_file.assert_called_once()  # The first local-source read failed before fallback.
 
     def test_blob_url_is_only_derived_from_a_contents_api_url(self):
         sha = "a" * 40
@@ -151,7 +151,7 @@ class UntouchedPathTests(unittest.TestCase):
         )
 
     def test_running_the_module_as_a_script_uses_main(self):
-        # Exactly what the workflow does: python3 scripts/sync_vorobey_hackerpolice.py
+        # Match the workflow's direct script invocation.
         output = io.StringIO()
         with (
             mock.patch.object(sys, "argv", ["sync_vorobey_hackerpolice.py", "--help"]),
@@ -163,16 +163,16 @@ class UntouchedPathTests(unittest.TestCase):
         self.assertNotIn("--include-proof", output.getvalue())
 
     def test_envelope_with_non_string_content_is_not_unwrapped(self):
-        # encoding says base64 but content is not text: b64decode would raise,
-        # so the envelope must be rejected before it is tried.
+        # Base64 content must be text; reject other types before decoding so
+        # b64decode() cannot turn malformed input into an uncaught exception.
         self.assertIsNone(sources._unwrap_github_contents_envelope({"encoding": "base64", "content": 123}))
         self.assertIsNone(sources._unwrap_github_contents_envelope({"content": "e30="}))
         self.assertIsNone(sources._unwrap_github_contents_envelope({"encoding": "base64"}))
         self.assertIsNone(sources._unwrap_github_contents_envelope({"encoding": "base64", "content": ""}))
 
     def test_envelope_content_with_line_breaks_still_decodes(self):
-        # The API may wrap long base64 in newlines; strict validation would
-        # reject that and silently lose the fallback.
+        # GitHub may wrap base64 content across lines; strict validation would
+        # reject valid responses and prevent the fallback.
         encoded = base64.encodebytes(b'{"players": []}').decode("ascii")
         self.assertIn("\n", encoded)
         self.assertEqual(
@@ -180,14 +180,14 @@ class UntouchedPathTests(unittest.TestCase):
         )
 
     def test_redact_url_omits_a_url_it_cannot_parse(self):
-        # urlsplit raises on a malformed IPv6 literal; logging must not crash
-        # or fall back to echoing credentials from the unparseable URL.
+        # A malformed IPv6 literal makes urlsplit() raise; redaction must not
+        # crash or expose credentials from the unparseable URL.
         broken = "https://user:secret@[::1/list.json"
         self.assertEqual(sources.redact_url(broken), "[malformed URL omitted]")
 
     def test_indirect_document_skips_a_candidate_that_is_not_a_playerlist(self):
-        # A follow-up URL that answers with JSON which is neither a playerlist
-        # nor a base64 envelope: it must be skipped, not accepted.
+        # Reject follow-up JSON that is neither a playerlist nor a base64
+        # envelope.
         envelope = json.dumps(
             {
                 "encoding": "base64",
@@ -201,7 +201,7 @@ class UntouchedPathTests(unittest.TestCase):
             if url == SOURCE_API_URL:
                 return envelope
             if url == "https://example.invalid/download.json":
-                return b'{"$schema": "x"}'  # JSON, but not a playerlist
+                return b'{"$schema": "x"}'  # Valid JSON, but not a playerlist document.
             raise SyncError("blocked")
 
         with (
@@ -222,7 +222,7 @@ class UntouchedPathTests(unittest.TestCase):
             sources.redact_url("https://:ghp_secret@example.invalid/list.json"),
             "https://example.invalid/list.json",
         )
-        # The same form with a port, and with both halves empty apart from the password.
+        # The empty-username case must also preserve a non-default port.
         self.assertEqual(
             sources.redact_url("https://:s3cret@example.invalid:8443/x"),
             "https://example.invalid:8443/x",
@@ -236,8 +236,8 @@ class UntouchedPathTests(unittest.TestCase):
         self.assertNotIn("secret", sources.redact_url("https://user:secret@example.invalid/x"))
 
     def test_a_directory_that_cannot_be_fsynced_does_not_fail_the_write(self):
-        # Some platforms cannot fsync a directory; the rename is already done,
-        # so failing to make it durable must not turn the write into an error.
+        # Some platforms cannot fsync directories. The atomic rename is already
+        # complete, so unsupported directory durability must not fail the write.
         target = self.root / "list.json"
         real_fsync = os.fsync
 
@@ -251,9 +251,8 @@ class UntouchedPathTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"{}\n")
 
     def test_indirect_document_with_no_usable_candidate_is_a_fetch_error(self):
-        # A GitHub API envelope that decodes to nothing usable, and every
-        # follow-up URL for it is blocked: the source must fail with a clear
-        # SyncError, not a traceback and not a half-parsed document.
+        # An unusable API envelope with blocked fallback URLs must produce a
+        # clear SyncError rather than a traceback or partially parsed document.
         envelope = json.dumps(
             {"encoding": "base64", "content": base64.b64encode(b"{}").decode("ascii"), "sha": "a" * 40}
         ).encode("utf-8")
@@ -275,7 +274,7 @@ class UntouchedPathTests(unittest.TestCase):
         target = self.root / "list.json"
         with mock.patch.object(Path, "replace", side_effect=OSError("disk full")), self.assertRaises(OSError):
             sync_module._atomic_write_bytes(target, b"{}\n")
-        self.assertEqual(list(self.root.iterdir()), [])  # no stale .tmp file
+        self.assertEqual(list(self.root.iterdir()), [])  # Failed writes must not leave a temporary file behind.
 
     def test_a_valid_long_basename_can_still_be_written_atomically(self):
         name_limit = os.pathconf(self.root, "PC_NAME_MAX")
@@ -373,7 +372,7 @@ class UntouchedPathTests(unittest.TestCase):
         target.chmod(0o640)
         sync_module._atomic_write_bytes(target, b"new\n")
         self.assertEqual(target.read_bytes(), b"new\n")
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)  # mode preserved
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)  # Preserve the existing file mode.
 
     def test_a_new_file_takes_the_umask_not_a_hardcoded_0644(self):
         """``chmod(0o644)`` overrode the operator's umask.
@@ -448,7 +447,7 @@ class UntouchedPathTests(unittest.TestCase):
                     argv[flag] = str(loop)
                     flat = [item for pair in argv.items() for item in pair if item is not None]
                     with contextlib.redirect_stdout(io.StringIO()):
-                        code = main(flat)  # must not raise or replace the loop with a file
+                        code = main(flat)  # Return a clean refusal and leave the symlink intact.
                     self.assertEqual(code, 2)
                     self.assertTrue(loop.is_symlink())
 
@@ -460,20 +459,19 @@ class UntouchedPathTests(unittest.TestCase):
         before = database.read_bytes()
         clean = playerlist_module.ValidationResult()
         broken = playerlist_module.ValidationResult(errors=["simulated problem"])
-        # load_database() validates too: let that one pass, fail the post-sync one.
+        # Let load_database() pass, then fail validation after the sync.
         with mock.patch.object(sync_module, "validate", side_effect=[clean, broken]):
             code = main(
                 ["--database", str(database), "--source", str(source), "--snapshot", str(self.root / "snapshot.json")]
             )
         self.assertEqual(code, 2)
-        self.assertEqual(database.read_bytes(), before)  # nothing written
+        self.assertEqual(database.read_bytes(), before)  # A validation failure must leave the database unchanged.
 
     def test_policy_keeps_an_entry_whose_attributes_are_not_a_list(self):
-        # A bare string is iterable, so an unguarded loop would treat it as a
-        # list of one-character tags and mangle the entry.
-        # A tuple/set/dict of real tag names is the dangerous case: unlike a
-        # bare string it survives the "looks like attributes" checks, so an
-        # unguarded policy would rewrite (or crash on) a hand-edited entry.
+        # Strings are iterable, so an unguarded loop could treat each character as a tag.
+        # Tuples, sets, and dictionaries can also pass superficial shape checks.
+        # Policy helpers should leave these malformed values unchanged rather than
+        # rewriting hand-edited data or crashing while processing it.
         for attributes in (
             "cheater",
             "suspicious",
@@ -492,8 +490,8 @@ class UntouchedPathTests(unittest.TestCase):
             self.assertEqual(database["players"][0]["attributes"], attributes)
 
     def test_demote_leaves_an_entry_with_non_string_attributes_alone(self):
-        # validate() rejects this before the run starts; the policy still keeps
-        # the entry rather than crashing if it ever reaches here.
+        # validate() rejects this at the CLI boundary. Policy helpers should
+        # still leave malformed entries unchanged if called directly.
         database = {"players": [{"steamid": "[U:1:100]", "attributes": [1, "cheater"]}]}
         changes = demote(database, ["[U:1:100]"])  # type: ignore[arg-type]
         self.assertEqual(changes, [])
@@ -530,17 +528,16 @@ class WriteOrderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "up.json").write_text(dumps({"players": [player("[U:1:1]", ["cheater"])]}), encoding="utf-8")
-            # deliberately non-canonical, so a successful rewrite is visible
+            # Keep the input non-canonical so a successful write is observable.
             (root / "db.json").write_text(
                 '{"players":[{"attributes":["cheater"],"steamid":"[U:1:1]"}]}', encoding="utf-8"
             )
-            # A symlink whose target directory does not exist: the guard sees a
-            # healthy parent (root), the previous-snapshot read sees "no file"
-            # (a broken link does not exist), and the write -- which resolves the
-            # link -- fails. That is the "last write fails after the database
-            # changed" case, deterministically, even when tests run as root.
+            # The symlink targets a missing directory: path checks accept its existing
+            # parent, and snapshot loading treats the dangling link as absent. The write
+            # resolves the link and fails, deterministically exercising a final write
+            # failure even when tests run as root.
             (root / "snap.json.link").symlink_to(root / "nodir" / "snap.json")
-            with contextlib.redirect_stdout(io.StringIO()):  # the report goes to stdout
+            with contextlib.redirect_stdout(io.StringIO()):  # The CLI prints the report even with --report set.
                 code = main(
                     [
                         "--database",
@@ -560,7 +557,7 @@ class WriteOrderTests(unittest.TestCase):
                 (root / "db.json").read_bytes(),
                 dumps({"players": [player("[U:1:1]", ["cheater"])]}).encode("utf-8"),
             )
-            self.assertTrue((root / "snap.json.link").is_symlink())  # the failed target is untouched
+            self.assertTrue((root / "snap.json.link").is_symlink())  # Preserve the failed target symlink.
             self.assertEqual([p.name for p in root.iterdir() if ".tmp" in p.name], [])
 
 
@@ -585,7 +582,7 @@ class IdempotencyTests(unittest.TestCase):
                 }
             )
             (root / "up.json").write_text(upstream, encoding="utf-8")
-            # Promoted, demoted (entry removed) and left alone, all in one run.
+            # Exercise promotion, full-entry demotion, and an unrelated player in one run.
             (root / "db.json").write_text(
                 dumps(
                     {
@@ -618,23 +615,23 @@ class IdempotencyTests(unittest.TestCase):
                 ]
                 with (
                     mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}),
-                    contextlib.redirect_stdout(io.StringIO()),  # the report goes to stdout
+                    contextlib.redirect_stdout(io.StringIO()),  # The report is printed to stdout.
                 ):
                     self.assertEqual(main(argv), 0)
                 return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
 
             first = run(root / "out1")
             self.assertEqual(first["changed"], "true")
-            self.assertEqual(first["count"], "2")  # one promotion, one demotion
+            self.assertEqual(first["count"], "2")  # One promotion and one demotion were applied.
             database_after, snapshot_after = (root / "db.json").read_bytes(), (root / "snap.json").read_bytes()
-            self.assertEqual(snapshot_after, upstream.encode("utf-8"))  # baseline advanced
+            self.assertEqual(snapshot_after, upstream.encode("utf-8"))  # Advance the snapshot baseline.
 
             second = run(root / "out2")
             self.assertEqual(second["changed"], "false")
             self.assertEqual(second["count"], "0")
             self.assertEqual(second["modified"], "false")
             self.assertEqual(second["snapshot_changed"], "false")
-            # Byte-for-byte untouched, and the report says so.
+            # The second run leaves both files byte-for-byte unchanged.
             self.assertEqual((root / "db.json").read_bytes(), database_after)
             self.assertEqual((root / "snap.json").read_bytes(), snapshot_after)
             self.assertIn("No changes", (root / "report.md").read_text(encoding="utf-8"))
@@ -921,13 +918,12 @@ class CliTests(unittest.TestCase):
         args = build_parser().parse_args(["--snapshot", "some/path.json", "--no-update-snapshot"])
         self.assertEqual(args.snapshot, "some/path.json")
         self.assertTrue(args.no_update_snapshot)
-        # The pre-rename --backup flags no longer exist.
+        # The obsolete --backup options must remain rejected.
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             build_parser().parse_args(["--backup", "old/path.json"])
 
     def run_cli(self, *extra, env=None):
-        # Always point --snapshot at the temp dir so tests never touch the
-        # repository's real snapshot.
+        # Use a temporary snapshot path so tests never touch the repository file.
         argv = ["--database", str(self.database), "--snapshot", str(self.root / "snapshot.json"), *extra]
         stdout, stderr = io.StringIO(), io.StringIO()
         with (
@@ -962,9 +958,9 @@ class CliTests(unittest.TestCase):
     def test_a_hostile_path_cannot_inject_a_log_line_or_an_ansi_escape(self):
         code, _, stderr = self.run_cli("--source", str(self.source), "--database", "a\nb\x1b[31m.json")
         self.assertEqual(code, 2)
-        self.assertNotIn("\x1b", stderr)  # no raw ESC
-        self.assertEqual(stderr.strip().count("\n"), 0)  # exactly one line
-        self.assertIn("a\\nb", stderr)  # shown as an escape, not dropped
+        self.assertNotIn("\x1b", stderr)  # The log contains no raw ESC character.
+        self.assertEqual(stderr.strip().count("\n"), 0)  # The hostile path does not add log lines.
+        self.assertIn("a\\nb", stderr)  # Preserve the value in escaped form rather than dropping it.
 
     def test_a_hostile_snapshot_path_cannot_repaint_the_log(self):
         """The success lines print paths too: escape them like the error lines."""
@@ -972,7 +968,7 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.run_cli("--source", str(self.source), "--snapshot", str(snapshot))
         self.assertEqual(code, 0)
         self.assertNotIn("\x1b", stderr)
-        self.assertIn("\\x1b[0m", stderr)  # shown as an escape, not dropped
+        self.assertIn("\\x1b[0m", stderr)  # Preserve the value in escaped form rather than dropping it.
         self.assertTrue(snapshot.exists())
 
     def test_suspicious_and_racist_are_written(self):
@@ -1052,8 +1048,8 @@ class CliTests(unittest.TestCase):
                     "$schema": "x",
                     "file_info": {},
                     "players": [
-                        player("[U:1:400]", ["cheater"]),  # removed upstream -> demoted
-                        player("[U:1:300]", ["suspicious"]),  # removed upstream, not a cheater
+                        player("[U:1:400]", ["cheater"]),  # Removed upstream; demote this local cheater.
+                        player("[U:1:300]", ["suspicious"]),  # Removed upstream, but this player is not a cheater.
                     ],
                 }
             ),
@@ -1062,15 +1058,15 @@ class CliTests(unittest.TestCase):
         self.write_snapshot_fixture(
             hackerpolice_entry("[U:1:300]"),
             hackerpolice_entry("[U:1:400]"),
-            hackerpolice_entry("[U:1:500]"),  # not in this database at all
+            hackerpolice_entry("[U:1:500]"),  # Removed upstream, but absent from this database.
         )
         report_file = self.root / "report.md"
         code, stdout, _ = self.run_cli("--source", str(self.source), "--demote", "--report", str(report_file))
         self.assertEqual(code, 0)
         report = report_file.read_text(encoding="utf-8")
         self.assertEqual(report, stdout)
-        # The file IS the pull request body: exactly one trailing newline, so
-        # the published body does not end with a blank line.
+        # The report file becomes the PR body: include exactly one trailing newline
+        # so the published body does not end with a blank line.
         self.assertTrue(report.endswith("\n"))
         self.assertFalse(report.endswith("\n\n"))
         self.assertEqual(report_file.read_bytes(), report.encode("utf-8"))
@@ -1082,7 +1078,7 @@ class CliTests(unittest.TestCase):
                 f"| `[U:1:{account}]` | [Profile](https://steamcommunity.com/profiles/{steamid64}) |",
                 report,
             )
-        # The still-current upstream IDs are not "removed".
+        # IDs still present upstream are not removals.
         for account in (100, 200):
             self.assertNotIn(f"| `[U:1:{account}]` | [Profile]", report)
 
@@ -1098,7 +1094,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("looks like an upstream problem", stdout)
         self.assertIn("**61 SteamIDs removed from the Vorobey hackerpolice list", stdout)
         self.assertIn("**not refreshed**", stdout)
-        # ... while demotion was skipped, so the baseline did not advance.
+        # Demotion was skipped, so the snapshot baseline did not advance.
         self.assertEqual(
             {p["steamid"] for p in json.loads(snapshot_fixture.read_text(encoding="utf-8"))["players"]},
             {f"[U:1:{n}]" for n in range(400, 461)},
@@ -1142,13 +1138,13 @@ class CliTests(unittest.TestCase):
         snapshot_fixture = self.write_snapshot_fixture(hackerpolice_entry("[U:1:300]"), hackerpolice_entry("[U:1:400]"))
         before = snapshot_fixture.read_bytes()
 
-        code, stdout, _ = self.run_cli("--source", str(self.source))  # no --demote
+        code, stdout, _ = self.run_cli("--source", str(self.source))  # Demotion is disabled.
         self.assertEqual(code, 0)
-        self.assertEqual(snapshot_fixture.read_bytes(), before)  # baseline held back
+        self.assertEqual(snapshot_fixture.read_bytes(), before)  # Keep the pending-removal baseline unchanged.
         self.assertIn("**not refreshed**", stdout)
         self.assertIn("demotion is disabled", stdout)
 
-        # ... and the very same removals are applied once --demote is passed.
+        # Passing --demote applies those pending removals.
         code, stdout, _ = self.run_cli("--source", str(self.source), "--demote")
         self.assertEqual(code, 0)
         players = json.loads(self.database.read_text(encoding="utf-8"))["players"]
@@ -1173,8 +1169,8 @@ class CliTests(unittest.TestCase):
         players = json.loads(self.database.read_text(encoding="utf-8"))["players"]
         self.assertEqual(players[0]["attributes"], ["cheater"])
         self.assertIn("Demotion: **skipped", stdout)
-        # The run still writes the snapshot, establishing the baseline; the
-        # second run can then prove removals against it.
+        # This run creates the baseline. The next run can then prove removals
+        # against that snapshot.
         snapshot = json.loads((self.root / "snapshot.json").read_text(encoding="utf-8"))
         self.assertEqual(len(snapshot["players"]), 2)
 
@@ -1190,8 +1186,8 @@ class CliTests(unittest.TestCase):
         players = json.loads(self.database.read_text(encoding="utf-8"))["players"]
         self.assertEqual(players[0]["attributes"], ["cheater"])
         self.assertIn("looks like an upstream problem", stdout)
-        # The snapshot must NOT advance past removals we refused to apply,
-        # or they could never be demoted later.
+        # Do not advance the snapshot past unapplied removals; they would no
+        # longer be available as demotion candidates.
         self.assertEqual(snapshot_fixture.read_bytes(), snapshot_before)
 
     def test_allow_mass_demotion_forces_the_demotion(self):
@@ -1228,7 +1224,7 @@ class CliTests(unittest.TestCase):
             p["steamid"] for p in json.loads((self.root / "snapshot.json").read_text(encoding="utf-8"))["players"]
         }
         self.assertEqual(snapshot_ids, {"[U:1:100]", "[U:1:200]"})
-        # Next run: baseline == current list, so nothing is re-demoted.
+        # The next run sees the current list as its baseline and makes no changes.
         code, stdout, _ = self.run_cli("--source", str(self.source), "--demote")
         self.assertEqual(code, 0)
         self.assertIn("No changes", stdout)
@@ -1298,9 +1294,9 @@ class CliTests(unittest.TestCase):
         self.assertIn("snapshot_removed=0", lines)
 
     def test_concurrent_runs_never_corrupt_the_files(self):
-        # Four processes sync the SAME database/snapshot at the same time:
-        # unique temp files + atomic replace must leave complete, valid
-        # files behind (last writer wins, never an interleaved mixture).
+        # Run four processes against the same database and snapshot. Unique temp
+        # files and atomic replacements must leave complete files; the last writer
+        # may win, but writes must never interleave.
         script = Path(__file__).resolve().parents[1] / "scripts" / "sync_vorobey_hackerpolice.py"
         argv = [
             sys.executable,
@@ -1319,13 +1315,13 @@ class CliTests(unittest.TestCase):
             p["steamid"]: p["attributes"] for p in json.loads(self.database.read_text(encoding="utf-8"))["players"]
         }
         self.assertEqual(players["[U:1:100]"], ["cheater"])
-        # The snapshot is still an exact byte replica, and no temp files leaked.
+        # Preserve the byte-for-byte snapshot and leave no temporary files behind.
         self.assertEqual((self.root / "snapshot.json").read_bytes(), self.source.read_bytes())
         self.assertEqual(list(self.root.glob(".*.tmp")), [])
 
     def test_corrupted_files_never_crash(self):
-        # Random byte corruption of database/source/snapshot must always end
-        # in exit 0 or the clean exit 2 -- never an uncaught exception.
+        # Randomly corrupt the database, source, and snapshot; each run must exit
+        # cleanly with status 0 or 2, never with an uncaught exception.
         rng = random.Random(99)
         db_bytes = self.database.read_bytes()
         src_bytes = self.source.read_bytes()
@@ -1346,9 +1342,9 @@ class CliTests(unittest.TestCase):
             self.assertIn(code, (0, 2))
 
     def test_ascii_stdout_cannot_crash_the_report(self):
-        # Regression: on an ASCII/legacy-codepage stdout (Windows cp1252,
-        # PYTHONIOENCODING=ascii) printing the report -- which contains
-        # arrows and non-ASCII names -- used to die with UnicodeEncodeError.
+        # Regression: ASCII or legacy-codepage stdout (for example,
+        # PYTHONIOENCODING=ascii) previously raised UnicodeEncodeError when printing
+        # arrows and non-ASCII names in the report.
         self.write_snapshot_fixture(hackerpolice_entry("[U:1:100]"))
         raw = io.BytesIO()
         stdout = io.TextIOWrapper(raw, encoding="ascii")
@@ -1385,7 +1381,7 @@ class CliTests(unittest.TestCase):
                     "$schema": "x",
                     "file_info": {},
                     "players": [
-                        player("[U:1:900]", ["cheater"]),  # appended by hand, out of order
+                        player("[U:1:900]", ["cheater"]),  # This entry was appended by hand and is out of order.
                         player("[U:1:100]", ["cheater"]),
                     ],
                 }
@@ -1517,7 +1513,7 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.run_cli("--source", str(self.source), "--report", str(report_dir))
         self.assertEqual(code, 2)
         self.assertIn("cannot write report", stderr)
-        # Nothing was written before the report failed.
+        # A report-write failure must occur before any database update.
         self.assertNotIn("cheater", self.database.read_text(encoding="utf-8"))
 
     def test_invalid_database_is_refused_before_anything_is_written(self):
@@ -1578,7 +1574,7 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.run_cli("--source", str(snapshot), "--snapshot", str(snapshot))
         self.assertEqual(code, 2)
         self.assertIn("--source must not be the same file as --snapshot", stderr)
-        # Nothing was written: the baseline is exactly as it was.
+        # The failed run must leave the snapshot baseline unchanged.
         self.assertEqual(snapshot.read_bytes(), before)
 
     def test_a_broken_snapshot_is_not_reported_as_a_broken_upstream_list(self):
@@ -1589,9 +1585,8 @@ class CliTests(unittest.TestCase):
         file that was perfectly fine while the broken one stayed unnamed.
         """
         broken = self.root / "snapshot.json"
-        broken.write_text('{"$schema": "x"}', encoding="utf-8")  # well-formed JSON, wrong shape
-        # --source keeps this off the network: without it the run fetches the
-        # real upstream list first (slow, and unreachable in an offline build).
+        broken.write_text('{"$schema": "x"}', encoding="utf-8")  # Valid JSON with an invalid playerlist shape.
+        # Use a local source to avoid a slow live fetch in offline tests.
         code, _, stderr = self.run_cli("--source", str(self.source))
         self.assertEqual(code, 2)
         self.assertIn(f"the previous snapshot {broken}", stderr)
@@ -1611,7 +1606,7 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.run_cli("--snapshot", str(missing))
         self.assertEqual(code, 2)
         self.assertIn(f"--snapshot directory does not exist: {missing.parent}", stderr)
-        self.assertFalse(missing.parent.exists())  # and it was NOT created
+        self.assertFalse(missing.parent.exists())  # The missing output directory must not be created.
 
     def test_a_missing_output_directory_cannot_inject_a_log_line(self):
         hostile = self.root / ("bad\n\x1b[31m" + "x" * 100) / "report.md"
@@ -1630,7 +1625,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(missing.parent.exists())
         self.assertEqual(
             [p.name for p in self.root.iterdir() if ".tmp" in p.name], []
-        )  # refused before anything was written
+        )  # Refuse before creating any output files.
 
     def test_missing_database_is_an_error(self):
         self.database.unlink()
@@ -1645,8 +1640,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("not valid JSON", stderr)
 
     def test_report_path_must_not_alias_the_database(self):
-        # Regression: the report is written before the database, so an
-        # aliased --report destroyed the database (even in dry-run mode).
+        # Regression: the report is written before the database; an aliased path
+        # could overwrite the database, including during a dry run.
         original = self.database.read_text(encoding="utf-8")
         for extra in (("--report", str(self.database)), ("--report", str(self.database), "--dry-run")):
             code, _, stderr = self.run_cli("--source", str(self.source), *extra)
@@ -1718,7 +1713,7 @@ class UnpublishableJsonTests(unittest.TestCase):
         if snapshot is not None:
             self.write("snap.json", snapshot)
         self.assertEqual(self.run_cli(), 2)
-        self.assertEqual(self.read("db.json"), database)  # not rewritten
+        self.assertEqual(self.read("db.json"), database)  # The rejected database must not be rewritten.
         if snapshot is None:
             self.assertFalse((self.root / "snap.json").exists())
 
@@ -1805,7 +1800,7 @@ class LifecycleTests(unittest.TestCase):
                 player("[U:1:100]", ["suspicious"]),
                 player("[U:1:200]", ["cheater", "racist"], proof=["Silent Aim & ESP", auto]),
                 player("[U:1:300]", ["cheater"]),
-                player("[U:1:999]", ["cheater"]),  # manual cheater, never upstream
+                player("[U:1:999]", ["cheater"]),  # This manually added cheater has never appeared upstream.
             ],
         )
         self.write(
@@ -1818,14 +1813,14 @@ class LifecycleTests(unittest.TestCase):
         self.git("add", "-A")
         self.git("commit", "-qm", "baseline")
 
-        # Run 1 + "merge": promotion lands, baseline committed.
+        # Run 1 applies the promotion and commits the updated baseline.
         self.run_bot()
         self.assertEqual(self.players()["[U:1:100]"]["attributes"], ["cheater"])
         self.git("add", "-A")
         self.git("commit", "-qm", "sync 1")
 
-        # Upstream drops 200+300; run, DISCARD the changes (closed PR), re-run:
-        # the identical demotions must be proposed again from the old baseline.
+        # After upstream removes IDs 200 and 300, discard the proposal as if its PR
+        # were closed. The next run must propose the same demotions from the old baseline.
         self.write(self.up, [hackerpolice_entry("[U:1:100]")])
         out1 = self.run_bot()
         self.git("checkout", "--", "db.json", "snapshot/snap.json")
@@ -1841,7 +1836,7 @@ class LifecycleTests(unittest.TestCase):
         self.git("add", "-A")
         self.git("commit", "-qm", "sync 2")
 
-        # Run 3: fully converged - no changes, clean working tree.
+        # Run 3: no changes; the data and worktree have converged.
         self.assertIn("No changes", self.run_bot())
         status = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -1867,8 +1862,8 @@ class DocumentedLimitsTests(unittest.TestCase):
     """
 
     def test_the_documented_report_limits(self):
-        # README: "a table stops at 150 rows (100 for the removed-SteamID list)
-        # and the whole body stops at 60,000 bytes".
+        # README contract: change tables stop at 150 rows, the removed-ID table
+        # at 100 rows, and the report body at 60,000 bytes.
         self.assertEqual(report_module.MAX_CHANGE_TABLE_ROWS, 150)
         self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 100)
         self.assertEqual(report_module.MAX_REPORT_BYTES, 60_000)
@@ -1884,8 +1879,8 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.MAX_URL_DISPLAY_CHARS, 2048)
 
     def test_the_read_and_fetch_limits(self):
-        # README: "64 MiB per download, 30 s, 3 attempts, then the next fallback.
-        # The same 64 MiB cap applies to the database and snapshot files".
+        # README contract: downloads allow 64 MiB, 30 seconds, and three attempts
+        # before fallback; database and snapshot files share the 64 MiB limit.
         self.assertEqual(playerlist_module.MAX_FILE_BYTES, 64 * 1024 * 1024)
         self.assertEqual(sources.MAX_SOURCE_BYTES, 64 * 1024 * 1024)
         self.assertEqual(sources._MAX_URL_PARSE_CHARS, 4_096)
@@ -1894,10 +1889,10 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.RETRY_BACKOFF_SECONDS, 2)
 
     def test_the_documented_guard_and_account_bounds(self):
-        # README: "more than 50 IDs *and* more than 20 % gone at once".
+        # README contract: the guard requires more than 50 IDs and more than 20% removal.
         self.assertEqual(sync_module.MASS_DEMOTION_MIN_IDS, 50)
         self.assertEqual(sync_module.MASS_DEMOTION_MAX_FRACTION, 0.2)
-        # Steam account IDs are 32-bit, and the instance field occupies 20 bits.
+        # Steam account IDs are 32-bit; instance identifiers use 20 bits.
         self.assertEqual(playerlist_module.MAX_ACCOUNT_ID, 2**32)
         self.assertEqual(playerlist_module.MAX_STEAMID_INSTANCE, 2**20)
 

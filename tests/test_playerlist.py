@@ -49,7 +49,7 @@ class NormalizeSteamIdTests(unittest.TestCase):
             f"https://steamcommunity.com/profiles/{STEAMID64_BASE}",
         ):
             self.assertIsNone(normalize_steamid(probe), probe)
-        self.assertIsNone(playerlist_module._bounded_int("²"))  # defensive guard, unreachable from input
+        self.assertIsNone(playerlist_module._bounded_int("²"))  # Defensive guard; normal input cannot reach this case.
 
     def test_non_ascii_digits_are_rejected_not_crashed(self):
         """Regression: "²".isdigit() is True but int("²") raises, so a single
@@ -132,8 +132,7 @@ class NormalizeSteamIdTests(unittest.TestCase):
         self.assertEqual(normalize_steamid("[U:1:4294967295]"), "[U:1:4294967295]")
 
     def test_steam2_ids_are_range_checked_too(self):
-        # Regression: the STEAM_X:Y:Z branch used to mint [U:1:0] and
-        # account ids far beyond 32 bits.
+        # Regression: reject Steam2 IDs that would yield zero or exceed the 32-bit account range.
         self.assertIsNone(normalize_steamid("STEAM_0:0:0"))
         self.assertIsNone(normalize_steamid("STEAM_0:1:99999999999"))
         self.assertEqual(normalize_steamid("STEAM_0:1:2147483647"), "[U:1:4294967295]")
@@ -148,12 +147,11 @@ class NormalizeSteamIdTests(unittest.TestCase):
         self.assertIsNone(normalize_steamid(10**5000))
 
     def test_absurdly_long_digit_strings_are_rejected_without_crashing(self):
-        # Beyond Python's int-parsing digit limit: hostile/corrupt input
-        # must be rejected, not crash the sync.
+        # Reject values beyond Python's integer-digit limit without crashing.
         huge = "9" * 5000
         for value in (f"[U:1:{huge}]", huge, f"STEAM_0:1:{huge}"):
             self.assertIsNone(normalize_steamid(value), value[:20])
-        # Leading zeros do not count towards the limit.
+        # Leading zeros do not count toward the digit limit.
         self.assertEqual(normalize_steamid("0" * 5000 + "1730017"), "[U:1:1730017]")
 
     def test_rejects_garbage(self):
@@ -190,7 +188,7 @@ class NormalizeSteamIdTests(unittest.TestCase):
         self.assertIsNone(normalize_steamid(int("9" * 400)))
 
     def test_steam_history_url(self):
-        # Same SteamID64 as the Steam Community permalink, on SteamHistory's /id/ page.
+        # SteamHistory uses the same SteamID64 on its /id/ page.
         self.assertEqual(steam_history_url("[U:1:269327660]"), "https://steamhistory.net/id/76561198229593388")
         self.assertEqual(steam_history_url("STEAM_0:1:865008"), "https://steamhistory.net/id/76561197961995745")
         self.assertEqual(steam_history_url(76561198229593388), "https://steamhistory.net/id/76561198229593388")
@@ -328,7 +326,7 @@ class StrictJsonTests(unittest.TestCase):
                 strict_json_loads(body)
             self.assertIn("out of range for a JSON number", str(caught.exception))
         self.assertEqual(strict_json_loads('{"t": 1.5}'), {"t": 1.5})
-        self.assertEqual(strict_json_loads('{"t": 1e-999}'), {"t": 0.0})  # underflow is finite
+        self.assertEqual(strict_json_loads('{"t": 1e-999}'), {"t": 0.0})  # Underflow remains finite.
 
     def test_duplicate_keys_are_refused(self):
         with self.assertRaises(ValueError) as caught:
@@ -347,7 +345,7 @@ class StrictJsonTests(unittest.TestCase):
     def test_the_same_input_as_the_standard_library_still_parses(self):
         for body in ('{"players": []}', '{"a": [1, 2.5, true, false, null]}', '{"s": "ы\\u00e9"}', "[]", "3"):
             self.assertEqual(strict_json_loads(body), json.loads(body))
-        # Bytes, a BOM (already decoded away) and nesting depth behave as before.
+        # Byte input is also accepted.
         self.assertEqual(strict_json_loads(b'{"players": []}'), {"players": []})
 
     def test_serialising_a_non_finite_number_is_refused(self):
@@ -411,7 +409,7 @@ class DisplayPathTests(unittest.TestCase):
     def test_a_lone_surrogate_is_still_printable(self):
         shown = display_path("a\udcffb")
         self.assertNotIn("\udcff", shown)
-        shown.encode("utf-8")  # must not raise
+        shown.encode("utf-8")  # The escaped path remains UTF-8 encodable.
 
     def test_a_very_long_path_is_clipped(self):
         shown = display_path("/tmp/" + "d" * 5_000)

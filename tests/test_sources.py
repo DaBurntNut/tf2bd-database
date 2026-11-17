@@ -88,7 +88,7 @@ class SourceFetchTests(unittest.TestCase):
 
     def test_fetch_returns_body_bytes_verbatim(self):
         (document, source, raw), _ = self.fetch([_FakeResponse(self.BODY)])
-        self.assertEqual(raw, self.BODY)  # BOM and all: nothing decoded/re-encoded
+        self.assertEqual(raw, self.BODY)  # Preserve the fixture's BOM and exact source bytes in the snapshot.
         self.assertEqual(source, self.URL)
         self.assertIn("[U:1:100]", [p["steamid"] for p in document["players"]])
 
@@ -98,12 +98,12 @@ class SourceFetchTests(unittest.TestCase):
             "utf-8"
         )
         (document, _, raw), _ = self.fetch([_FakeResponse(envelope)])
-        self.assertEqual(raw, inner)  # the envelope itself is never snapshotted
+        self.assertEqual(raw, inner)  # Snapshot the decoded file bytes, not the GitHub API envelope.
         self.assertEqual(len(document["players"]), 1)
 
     def test_non_https_download_url_is_never_followed(self):
-        # download_url is untrusted response data: a plaintext or local
-        # target must be rejected, not fetched.
+        # Treat download_url as untrusted response data; reject plaintext and local
+        # targets before opening a follow-up request.
         for bad_url in ("http://example.invalid/raw.json", "/etc/passwd"):
             envelope = json.dumps({"encoding": "none", "content": "", "download_url": bad_url}).encode("utf-8")
             with (
@@ -112,7 +112,7 @@ class SourceFetchTests(unittest.TestCase):
                 self.assertRaises(SyncError),
             ):
                 load_first_available_raw([self.URL])
-            self.assertEqual(urlopen.call_count, 1)  # only the envelope itself was fetched
+            self.assertEqual(urlopen.call_count, 1)  # Only the API envelope was fetched.
 
     def test_a_non_string_download_url_is_ignored(self):
         """download_url is response data: it can be any JSON type, not just text."""
@@ -124,7 +124,7 @@ class SourceFetchTests(unittest.TestCase):
                 self.assertRaises(SyncError),
             ):
                 load_first_available_raw([self.URL])
-            self.assertEqual(urlopen.call_count, 1, value)  # nothing else was fetched
+            self.assertEqual(urlopen.call_count, 1, value)  # No follow-up URL was fetched.
 
     def test_large_file_envelope_falls_back_to_download_url(self):
         envelope = json.dumps(
@@ -172,8 +172,8 @@ class SourceFetchTests(unittest.TestCase):
         redacted = sources.redact_url("https://example.invalid/list.json?token=ghp_SECRET&ref=main")
         self.assertIn("token=REDACTED", redacted)
         self.assertNotIn("ghp_SECRET", redacted)
-        # A harmless parameter keeps its value, so the line still identifies
-        # what was fetched.
+        # Preserve harmless parameters so the fetch line remains useful for
+        # identifying the requested source.
         self.assertIn("ref=main", redacted)
 
     def test_html_character_references_cannot_hide_url_credentials(self):
@@ -221,15 +221,15 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("OVER_ENCODED_HTML_SECRET", shown)
         self.assertIn("too deeply encoded", shown)
 
-        # A percent-encoded query key is decoded by parse_qsl before the
-        # sensitive-name check; unresolved entities there must fail closed too.
+        # parse_qsl decodes percent-encoded keys before the credential-name check;
+        # unresolved HTML entities in keys must also fail closed.
         key = urllib.parse.quote(f"token{delimiter}KEY_SECRET", safe="")
         shown = sources.redact_url(f"https://example.invalid/x?{key}=ignored")
         self.assertNotIn("KEY_SECRET", shown)
         self.assertNotIn("ignored", shown)
         self.assertIn("REDACTED=REDACTED", shown)
 
-        # Encoded scheme separators in a nested URL are bounded independently.
+        # Apply the nested-URL inspection limit to encoded scheme separators too.
         nested = f"https{overencode('&colon;')}{overencode('&sol;&sol;')}user:NESTED_HTML_PASSWORD@client.invalid/path"
         nested_url = "https://example.invalid/?redirect_uri=" + urllib.parse.quote(nested, safe="")
         shown = sources.redact_url(nested_url)
@@ -318,7 +318,7 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("ignored", shown)
         self.assertIn("REDACTED=REDACTED", shown)
 
-        # The malformed/prose fallback must not echo the same obfuscated key.
+        # The malformed-text fallback must also redact this obfuscated key.
         shown = sources.redact_urls_in_text("Context: ?token%3DPROSE_KEY_SECRET=VALUE")
         self.assertNotIn("PROSE_KEY_SECRET", shown)
         self.assertNotIn("VALUE", shown)
@@ -341,7 +341,7 @@ class SourceFetchTests(unittest.TestCase):
         )
         report = render_report(info)
         self.assertNotIn("SUPERSECRET", report)
-        self.assertIn("private\\_token=REDACTED", report)  # "_" is markdown-escaped
+        self.assertIn("private\\_token=REDACTED", report)  # The report escapes underscores for Markdown.
         self.assertIn("ref=main", report)
 
     def test_upstream_evidence_urls_never_publish_credentials(self):
@@ -365,7 +365,7 @@ class SourceFetchTests(unittest.TestCase):
         self.assertIn("X-Amz-Signature=REDACTED", report)
         self.assertIn("ref=main", report)
         self.assertIn("access_token=REDACTED", report)
-        # Credentials were redacted, so don't offer a dead link to the altered URL.
+        # Redacted evidence URLs must not link to the altered target.
         cell = report_module._evidence_cell([evidence])
         self.assertNotIn("](", cell)
 
@@ -479,9 +479,9 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("LINEBREAK_TOKEN", shown)
         self.assertIn("?token=REDACTED.", shown)
 
-        # urlsplit() removes CR/LF/TAB before parsing. These malformed prose
-        # URLs must therefore redact the same query even when a control splits
-        # the parameter name, its equals sign, or its value.
+        # urlsplit() removes CR, LF, and TAB before parsing; malformed prose URLs
+        # must still redact queries when a control splits the parameter name,
+        # equals sign, or value.
         for split_parameter, secret in (
             ("?to ken=SPLIT_SPACE_NAME_SECRET", "SPLIT_SPACE_NAME_SECRET"),
             ("?to\u2002ken=SPLIT_UNICODE_SPACE_NAME_SECRET", "SPLIT_UNICODE_SPACE_NAME_SECRET"),
@@ -530,8 +530,8 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("LONG_SECRET", shown)
 
     def test_redact_url_leaves_an_ordinary_fragment_alone(self):
-        # "= in the fragment" is not enough to redact: a pair whose name is not
-        # secret-looking must keep its value, exactly like the query string.
+        # An equals sign in the fragment is not enough to trigger redaction;
+        # harmless pairs must retain their values, as in the query string.
         for url in (
             "https://h/x#L10",
             "https://h/x#section-2",
@@ -612,7 +612,7 @@ class SourceFetchTests(unittest.TestCase):
             "https://example.invalid/\udfff/x?ref=main",
         ):
             redacted = sources.redact_url(url)
-            redacted.encode("utf-8")  # the report writes UTF-8: must not raise
+            redacted.encode("utf-8")  # Reports are UTF-8 output, so encoding must succeed.
             self.assertNotIn("abc", redacted)
             self.assertIn("example.invalid", redacted)
 
@@ -652,7 +652,7 @@ class SourceFetchTests(unittest.TestCase):
             load(Path(bad))
         with self.assertRaises(sources.SyncError):
             sources._read_bytes(bad)
-        # "no snapshot" is the honest answer for a path that cannot exist
+        # Treat an unrepresentable path as a missing snapshot.
         self.assertIsNone(sources.load_snapshot(Path("x\ud800.json")))
         self.assertFalse(sync_module._same_file(Path(bad), Path("x")))
 
@@ -670,7 +670,7 @@ class SourceFetchTests(unittest.TestCase):
             "https://example.invalid/a\x00b",
             "https://example.invalid/a\u202eb",
             "https://example.invalid/a\u200bb",
-            "https://[::1\nforged",  # urlsplit() itself refuses this one
+            "https://[::1\nforged",  # Exercise urlsplit()'s malformed-IPv6 exception path.
         ):
             shown = sources.redact_url(url)
             self.assertEqual(len(shown.splitlines()), 1)
@@ -685,7 +685,7 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(sources.http_scheme("HTTPS://example.invalid/x"), "https")
         self.assertEqual(sources.http_scheme("HTTP://example.invalid/x"), "http")
         self.assertEqual(sources.http_scheme("playerlist.garou3299.json"), "")
-        self.assertEqual(sources.http_scheme("https://[::1/x"), "")  # malformed, never raises
+        self.assertEqual(sources.http_scheme("https://[::1/x"), "")  # Malformed IPv6 returns an empty scheme.
 
     def test_an_uppercase_https_source_is_fetched_instead_of_treated_as_a_path(self):
         with mock.patch("sources._OPENER.open", return_value=_FakeResponse(b'{"players": []}')):
@@ -702,7 +702,7 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("ghp_secret", str(raised.exception))
         self.assertIn("https://example.invalid/list.json", str(raised.exception))
 
-        # Same for a document that parses but is not a JSON object.
+        # Parsed JSON with the wrong top-level type is rejected as well.
         with (
             mock.patch("sources._OPENER.open", return_value=_FakeResponse(b"[]")),
             self.assertRaises(SyncError) as raised,
@@ -761,7 +761,7 @@ class SourceFetchTests(unittest.TestCase):
             mock.patch("sources.time.sleep"),
         ):
             document, _, raw = load_first_available_raw([self.API_URL])
-        self.assertEqual(raw, inner)  # the envelope is never what gets snapshotted
+        self.assertEqual(raw, inner)  # The API envelope must never be written as the snapshot.
         self.assertEqual(len(document["players"]), 1)
 
     def test_accept_header_matches_the_endpoint(self):
@@ -783,7 +783,7 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(opener.call_args_list[0].args[0].get_header("Accept"), "application/vnd.github.raw")
 
     def test_blob_url_requires_the_github_api_and_a_valid_sha(self):
-        self.assertIsNone(sources._github_blob_url(self.URL, "a" * 40))  # not the API host
+        self.assertIsNone(sources._github_blob_url(self.URL, "a" * 40))  # Reject non-API hosts.
         self.assertIsNone(sources._github_blob_url(self.API_URL, "not-a-sha"))
         self.assertIsNone(sources._github_blob_url(self.API_URL, None))
         self.assertEqual(
@@ -885,7 +885,7 @@ class SourceFetchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(load_snapshot(Path(tmp) / "absent.json"))
             with self.assertRaises(SyncError):
-                load_snapshot(Path(tmp))  # a directory, not a file
+                load_snapshot(Path(tmp))  # A directory is not a source file.
 
     def test_bad_base64_envelope_falls_through_to_the_next_strategy(self):
         envelope = json.dumps({"encoding": "base64", "content": "!!!not base64!!!", "download_url": self.URL}).encode(
@@ -911,7 +911,7 @@ class SourceFetchTests(unittest.TestCase):
 
     def test_a_failing_candidate_is_skipped_for_the_next_one(self):
         sha = "d" * 40
-        # download_url (3 failed attempts) is tried before the blob endpoint.
+        # Try download_url first, then the Git blob endpoint after three failures.
         envelope = json.dumps(
             {"encoding": "none", "content": "", "sha": sha, "download_url": "https://raw.invalid/list.json"}
         ).encode("utf-8")
@@ -988,9 +988,9 @@ class SourceFetchTests(unittest.TestCase):
         self.assertIn("not a regular file", result.stdout)
 
     def test_malformed_urls_are_clean_errors_not_crashes(self):
-        # Bad IPv6 literals / control characters make urllib raise
-        # ValueError/InvalidURL: that must surface as SyncError (fallback
-        # or exit 2), never as a traceback. No network is touched.
+        # Malformed IPv6 literals and control characters can make urllib raise
+        # ValueError or InvalidURL. Convert these to SyncError so callers can fall
+        # back or exit cleanly; neither case should reach the network.
         for url in ("https://[::1", "https://exa\nmple.invalid/"):
             with mock.patch("sources.time.sleep"), self.assertRaises(SyncError):
                 load_first_available_raw([url])
@@ -1082,8 +1082,8 @@ class SourceFetchTests(unittest.TestCase):
 
     def test_http_error_without_a_response_body_is_still_handled(self):
         error = urllib.error.HTTPError(self.URL, 404, "not found", Message(), None)
-        # urllib's constructor substitutes an empty StringIO for None; mimic an
-        # error with no owned response stream to exercise the cleanup guard.
+        # HTTPError replaces a None body with an empty StringIO; set fp to None
+        # explicitly to exercise cleanup when no response stream is owned.
         error.fp = None
         with (
             mock.patch("sources._OPENER.open", side_effect=[error]),
@@ -1126,8 +1126,8 @@ class SourceFetchTests(unittest.TestCase):
         prefix = "https://example.invalid/"
         base_url = prefix + "a" * (sources._MAX_URL_PARSE_CHARS - len(prefix) - 1) + "/"
         request = urllib.request.Request(base_url)
-        # urllib resolves a relative Location before calling redirect_request;
-        # verify the absolute target, not just the short header value.
+        # urllib resolves a relative Location before invoking redirect_request;
+        # validate the absolute target rather than the short header value.
         location = sources.urllib.parse.urljoin(base_url, "b" * 100)
         self.assertGreater(len(location), sources._MAX_URL_PARSE_CHARS)
         with (
@@ -1162,9 +1162,8 @@ class SourceFetchTests(unittest.TestCase):
             load_first_available_raw([self.URL])
         self.assertEqual(opener.call_count, sources.FETCH_ATTEMPTS)
         self.assertEqual(sleep.call_count, sources.FETCH_ATTEMPTS - 1)
-        # The DELAY matters, not just the number of attempts: retrying a
-        # rate-limited server with a zero backoff is a hammer, and the delays
-        # must grow instead of repeating.
+        # Assert the delay values as well as the attempt count: zero-delay retries
+        # would hammer a rate-limited host, and each delay must increase.
         backoffs = [call.args[0] for call in sleep.call_args_list]
         self.assertTrue(all(delay > 0 for delay in backoffs), backoffs)
         self.assertEqual(backoffs, sorted(backoffs))
@@ -1192,7 +1191,7 @@ class SourceFetchTests(unittest.TestCase):
                 else:
                     with self.assertRaises(SyncError):
                         load_first_available_raw([self.URL])
-                    self.assertEqual(response.read_count, 0)  # rejected before download
+                    self.assertEqual(response.read_count, 0)  # Reject the response before reading its body.
 
     def test_a_body_shorter_than_its_declared_length_is_retried(self):
         """A connection that dies mid-body must not hand back partial bytes."""
@@ -1247,7 +1246,7 @@ class SourceFetchTests(unittest.TestCase):
             ):
                 load_first_available_raw([self.URL])
             self.assertEqual(opener.call_count, expected_attempts, f"HTTP {code}")
-            # never sleep after the final attempt
+            # Do not sleep after the final attempt.
             self.assertEqual(sleep.call_count, expected_attempts - 1, f"HTTP {code}")
 
     def test_backoff_grows_linearly_between_attempts(self):
@@ -1281,7 +1280,7 @@ class SourceFetchTests(unittest.TestCase):
             self.assertRaises(SyncError),
         ):
             load_first_available_raw([self.URL])
-        self.assertEqual(response.read_count, 0)  # never downloaded the body
+        self.assertEqual(response.read_count, 0)  # Reject an oversized response before downloading its body.
 
     def test_transient_http_error_is_retried_until_success(self):
         error = urllib.error.HTTPError(self.URL, 503, "unavailable", Message(), None)

@@ -15,8 +15,7 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-# GitHub Actions exports GITHUB_OUTPUT for every step. Tests must never append
-# to the runner's real output file; tests of that behavior supply their own.
+# Clear GitHub Actions' GITHUB_OUTPUT during test imports; output tests inject a temporary path.
 os.environ.pop("GITHUB_OUTPUT", None)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 

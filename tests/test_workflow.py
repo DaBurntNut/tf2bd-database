@@ -71,7 +71,7 @@ class WorkflowContractTests(unittest.TestCase):
         passed = set(re.findall(r"--[a-z][a-z-]*", invocation))
         self.assertTrue(passed, "the sync step should pass flags")
         self.assertEqual(passed - options, set(), "the workflow passes a flag the parser dropped")
-        # Flags hidden in the DRY_RUN / ALLOW_MASS_DEMOTION shell variables.
+        # Check option flags embedded in the DRY_RUN and ALLOW_MASS_DEMOTION shell variables too.
         for hidden in re.findall(r"'(--[a-z][a-z-]*)'", self.workflow):
             self.assertIn(hidden, options)
 
@@ -169,7 +169,7 @@ class WorkflowContractTests(unittest.TestCase):
         jobs = self.jobs()
         self.assertEqual(set(jobs), {"checks", "sync"})
         checks, sync = jobs["checks"], jobs["sync"]
-        self.assertIn("Lint and test the proposed change", checks)  # preserve the existing PR check context
+        self.assertIn("Lint and test the proposed change", checks)  # Preserve the existing pull-request check context.
         self.assertIn("Lint and test before publishing", checks)
         self.assertRegex(self.workflow, r"(?m)^permissions:\n  contents: read$")
         for command in (
@@ -205,8 +205,8 @@ class WorkflowContractTests(unittest.TestCase):
         sync = self.jobs()["sync"]
         self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", sync)
         self.assertIn("ref: ${{ github.event.repository.default_branch }}", sync)
-        # The checks job must NOT pin it: a pull request has to be tested on its
-        # own merge ref.
+        # The checks job must not pin its ref; pull requests need their merge
+        # refs tested.
         self.assertNotIn("ref: ${{ github.event.repository.default_branch }}", self.jobs()["checks"])
 
     def test_the_pull_request_targets_the_default_branch_explicitly(self):
@@ -222,7 +222,7 @@ class WorkflowContractTests(unittest.TestCase):
         steps = self.workflow.split("\n      - ")
         block = next((step for step in steps if step.startswith("name: Close a stale bot pull request")), None)
         self.assertIsNotNone(block, "the workflow must close a stale bot pull request")
-        assert block is not None  # for type checkers
+        assert block is not None  # Keep the narrowed value explicit for type checkers.
         self.assertIn("steps.sync.outcome == 'success'", block)
         self.assertIn("steps.sync.outputs.changed != 'true'", block)
         self.assertIn("env.MODE == 'commit'", block)
@@ -241,17 +241,17 @@ class WorkflowContractTests(unittest.TestCase):
         """
         checks = self.jobs()["checks"]
         self.assertIn("matrix:", checks)
-        self.assertIn('"3.10"', checks)  # the documented floor
+        self.assertIn('"3.10"', checks)  # The documented minimum supported version.
         self.assertIn(
             '"3.12"',
             checks,
-        )  # the production version
+        )  # The production runtime version.
         self.assertIn("python-version: ${{ matrix.python-version }}", checks)
-        # Each leg needs its own concurrency group: with cancel-in-progress on a
-        # SHARED group the legs cancel each other and only one survives.
+        # Include Python in the concurrency key so matrix legs cannot cancel
+        # each other when a run is superseded.
         group = next(line for line in checks.splitlines() if line.strip().startswith("group: checks-"))
         self.assertIn("matrix.python-version", group)
-        # The sync job is production: it stays on one version, deliberately.
+        # The production sync job intentionally uses a single Python version.
         self.assertNotIn("matrix:", self.jobs()["sync"])
 
     def test_scripts_and_tests_parse_as_python_310(self):
@@ -261,8 +261,8 @@ class WorkflowContractTests(unittest.TestCase):
             with self.subTest(path=path.relative_to(self.root)):
                 ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10))
 
-        # Prove this parser mode really rejects syntax introduced after 3.10;
-        # otherwise the compatibility check could silently stop guarding.
+        # Verify that the Python 3.10 parser rejects newer syntax; otherwise
+        # this compatibility check could stop detecting unsupported syntax.
         with self.assertRaises(SyntaxError):
             ast.parse("type Alias = int\n", feature_version=(3, 10))
 
@@ -289,7 +289,7 @@ class WorkflowContractTests(unittest.TestCase):
             "import os, sys;"
             "os.environ['GITHUB_OUTPUT']='must-not-survive-the-import';"
             f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r});"
-            "import test_sources;"  # imports the suite support guard, without running tests
+            "import test_sources;"  # Import test_sources to load the shared environment guard without running tests.
             "print(os.environ.get('GITHUB_OUTPUT', '<popped>'))"
         )
         result = subprocess.run(
@@ -338,7 +338,7 @@ class WorkflowContractTests(unittest.TestCase):
     def test_dependabot_only_bumps_the_pinned_actions(self):
         text = self.dependabot_path.read_text(encoding="utf-8")
         self.assertIn('package-ecosystem: "github-actions"', text)
-        self.assertNotIn("pip", text)  # no runtime dependencies to watch
+        self.assertNotIn("pip", text)  # Runtime scripts have no third-party dependencies to update.
         self.assertNotIn("package-ecosystem: npm", text)
         self.assertIn('interval: "weekly"', text)
 
@@ -368,8 +368,8 @@ class RepositoryDataTests(unittest.TestCase):
     def test_shipped_database_is_valid_and_canonically_formatted(self):
         database, original = load(self.ROOT / "playerlist.garou3299.json")
         self.assertEqual(validate(database).errors, [])
-        # Canonical formatting means a bot run never rewrites the whole file:
-        # a hand-reformatted list would show up as a thousands-line diff.
+        # Canonical formatting prevents the bot from rewriting the full data file
+        # after a manual formatting-only change.
         self.assertEqual(dumps(database), original)
 
     def test_the_shipped_standalone_playerlist_is_valid_and_canonical(self):
@@ -463,7 +463,7 @@ class RepositoryDataTests(unittest.TestCase):
         workflow = (self.ROOT / ".github/workflows/sync-vorobey-hackerpolice.yml").read_text(encoding="utf-8")
         sync_block = self.job_block(workflow, "sync")
         self.assertIn("cancel-in-progress: false", workflow)
-        self.assertIn("timeout-minutes:", sync_block)  # a stuck fetch cannot hold the job
+        self.assertIn("timeout-minutes:", sync_block)  # Bound the job so a stalled fetch cannot run indefinitely.
 
     def test_publishing_steps_stage_only_the_two_data_files(self):
         """`git add -A` would publish whatever else happens to be in the workspace."""
@@ -542,7 +542,7 @@ class RepositoryDataTests(unittest.TestCase):
             git(checkout, "config", "user.name", "test")
             git(checkout, "config", "user.email", "test@example.invalid")
             git(checkout, "checkout", "-B", "main", "origin/main")
-            git(checkout, "checkout", "-B", branch)  # workflow fallback: no upstream configured
+            git(checkout, "checkout", "-B", branch)  # The local fallback branch has no configured upstream.
             upstream = subprocess.run(
                 ["git", "rev-parse", "--verify", "--abbrev-ref", "@{upstream}"],
                 cwd=checkout,
@@ -567,9 +567,9 @@ class RepositoryDataTests(unittest.TestCase):
                 git(checkout, "rev-parse", "HEAD"),
             )
 
-            # First run: the bot branch does not exist. The failed fetch leaves
-            # an empty expectation, which must permit creation but never force
-            # an existing remote ref into place.
+            # On the first run, the remote bot branch is absent. A failed fetch must
+            # leave an empty lease expectation that allows creation but never
+            # authorizes overwriting an existing remote ref.
             git(source, "push", "origin", "--delete", branch)
             fresh = root / "fresh-checkout"
             git(root, "init", str(fresh))
