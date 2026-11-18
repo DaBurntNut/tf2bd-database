@@ -1788,7 +1788,7 @@ class CapBoundaryTests(unittest.TestCase):
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE", "https://youtu.be/DXQ5gEDIhzE"),
             ("https://youtube.com/watch?v=DXQ5gEDIhzE", "https://youtu.be/DXQ5gEDIhzE"),
             ("https://m.youtube.com/watch?v=DXQ5gEDIhzE", "https://youtu.be/DXQ5gEDIhzE"),
-            ("http://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s", "https://youtu.be/DXQ5gEDIhzE"),
+            ("http://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&list=PLabc&index=3", "https://youtu.be/DXQ5gEDIhzE"),
             ("https://youtu.be/DXQ5gEDIhzE", "https://youtu.be/DXQ5gEDIhzE"),
             ("https://www.youtube.com/shorts/DXQ5gEDIhzE", "https://youtu.be/DXQ5gEDIhzE"),
@@ -1798,6 +1798,65 @@ class CapBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(link=link):
                 self.assertEqual(report_module._youtube_short_url(link), expected)
+
+    def test_a_timestamp_in_the_long_form_is_carried_over(self):
+        """A proof is often a specific MOMENT in a long video.
+
+        Dropping the timestamp makes the reviewer hunt for the evidence, so it
+        survives the rewrite in every long form (watch, shorts, embed, live, v).
+        """
+        for link, expected in (
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+            ("https://www.youtube.com/watch?t=42s&v=DXQ5gEDIhzE", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=1m30s", "https://youtu.be/DXQ5gEDIhzE?t=1m30s"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=1h2m3s", "https://youtu.be/DXQ5gEDIhzE?t=1h2m3s"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=90", "https://youtu.be/DXQ5gEDIhzE?t=90"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=90", "https://youtu.be/DXQ5gEDIhzE?start=90"),
+            ("https://www.youtube.com/shorts/DXQ5gEDIhzE?t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+            ("https://www.youtube.com/embed/DXQ5gEDIhzE?t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._youtube_short_url(link), expected)
+
+    def test_no_timestamp_is_ever_invented(self):
+        # The rule is "carry it only if the long form had one".
+        for link in (
+            "https://www.youtube.com/watch?v=DXQ5gEDIhzE",
+            "https://www.youtube.com/watch?v=DXQ5gEDIhzE&si=share-tag",
+            "https://www.youtube.com/watch?v=DXQ5gEDIhzE&list=PLabc",
+            "https://www.youtube.com/shorts/DXQ5gEDIhzE",
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._youtube_short_url(link), "https://youtu.be/DXQ5gEDIhzE")
+
+    def test_only_a_real_timestamp_survives_the_rewrite(self):
+        # Junk in t=/start= must not be pasted into the rewritten link, and no
+        # other query key may ride along with a real timestamp.
+        for link in (
+            "https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=abc",
+            "https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=",
+            "https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s%20evil",
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._youtube_short_url(link), "https://youtu.be/DXQ5gEDIhzE")
+        mixed = "https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s&si=vZ4JnwKUJCx6a1dk&list=PLabc"
+        self.assertEqual(report_module._youtube_short_url(mixed), "https://youtu.be/DXQ5gEDIhzE?t=42s")
+
+    def test_an_already_short_link_is_left_exactly_as_stored(self):
+        """The contract is on the CELL: the stored link is never altered.
+
+        A bare ``youtu.be`` link may be canonicalised to an identical string,
+        and a short link carrying a query is left alone entirely (no rewrite),
+        so either way a ``?t=`` or ``?si=`` the list actually wrote survives.
+        """
+        for link in (
+            "https://youtu.be/DXQ5gEDIhzE",
+            "https://youtu.be/DXQ5gEDIhzE?t=42s",
+            "https://youtu.be/DXQ5gEDIhzE?si=vZ4JnwKUJCx6a1dk",
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._evidence_cell([link]), f"[proof]({link})")
+                self.assertIn(report_module._youtube_short_url(link), (None, link))
 
     def test_the_proof_label_is_proof_when_there_is_exactly_one(self):
         # The rule: one link shows "proof", several show "proof 1", "proof 2", ...

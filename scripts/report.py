@@ -347,6 +347,11 @@ _YOUTUBE_ID_PATH = re.compile(r"^/(?:shorts|embed|live|v)/(?P<id>[A-Za-z0-9_-]+)
 # The already-short host, which needs no rewrite but should display the same way.
 _YOUTUBE_SHORT = re.compile(r"^https?://youtu\.be/(?P<id>[A-Za-z0-9_-]+)$", re.ASCII)
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
+# Query keys that name a position in the video, and the forms YouTube accepts
+# for one ("42", "42s", "1m30s", "1h2m3s"). Anything else is not a timestamp and
+# is dropped rather than pasted into the link.
+_YOUTUBE_TIMESTAMP_KEYS = frozenset({"t", "start"})
+_YOUTUBE_TIME = re.compile(r"^(?:\d+h)?(?:\d+m)?(?:\d+s?)$", re.ASCII)
 
 
 def _youtube_short_url(link: str) -> str | None:
@@ -358,9 +363,12 @@ def _youtube_short_url(link: str) -> str | None:
     secrets. Only the exact YouTube hosts are rewritten -- a lookalike such as
     ``youtube.com.evil.invalid`` is not a YouTube link and keeps its label.
 
-    ``/watch`` URLs keep ONLY the video id, so the label cannot expose the rest
-    of the query (a playlist parameter, or anything else a link may carry). A
-    link without exactly one usable id is left alone rather than guessed at.
+    A ``/watch`` URL keeps its video id and its TIMESTAMP (``t`` / ``start``),
+    because a proof is often a specific moment in a long video and dropping it
+    makes the evidence harder to check. Nothing else from the query survives
+    (playlist, tracking, share tags), and a timestamp is carried only when the
+    long form actually had one -- none is ever invented. A link without exactly
+    one usable id is left alone rather than guessed at.
     """
     short = _YOUTUBE_SHORT.match(link)
     if short is not None:
@@ -373,9 +381,10 @@ def _youtube_short_url(link: str) -> str | None:
         return None
     if parts.netloc.lower() not in _YOUTUBE_HOSTS:
         return None
+    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
     video_id: str | None = None
     if parts.path == "/watch":
-        ids = [value for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True) if key == "v"]
+        ids = [value for key, value in pairs if key == "v"]
         if len(ids) == 1:
             video_id = ids[0]
     else:
@@ -384,7 +393,12 @@ def _youtube_short_url(link: str) -> str | None:
             video_id = by_path.group("id")
     if video_id is None or not _VIDEO_ID.match(video_id):
         return None
-    return f"https://youtu.be/{video_id}"
+    # Keep a real timestamp, in the order it appeared, for EVERY long form --
+    # a /shorts or /live link can point at a moment just as a /watch one can.
+    # Everything else in the query is dropped.
+    kept = [(key, value) for key, value in pairs if key in _YOUTUBE_TIMESTAMP_KEYS and _YOUTUBE_TIME.match(value)]
+    timestamp = "?" + urllib.parse.urlencode(kept) if kept else ""
+    return f"https://youtu.be/{video_id}{timestamp}"
 
 
 def _evidence_link_status(link: str) -> tuple[str, bool]:

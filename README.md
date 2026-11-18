@@ -82,8 +82,10 @@ uniform: `proof` when a row has exactly one link, `proof 1`, `proof 2`, … when
 has several, whatever each link points at — a mixed row stays readable because
 every entry is named the same way. The link target points at the exact upstream
 URL, except a YouTube video, which targets YouTube's own short form
-(`https://youtu.be/<id>`, derived from the video id alone): a faithful alias of
-the same video that keeps the markdown short. That is a pure text rewrite — no
+(`https://youtu.be/<id>`): a faithful alias of the same video that keeps the
+markdown short. A timestamp in the long form (`&t=42s`, `&start=90`) is carried
+across, because a proof is often one specific moment in a long video; nothing
+else from the query survives, and no timestamp is ever invented. That is a pure text rewrite — no
 request and no third-party shortener — so the report stays offline and the link
 stays verifiable. A link whose credentials had to be redacted is shown as plain
 code instead, never as a clickable target.
