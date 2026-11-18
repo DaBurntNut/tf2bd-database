@@ -18,11 +18,7 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = ["playerlist", "sources", "policy", "report", "sync_vorobey_hackerpolice"]
 
-# Scripts are top-level modules; add scripts/ to the type checkers' import path.
-[tool.pyright]
-include = ["scripts"]
-extraPaths = ["scripts"]
-
+# mypy is the type checker CI runs; a second, unenforced config would only drift.
 [tool.mypy]
 # Strictly type-check the small, unattended runtime.
 strict = true

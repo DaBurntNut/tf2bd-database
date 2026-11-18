@@ -8,6 +8,7 @@ hackerpolice list.
 from __future__ import annotations
 
 import errno
+import html
 import json
 import math
 import os
@@ -66,7 +67,8 @@ _DIAGNOSTIC_SECRET_MARKER = re.compile(
 _DIAGNOSTIC_FIELD_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
 _DIAGNOSTIC_VALUE_DELIMITERS = frozenset(",;&\r\n\t ")
 _AUTHORIZATION_HEADER = re.compile(r"(?i)(?P<header>\b(?:proxy-)?authorization\s*:\s*)[^\r\n]*", re.ASCII)
-_BEARER_CREDENTIAL = re.compile(r"(?i)\b(?P<scheme>Bearer|Basic)\s+[^\s,;&]+", re.ASCII)
+# ``Bearer <token>``, also written ``Bearer = <token>`` or ``Bearer: <token>``.
+_BEARER_CREDENTIAL = re.compile(r"(?i)\b(?P<scheme>Bearer|Basic)\s*[:=]?\s+(?P<credential>[^\s,;&]+)", re.ASCII)
 # Also sanitize URL userinfo when the generic path formatter is used directly.
 _URL_USERINFO_PREFIX = re.compile(r"(?:https?:/{0,4}|//)", re.IGNORECASE | re.ASCII)
 _URL_USERINFO_IN_TEXT = re.compile(
@@ -76,7 +78,52 @@ _URL_USERINFO_IN_TEXT = re.compile(
 # Identify nested percent-encoded URL schemes before they are clipped out of view.
 _ENCODED_HTTP_SCHEME = re.compile(r"https?(?:%(?:25)*3a|:(?:%(?:25)*2f))", re.IGNORECASE | re.ASCII)
 _PERCENT_ESCAPE_IN_TEXT = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
+_PERCENT_ESCAPE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
+# Field names keep plain characters plus percent escapes and HTML references.
+_FIELD_NAME_CHARS = re.compile(r"[A-Za-z0-9_.%-]+", re.ASCII)
+# Control and zero-width characters that servers ignore when matching a name.
+_INVISIBLE_IN_FIELD_NAME = re.compile("[\x00-\x20\x7f-\x9f\u200b-\u200f\u2028-\u202f\u2060\ufeff]", re.ASCII)
+# A query-style pair anywhere in free text: find the name, then its value.
+_QUERY_PAIR_IN_TEXT = re.compile(r"[?&#;](?P<name>[^\s=&?#;]+)=(?P<value>[^\s&;#]*)", re.ASCII)
 _MAX_DIAGNOSTIC_DECODE_DEPTH = 8
+# Lone surrogates: JSON can encode them, UTF-8 cannot. Replace before output.
+SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _normalised_field_name(name: str) -> str | None:
+    """Decode an obfuscated field name, or ``None`` if it is not a plain name.
+
+    A query key can percent-encode its separator (``to%0Aken``), use HTML
+    character references, or carry invisible characters a server strips before
+    looking the credential up. Redaction has to be at least as permissive as
+    that normalisation, or the encoded spelling quietly walks past it.
+    """
+    decoded = name
+    for _ in range(_MAX_DIAGNOSTIC_DECODE_DEPTH):
+        next_decoded = html.unescape(urllib.parse.unquote(decoded))
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    else:
+        # Still decoding at the depth limit. Fail closed rather than match on a
+        # spelling that is not the one a server would end up with.
+        return None
+    decoded = _INVISIBLE_IN_FIELD_NAME.sub("", decoded)
+    if not _FIELD_NAME_CHARS.fullmatch(decoded):
+        # It decodes to something that is not a field name any more (an embedded
+        # URL, say). Fail closed instead of guessing what a server would do.
+        return None
+    return decoded
+
+
+def _is_secret_field_name(name: str) -> bool:
+    """True when a credential-looking field name is present in any spelling."""
+    if not name:
+        return False
+    if _DIAGNOSTIC_SECRET_MARKER.search(name) is not None:
+        return True
+    normalised = _normalised_field_name(name)
+    return normalised is not None and _DIAGNOSTIC_SECRET_MARKER.search(normalised) is not None
 
 
 def _redact_diagnostic_secret_pairs(value: str) -> str:
@@ -98,8 +145,7 @@ def _redact_diagnostic_secret_pairs(value: str) -> str:
         key_start = key_end
         while key_start and value[key_start - 1] in _DIAGNOSTIC_FIELD_CHARS:
             key_start -= 1
-        name = value[key_start:key_end]
-        if not name or _DIAGNOSTIC_SECRET_MARKER.search(name) is None:
+        if not _is_secret_field_name(value[key_start:key_end]):
             separator += 1
             continue
         value_start = separator + 1
@@ -122,6 +168,14 @@ def _redact_diagnostic_secret_pairs(value: str) -> str:
                 escaped = char == "\\" and not escaped
                 if char != "\\":
                     escaped = False
+            if value_end - value_start == 2:
+                # An empty quoted body, as in ``password=''SECRET``. Redacting the
+                # empty body would leave the secret itself in the message, so treat
+                # the pair as unquoted and take everything up to the delimiter.
+                value_quote = ""
+                value_end = value_start
+                while value_end < len(value) and value[value_end] not in _DIAGNOSTIC_VALUE_DELIMITERS:
+                    value_end += 1
         else:
             while value_end < len(value) and value[value_end] not in _DIAGNOSTIC_VALUE_DELIMITERS:
                 value_end += 1
@@ -143,12 +197,35 @@ def _redact_diagnostic_secret_pairs(value: str) -> str:
     return "".join(parts)
 
 
-def _redact_diagnostic_text(value: str) -> str:
+def _redact_encoded_query_pairs(value: str) -> str:
+    """Redact the value of a query pair whose NAME only looks sensitive when decoded.
+
+    ``_redact_diagnostic_secret_pairs`` finds a name by reading backwards over
+    plain field characters, so ``?to%0Aken=SECRET`` does not look like a pair
+    at all. This pass decodes each name and follows its ``=`` to the value.
+    """
+    parts: list[str] = []
+    copied_through = 0
+    for match in _QUERY_PAIR_IN_TEXT.finditer(value):
+        name = match.group("name")
+        if _DIAGNOSTIC_SECRET_MARKER.search(name) is not None:
+            continue  # Plain names were already redacted by the scanner above.
+        if not _is_secret_field_name(name):
+            continue
+        parts.extend((value[copied_through : match.start("value")], "REDACTED"))
+        copied_through = match.end("value")
+    if not parts:
+        return value
+    parts.append(value[copied_through:])
+    return "".join(parts)
+
+
+def redact_diagnostic_text(value: str) -> str:
     """Redact common bare secrets, authorization headers, and URL userinfo."""
     value = _AUTHORIZATION_HEADER.sub(r"\g<header>REDACTED", value)
     value = _BEARER_CREDENTIAL.sub(r"\g<scheme> REDACTED", value)
     value = _URL_USERINFO_IN_TEXT.sub(r"\g<prefix>REDACTED@", value)
-    return _redact_diagnostic_secret_pairs(value)
+    return _redact_encoded_query_pairs(_redact_diagnostic_secret_pairs(value))
 
 
 def _redact_diagnostic_preview(value: str, limit: int) -> str:
@@ -166,21 +243,27 @@ def _redact_diagnostic_preview(value: str, limit: int) -> str:
     if inspect_encoded_url:
         if len(value) > len(preview):
             return "[nested URL omitted: too long to inspect safely]"
+        # Redact at every level before decoding the next one. A key can hide its
+        # separator behind an escape (``?to%0Aken=SECRET``), and the decoded form
+        # of that key is no longer a matchable field name, so a single pass over
+        # the deepest level would drop the raw-level redaction.
         candidate = preview
-        safe_candidate: str | None = None
+        shown = redact_diagnostic_text(candidate)
+        redacted = shown != candidate
         for _ in range(_MAX_DIAGNOSTIC_DECODE_DEPTH):
-            candidate = urllib.parse.unquote(candidate)
-            safe = _redact_diagnostic_text(candidate)
-            if safe != candidate:
-                safe_candidate = safe
             if _PERCENT_ESCAPE_IN_TEXT.search(candidate) is None:
                 break
+            candidate = urllib.parse.unquote(shown)
+            shown = redact_diagnostic_text(candidate)
+            redacted = redacted or shown != candidate
         if _PERCENT_ESCAPE_IN_TEXT.search(candidate):
             return "[nested URL omitted: too deep to inspect safely]"
-        if safe_candidate is not None:
-            return safe_candidate
+        if redacted:
+            # Only prefer the decoded spelling when it is what hid the credential;
+            # a benign encoded path is shown exactly as the operator wrote it.
+            return shown
 
-    return _redact_diagnostic_text(preview)
+    return redact_diagnostic_text(preview)
 
 
 def _shown(value: Any) -> str:
@@ -212,20 +295,20 @@ def _shown(value: Any) -> str:
 MAX_SHOWN_PATH_CHARS = 200
 
 
-def display_path(path: Any) -> str:
-    """A path as it should appear in a message: one line, printable, bounded.
+def display_raw(value: Any) -> str:
+    """One line, printable, bounded text that names an operator-supplied value.
 
-    The path is operator input, so it can hold a newline (which would start a
+    Paths are operator input, so they can hold a newline (which would start a
     second, operator-chosen log line) or an ESC sequence (which would repaint
     the terminal that runs ``cat`` on the log). Control characters are shown as
-    escapes rather than dropped, so the message still names the file exactly;
-    ``str`` keeps it readable where ``repr`` would add quotes as well. Build
-    only the preview: escaping an arbitrarily long input before clipping it
-    would allocate an arbitrarily long second string. URL userinfo and common
-    bare credential fields are redacted before this preview is clipped.
+    escapes rather than dropped, so the value still names the file exactly.
+    Build only the preview: escaping an arbitrarily long input before clipping
+    it would allocate an arbitrarily long second string. This does NOT redact
+    credentials -- callers that print untrusted path text go through
+    ``display_path`` instead.
     """
-    raw = str(path)
-    preview = _redact_diagnostic_preview(raw, MAX_SHOWN_PATH_CHARS)
+    raw = str(value)
+    preview = raw[: MAX_SHOWN_PATH_CHARS + 1]
     parts: list[str] = []
     length = 0
     for char in preview:
@@ -237,10 +320,23 @@ def display_path(path: Any) -> str:
             return "".join(parts) + "…"
         parts.append(piece)
         length += len(piece)
-    shown = "".join(parts)
-    if len(raw) > MAX_SHOWN_PATH_CHARS:
-        return shown + "…"
-    return shown
+    return "".join(parts) + ("…" if len(raw) > MAX_SHOWN_PATH_CHARS else "")
+
+
+def display_path(path: Any) -> str:
+    """A path as it should appear in a message: one line, printable, bounded.
+
+    Same rules as ``display_raw``, with one addition: URL userinfo and common
+    bare credential fields are redacted before the preview is clipped, because
+    a path (or a ``--source`` value) can carry a token. Every module that shows
+    a path uses this, so the escaping rules cannot drift per call site.
+
+    ``display_raw`` is the escape-only half. It exists for text a caller has
+    ALREADY redacted (a finished error message): re-running the redactor over
+    it would inspect every ``key=value`` pair it mentions and, on a very long
+    message, report it as an uninspectable URL.
+    """
+    return display_raw(_redact_diagnostic_preview(str(path), MAX_SHOWN_PATH_CHARS))
 
 
 def error_reason(exc: BaseException) -> str:
@@ -255,7 +351,7 @@ def error_reason(exc: BaseException) -> str:
     return getattr(exc, "strerror", None) or str(exc)
 
 
-def _read_bounded_regular_file(path: Path, max_bytes: int) -> bytes:
+def read_bounded_regular_file(path: Path, max_bytes: int) -> bytes:
     """Read at most ``max_bytes + 1`` from a regular file, without blocking on a FIFO.
 
     Refuse known special files before opening them, then open non-blocking and
@@ -572,7 +668,7 @@ def load(path: Path) -> tuple[PlayerList, str]:
     """
     try:
         # Bound reads to regular files and enforce the limit on actual bytes read.
-        raw = _read_bounded_regular_file(path, MAX_FILE_BYTES)
+        raw = read_bounded_regular_file(path, MAX_FILE_BYTES)
     except (OSError, ValueError) as exc:
         # ValueError also covers paths the OS cannot encode (for example, NUL).
         raise PlayerListError(f"cannot read {display_path(path)}: {error_reason(exc)}") from exc

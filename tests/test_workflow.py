@@ -171,7 +171,14 @@ class WorkflowContractTests(unittest.TestCase):
         checks, sync = jobs["checks"], jobs["sync"]
         self.assertIn("Lint and test the proposed change", checks)  # Preserve the existing pull-request check context.
         self.assertIn("Lint and test before publishing", checks)
-        self.assertRegex(self.workflow, r"(?m)^permissions:\n  contents: read$")
+        # The workflow grants nothing globally; each job opts in to exactly what it needs,
+        # so a new job cannot inherit a write token by accident.
+        self.assertRegex(self.workflow, r"(?m)^permissions: \{\}$")
+        self.assertNotRegex(
+            self.workflow.split("jobs:")[0],
+            r"(?m)^\s+contents: write",
+            "the default (workflow-level) permissions must never grant write access",
+        )
         for command in (
             "python3 -m ruff check scripts tests",
             "python3 -m ruff format --check scripts tests",
@@ -210,6 +217,28 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_the_pull_request_targets_the_default_branch_explicitly(self):
         self.assertIn("base: ${{ env.BASE_BRANCH }}", self.workflow)
+
+    def test_a_new_job_cannot_inherit_a_write_token(self):
+        """Workflow-level permissions default to empty; jobs opt in individually.
+
+        The previous workflow granted ``contents: read`` globally, which any
+        future job would silently inherit (and which is the wrong reading of
+        "read-only": it still exposes a token). ``permissions: {}`` makes every
+        grant explicit, and the write-capable job is the only one that asks.
+        """
+        self.assertNotIn("permissions: write-all", self.workflow)
+        jobs = self.jobs()
+        self.assertNotIn("contents: write", jobs["checks"])
+        self.assertIn("contents: write", jobs["sync"])
+        self.assertIn("pull-requests: write", jobs["sync"])
+        # Every job still declares its own permissions block.
+        for name, block in jobs.items():
+            self.assertIn("permissions:", block, f"the {name} job inherits the default token")
+
+    def test_the_checks_job_does_not_download_history_it_never_reads(self):
+        checks = self.jobs()["checks"]
+        self.assertIn("fetch-depth: 1", checks)
+        self.assertNotIn("fetch-depth: 0", checks)  # 0 means the entire history.
 
     def test_a_noop_or_direct_commit_closes_a_stale_bot_pull_request(self):
         """A no-op or direct commit makes any previously opened bot PR stale.

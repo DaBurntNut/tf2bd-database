@@ -32,11 +32,12 @@ from typing import IO, Any
 
 from playerlist import (
     MAX_FILE_BYTES,
-    _read_bounded_regular_file,
-    _redact_diagnostic_text,
+    SURROGATE_RE,
     display_path,
     error_reason,
     normalize_steamid,
+    read_bounded_regular_file,
+    redact_diagnostic_text,
     strict_json_loads,
 )
 
@@ -156,7 +157,12 @@ def _declared_length(response: object) -> int | None:
     declared = response_headers.get("Content-Length") if response_headers is not None else None
     # Accept only ASCII digits in Content-Length.
     if isinstance(declared, str) and declared.isascii() and declared.isdigit():
-        return int(declared)
+        # Bound the digits before int(): a hostile header with thousands of
+        # digits would otherwise trip Python's int-conversion limit and turn a
+        # malformed header into a ValueError traceback. Ten digits is ~10 GiB,
+        # far beyond the byte cap, so a longer value is simply "too large".
+        significant = declared.lstrip("0") or "0"
+        return int(significant) if len(significant) <= 10 else MAX_SOURCE_BYTES + 1
     return None
 
 
@@ -217,10 +223,21 @@ def removed_steamids(previous: HackerpoliceIndex, current: HackerpoliceIndex) ->
 
 
 def _parse_document(raw: bytes, source: str) -> dict[str, Any]:
-    """Parse raw bytes as a playerlist document, raising SyncError."""
+    """Parse raw bytes as a playerlist document, raising SyncError.
+
+    The bytes are decoded here, once, so the error can name the actual
+    problem: handing raw bytes to ``json`` reports any non-UTF-8 file as
+    "not valid JSON", which sends the operator looking for a syntax error in
+    a file that is actually in the wrong encoding. UTF-8 with or without a
+    BOM is accepted, matching ``playerlist.load``.
+    """
     try:
-        document = strict_json_loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValueError) as exc:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise SyncError(f"{_redact_source(source)} is not valid UTF-8: {exc.reason} at byte {exc.start:,}") from exc
+    try:
+        document = strict_json_loads(text)
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
         # ValueError also covers Python's integer digit limit; duplicate-key errors may include untrusted keys.
         detail = _one_line(_no_surrogates(redact_urls_in_text(str(exc))))
         raise SyncError(f"{_redact_source(source)} is not valid JSON: {detail}") from exc
@@ -231,7 +248,7 @@ def _parse_document(raw: bytes, source: str) -> dict[str, Any]:
 
 def _display_path(path: Path) -> str:
     """Redact a path before clipping it for diagnostics."""
-    return display_path(redact_urls_in_text(str(path)))
+    return display_path(path)
 
 
 def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
@@ -259,7 +276,7 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     except (OSError, ValueError) as exc:
         raise SyncError(f"cannot read {_display_path(path)}: {error_reason(exc)}") from exc
     try:
-        raw = _read_bounded_regular_file(path, MAX_FILE_BYTES)
+        raw = read_bounded_regular_file(path, MAX_FILE_BYTES)
     except (OSError, ValueError) as exc:
         raise SyncError(f"cannot read {_display_path(path)}: {error_reason(exc)}") from exc
     if len(raw) > MAX_FILE_BYTES:
@@ -309,13 +326,10 @@ def _has_sensitive_query_name(name: str) -> bool:
 
 REDACTED = "REDACTED"
 
-# Replace lone surrogates before URL encoding or report output.
-_SURROGATES = re.compile(r"[\ud800-\udfff]")
-
 
 def _no_surrogates(value: str) -> str:
     """Replace lone UTF-16 surrogates so the value can always be encoded."""
-    return _SURROGATES.sub("\ufffd", value)
+    return SURROGATE_RE.sub("\ufffd", value)
 
 
 def _html_unescape_bounded(value: str) -> str | None:
@@ -438,9 +452,7 @@ def _sanitised_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tup
         # Redact the whole parameter name when it contains an encoded delimiter or value.
         safe_name = name if not sensitive or _SAFE_QUERY_NAME.fullmatch(name) else "REDACTED"
         safe_name = _no_surrogates(safe_name)
-        safe_value = (
-            REDACTED if sensitive else _redact_diagnostic_text(_no_surrogates(_redact_nested_url(value, depth)))
-        )
+        safe_value = REDACTED if sensitive else redact_diagnostic_text(_no_surrogates(_redact_nested_url(value, depth)))
         changed |= safe_name != name or safe_value != value
         safe_items.append((safe_name, safe_value))
     return safe_items, changed
@@ -549,7 +561,7 @@ def _redact_url(url: str, depth: int) -> str:
     else:
         shown = urllib.parse.urlunsplit((parts.scheme, netloc, path, query, fragment))
     # Keep output encodable and on one line
-    shown = _redact_diagnostic_text(_one_line(_no_surrogates(shown)))
+    shown = redact_diagnostic_text(_one_line(_no_surrogates(shown)))
     return shown if len(shown) <= MAX_URL_DISPLAY_CHARS else shown[:MAX_URL_DISPLAY_CHARS] + "…"
 
 
@@ -608,7 +620,9 @@ def _redact_urls_in_text(
 ) -> str:
     """Redact text while carrying the current nested-URL depth."""
     if len(text) > _MAX_URL_PARSE_CHARS:
-        return "[URL omitted: too long to inspect safely]"
+        # Prose is bounded for the same reason a URL is, but say so: "URL omitted"
+        # for a long paragraph sent the reader looking for a link that was never there.
+        return "[text omitted: too long to inspect safely]"
     if decode_entities:
         decoded = _html_unescape_bounded(text)
         if decoded is None:
@@ -664,7 +678,7 @@ def _redact_urls_in_text(
 
 def redact_urls_in_text(text: str) -> str:
     """Redact URL credentials and common bare secrets in untrusted prose."""
-    return _redact_diagnostic_text(_redact_urls_in_text(text, 0))
+    return redact_diagnostic_text(_redact_urls_in_text(text, 0))
 
 
 def _redact_source(value: str) -> str:
@@ -794,6 +808,28 @@ def _fetch_bytes(url: str) -> bytes:
     raise SyncError(f"could not fetch {redact_url(url)}: {reason}")
 
 
+# ``scheme:`` prefixes that name a URL rather than a Windows drive letter.
+_RESERVED_URL_SCHEMES = frozenset(
+    {"http", "https", "ftp", "ftps", "file", "data", "ssh", "git", "sftp", "gopher", "ws", "wss"}
+)
+
+
+def _looks_like_url(value: str) -> bool:
+    """True when ``value`` uses a real URL scheme instead of naming a local file.
+
+    Only ``http(s)`` is ever fetched, but anything carrying a scheme must be
+    REPORTED as a URL: ``ftp://host/list.json`` used to fall through to the
+    local-file path and fail with "cannot read ftp://...: No such file or
+    directory", which sent the operator looking for a missing file. A Windows
+    drive path (``C:\\list.json``) is a single character before the colon, and
+    the schemes above are never drive letters, so neither is misclassified.
+    """
+    scheme = value.partition(":")[0]
+    if not scheme or len(scheme) == 1 or http_scheme(value):
+        return False
+    return scheme.casefold() in _RESERVED_URL_SCHEMES
+
+
 def _read_bytes(source: str) -> bytes:
     """Return the raw bytes of an HTTP(S) URL or a local path, raising SyncError.
 
@@ -803,11 +839,15 @@ def _read_bytes(source: str) -> bytes:
     cannot yield an endless stream. Reading at most ``MAX_SOURCE_BYTES + 1``
     bytes makes the local path obey the same budget as a download.
     """
+    if _looks_like_url(source):
+        # Name the unsupported scheme instead of reporting a missing local file.
+        scheme = source.partition(":")[0].casefold()
+        raise SyncError(f"unsupported source URL scheme {scheme!r} (use https:// or a local path)")
     if http_scheme(source):
         return _fetch_bytes(source)
     LOGGER.debug("Reading %s from disk.", _redact_source(source))
     try:
-        raw = _read_bounded_regular_file(Path(source), MAX_SOURCE_BYTES)
+        raw = read_bounded_regular_file(Path(source), MAX_SOURCE_BYTES)
     except (OSError, ValueError) as exc:
         # ValueError also covers paths the OS cannot encode (for example, NUL).
         raise SyncError(f"cannot read {_redact_source(source)}: {error_reason(exc)}") from exc

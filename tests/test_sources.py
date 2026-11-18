@@ -743,7 +743,8 @@ class SourceFetchTests(unittest.TestCase):
         text = "Context: https://user:LONG_SECRET@example.invalid/" + "x" * 5_000
         with mock.patch("sources.redact_url", side_effect=AssertionError("must short-circuit")):
             shown = sources.redact_urls_in_text(text)
-        self.assertEqual(shown, "[URL omitted: too long to inspect safely]")
+        # Prose, not a URL: the note must not send the reader looking for a link.
+        self.assertEqual(shown, "[text omitted: too long to inspect safely]")
         self.assertNotIn("LONG_SECRET", shown)
 
     def test_redact_url_leaves_an_ordinary_fragment_alone(self):
@@ -1528,6 +1529,62 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(raw, self.BODY)
         self.assertEqual(calls, 3)
 
+    def test_a_hostile_content_length_cannot_crash_the_fetch(self):
+        """Thousands of digits used to raise Python's int-conversion ValueError.
+
+        A header is server-controlled, so it must never turn into a traceback;
+        a length that long is simply "too large" and is rejected unread.
+        """
+        response = _FakeResponse(self.BODY, {"Content-Length": "9" * 5_000})
+        with (
+            mock.patch("sources._OPENER.open", return_value=response),
+            mock.patch("sources.time.sleep"),
+            self.assertRaises(SyncError),
+        ):
+            load_first_available_raw([self.URL])
+        self.assertEqual(response.read_count, 0)
+
+    def test_a_non_utf8_source_is_reported_as_an_encoding_problem(self):
+        """'not valid JSON' would send the operator hunting for a syntax error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "latin1.json"
+            path.write_bytes(b'{"players": [{"steamid": "[U:1:1]", "last_seen": {"player_name": "\xe9"}}]}')
+            with self.assertRaises(SyncError) as caught:
+                load_first_available_raw([str(path)])
+        self.assertIn("not valid UTF-8", str(caught.exception))
+        self.assertNotIn("not valid JSON", str(caught.exception))
+
+    def test_a_utf8_bom_is_accepted_and_still_snapshotted_verbatim(self):
+        body = b'{"players": [{"steamid": "[U:1:100]"}]}'
+        payload = b"\xef\xbb\xbf" + body
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bom.json"
+            path.write_bytes(payload)
+            document, _, raw = load_first_available_raw([str(path)])
+        self.assertEqual(document["players"][0]["steamid"], "[U:1:100]")
+        self.assertEqual(raw, payload)  # The mark survives into the snapshot unchanged.
+
+    def test_a_url_scheme_is_named_instead_of_reported_as_a_missing_file(self):
+        """'cannot read ftp://...: No such file' described the wrong problem."""
+        for source, scheme in (
+            ("ftp://example.invalid/list.json", "ftp"),
+            ("sftp://example.invalid/list.json", "sftp"),
+            ("FILE:///etc/passwd", "file"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(SyncError) as caught:
+                    sources._read_bytes(source)
+                message = str(caught.exception)
+                self.assertIn(f"unsupported source URL scheme {scheme!r}", message)
+                self.assertNotIn("No such file", message)
+
+    def test_a_windows_drive_path_is_still_a_local_file(self):
+        """A single letter before the colon is a drive, never a scheme."""
+        with self.assertRaises(SyncError) as caught:
+            sources._read_bytes("C:\\lists\\playerlist.json")
+        self.assertIn("cannot read", str(caught.exception))
+        self.assertNotIn("unsupported source URL scheme", str(caught.exception))
+
 
 class SnapshotReadTests(unittest.TestCase):
     def test_snapshot_path_errors_redact_url_like_credentials_before_clipping(self):
@@ -1538,8 +1595,10 @@ class SnapshotReadTests(unittest.TestCase):
             self.assertRaises(SyncError) as caught,
         ):
             sources.load_snapshot(path)
+        # Whatever the wording, the credential must be gone and the message bounded.
         self.assertNotIn(secret, str(caught.exception))
-        self.assertIn("[malformed URL omitted]", str(caught.exception))
+        self.assertTrue("omitted" in str(caught.exception))
+        self.assertLessEqual(len(str(caught.exception)), 300)
 
     def test_a_self_referential_symlink_is_a_read_error_not_a_missing_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:

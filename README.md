@@ -85,6 +85,11 @@ the report reduces those caps further; its last-resort byte limit is also marked
 rather than silently cutting text. The tables aid review; the repository diff
 remains the complete record.
 
+Entry totals in the header count the raw rows the upstream file contains, so a
+duplicated row is visible; the added/removed counts and the `net` beside them
+count distinct SteamIDs, and the `net` is derived from those two counts rather
+than from the raw totals, so the line can never contradict itself.
+
 ## Safety rails
 
 - **Demotion is opt-in** — promotion runs on every invocation, but an entry is only
@@ -104,6 +109,9 @@ remains the complete record.
 - **Strict JSON** — non-standard `NaN`/`Infinity`, floating-point overflow,
   integer tokens over 4,300 digits and duplicate keys are rejected. This avoids
   invalid numeric values, version-dependent integer parsing and silent data loss.
+  A file that is not UTF-8 is reported as an encoding problem rather than as
+  invalid JSON, and a UTF-8 byte-order mark is accepted (and preserved in the
+  snapshot).
 - **Bounded reads** — HTTPS only (a redirect downgrade or a URL over 4,096
   characters is refused); API-provided follow-up URLs stay on the same origin,
   except GitHub Contents API downloads from `api.github.com` to
@@ -113,7 +121,10 @@ remains the complete record.
   reading, so a local path cannot hang the run or stream indefinitely.
   Credentials in a URL (including nested links in proof text) are redacted before
   anything is printed or published; overlong URLs are omitted before parsing,
-  and a URL cannot ping a user with `@handle`.
+  and a URL cannot ping a user with `@handle`. A malformed `Content-Length`
+  header cannot crash a fetch, and a source that names a scheme other than
+  `https://` (say `ftp://`) is reported as an unsupported scheme instead of a
+  missing local file.
 - **Safe messages** — every value that reaches a log line or the pull request is
   escaped and bounded: a player name or a path cannot start a second log line,
   repaint the terminal, hide itself behind invisible or bidirectional characters
@@ -141,6 +152,10 @@ remains the complete record.
 - **Pinned actions** — the workflow uses each action at a commit SHA, not at a
   movable tag, and Dependabot bumps those pins weekly; a compromised release in
   someone else's repository cannot run code here with a write token.
+- **Least-privilege workflow** — the workflow itself grants no permissions at
+  all (`permissions: {}`); each job opts in to exactly what it needs, so a job
+  added later cannot inherit a write token by accident. The checks job does not
+  even fetch the Git history it never reads.
 
 ## Run it yourself
 

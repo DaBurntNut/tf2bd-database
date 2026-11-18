@@ -86,8 +86,13 @@ MASS_DEMOTION_MAX_FRACTION = 0.2
 
 
 def display_path(path: Path | str) -> str:
-    """Redact a path before clipping it for display."""
-    return playerlist.display_path(redact_urls_in_text(str(path)))
+    """A path for a log line: redacted, one line, bounded (one shared helper)."""
+    return playerlist.display_path(path)
+
+
+def _one_line_message(value: str) -> str:
+    """Redact and flatten a message that quotes a path, escaping it exactly once."""
+    return playerlist.display_raw(redact_urls_in_text(value))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -209,13 +214,22 @@ def _check_github_output() -> None:
 
 
 def _log_validation(result: ValidationResult, context: str) -> None:
+    """Log bounded validation details without escaping any value twice.
+
+    ``playerlist.validate`` already quotes untrusted values through its own
+    bounded, redacting preview, so these messages carry newlines as the two
+    characters ``\\n``. Running the redacting path formatter over them
+    escaped that backslash a second time (``\\\\n``) and re-inspected every
+    ``key=value`` the message mentions; ``display_raw`` only makes the text
+    safe for a terminal.
+    """
     for warning in result.warnings:
-        LOGGER.warning("%s", display_path(warning))
+        LOGGER.warning("%s", playerlist.display_raw(warning))
     if result.warnings_omitted:
         LOGGER.warning("%s additional validation warning(s) omitted", result.warnings_omitted)
     safe_context = display_path(context)
     for error in result.errors:
-        LOGGER.error("%s: %s", safe_context, display_path(error))
+        LOGGER.error("%s: %s", safe_context, playerlist.display_raw(error))
     if result.errors_omitted:
         LOGGER.error("%s: %s additional validation problem(s) omitted", safe_context, result.errors_omitted)
 
@@ -225,9 +239,11 @@ def load_database(path: Path) -> tuple[PlayerList, str]:
     try:
         database, original = load(path)
     except PlayerListError as exc:
-        # ``load()`` clips the raw path before this boundary can redact it; replace that preview using the full path.
-        message = str(exc).replace(playerlist.display_path(path), display_path(path))
-        raise SyncError(redact_urls_in_text(message)) from exc
+        # ``load()`` clipped the raw path before this boundary could redact it. Swap
+        # that preview for the redacted one, then flatten the finished message once.
+        quoted = playerlist.display_raw(path)
+        message = str(exc).replace(quoted, display_path(path))
+        raise SyncError(_one_line_message(message)) from exc
 
     result = validate(database)
     _log_validation(result, f"{display_path(path)} is not a usable playerlist")
@@ -256,13 +272,15 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     an exact replica of the upstream file (no encoding/newline translation
     ever touches them).
     """
-    # Resolve symlinks to update their target; reject loops before replacing anything.
+    # Resolve a symlink so the replacement lands on its target, not on the link itself.
     target = path
     if path.is_symlink():
         try:
             target = path.resolve(strict=False)
         except RuntimeError as exc:
-            # Normalize symlink-loop errors to the path-aware write failure.
+            # ``resolve`` reports a symlink LOOP as RuntimeError, which is not an OSError.
+            # Convert it so the caller's error handling names the file instead of
+            # letting a RuntimeError escape as a traceback mid-write.
             raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), os.fspath(path)) from exc
     # Use unique, short temp names to avoid collisions and keep long basenames valid.
     fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".tf2bd-sync-", suffix=".tmp")
@@ -579,7 +597,10 @@ def run(args: argparse.Namespace) -> int:
             _atomic_write_bytes(Path(args.report), body.encode("utf-8"))
         except (OSError, ValueError) as exc:
             raise SyncError(f"cannot write report {display_path(args.report)}: {error_reason(exc)}") from exc
-    print(body, end="")
+    # Flush before the outcome logging: stdout is block-buffered when it is a pipe or a
+    # workflow log file, while stderr (where log records go) is not, so without this the
+    # summary and the "Updated ..." lines could reach the reader out of order.
+    print(body, end="", flush=True)
 
     # Write the database before advancing the snapshot; skipped demotions remain candidates.
     # Safe snapshot-only changes still refresh the baseline.

@@ -396,6 +396,33 @@ class DocumentHandlingTests(unittest.TestCase):
 class DisplayPathTests(unittest.TestCase):
     """Paths are operator input too: one line, printable, bounded."""
 
+    def test_display_raw_escapes_without_inspecting_or_re_redacting(self):
+        """It is the escape-only half used on finished, already-redacted messages.
+
+        Running the redactor over a finished message re-inspects every
+        ``key=value`` it mentions and, past the length cap, reports the whole
+        message as an uninspectable URL.
+        """
+        self.assertEqual(playerlist_module.display_raw("a\nb.json"), "a\\nb.json")
+        long_message = "players[0] has a problem: " + "key=value;" * 1_000
+        shown = playerlist_module.display_raw(long_message)
+        self.assertNotIn("omitted", shown)
+        self.assertTrue(shown.endswith("…"))
+        self.assertLessEqual(len(shown), playerlist_module.MAX_SHOWN_PATH_CHARS + 1)
+
+    def test_display_raw_bounds_before_escaping_to_avoid_a_giant_copy(self):
+        giant = "\x1b" * 200_000
+        shown = playerlist_module.display_raw(giant)
+        self.assertLessEqual(len(shown), playerlist_module.MAX_SHOWN_PATH_CHARS + 1)
+        self.assertEqual(set(shown) - {"…"}, {"\\", "x", "1", "b"})
+
+    def test_display_path_redacts_and_escapes_in_one_shared_helper(self):
+        secret = "SHARED_HELPER_SECRET"
+        shown = playerlist_module.display_path(f"https://user:{secret}@example.invalid/a\nb")
+        self.assertNotIn(secret, shown)
+        self.assertIn("REDACTED", shown)
+        self.assertNotIn("\n", shown)
+
     def test_control_characters_are_escaped_rather_than_dropped(self):
         self.assertEqual(display_path("a\nb.json"), "a\\nb.json")
         self.assertEqual(display_path("a\x1b[31m.json"), "a\\x1b[31m.json")
@@ -456,6 +483,65 @@ class DisplayPathTests(unittest.TestCase):
             playerlist_module._redact_diagnostic_preview(deep_marker, len(deep_marker)),
         )
 
+    def test_a_percent_encoded_field_name_cannot_hide_its_value(self):
+        # A key can encode its own separator, so the raw spelling never looks
+        # like a field name. Both the raw and the decoded spelling must redact.
+        cases = (
+            "?to%0Aken=ENCODED_KEY_SECRET",
+            "?to%256ben=DOUBLE_ENCODED_KEY_SECRET",
+            "?to%2520ken=SPACE_ENCODED_KEY_SECRET",
+            "?to%09ken=TAB_ENCODED_KEY_SECRET",
+            "?%74oken=PLAINLY_ENCODED_KEY_SECRET",
+            "#access_token=FRAGMENT_KEY_SECRET",
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                secret = value.rsplit("=", 1)[1]
+                shown = display_path(value)
+                self.assertNotIn(secret, shown)
+                self.assertIn("REDACTED", shown)
+
+    def test_a_field_name_that_never_finishes_decoding_fails_closed(self):
+        # Nested escapes deeper than the decode budget: no guess, but no plain
+        # name either, so the value is left alone rather than mis-parsed.
+        deep = "%" + "25" * (playerlist_module._MAX_DIAGNOSTIC_DECODE_DEPTH + 4) + "74oken"
+        self.assertIsNone(playerlist_module._normalised_field_name(deep))
+        # And a name that decodes to something that is not a field name at all.
+        self.assertIsNone(playerlist_module._normalised_field_name("tok%3Aen"))
+        self.assertIsNone(playerlist_module._normalised_field_name("a/b"))
+        # Plain names still decode to themselves.
+        self.assertEqual(playerlist_module._normalised_field_name("access_token"), "access_token")
+        self.assertEqual(playerlist_module._normalised_field_name("to%0Aken"), "token")
+
+    def test_an_encoded_benign_key_is_left_alone(self):
+        for value in ("?q=hello", "?ref=ma%69n", "/a%20b/list.json"):
+            with self.subTest(value=value):
+                self.assertEqual(display_path(value), value)
+
+    def test_an_empty_quoted_value_does_not_shadow_the_real_secret(self):
+        # ``password=''SECRET`` used to redact the empty body and leave SECRET.
+        for value, secret in (
+            ("access_token:''EMPTY_QUOTED_SECRET'", "EMPTY_QUOTED_SECRET"),
+            ('access_token=""EMPTY_DQUOTED_SECRET"', "EMPTY_DQUOTED_SECRET"),
+        ):
+            with self.subTest(value=value):
+                shown = display_path(value)
+                self.assertNotIn(secret, shown)
+                self.assertIn("REDACTED", shown)
+
+    def test_a_bearer_scheme_with_a_separator_still_redacts_its_credential(self):
+        for value, secret in (
+            ("Bearer = EQUALS_BEARER_SECRET", "EQUALS_BEARER_SECRET"),
+            ("Bearer: COLON_BEARER_SECRET", "COLON_BEARER_SECRET"),
+            ("Basic BASIC_AUTH_SECRET", "BASIC_AUTH_SECRET"),
+        ):
+            with self.subTest(value=value):
+                shown = display_path(value)
+                self.assertNotIn(secret, shown)
+                self.assertIn("REDACTED", shown)
+        # A lone scheme with nothing after it stays readable.
+        self.assertEqual(display_path("a Bearer"), "a Bearer")
+
     def test_bare_secret_pair_parser_handles_quoted_empty_and_punctuated_values(self):
         cases = (
             ("access_token   =   SPACED_SECRET", "SPACED_SECRET", "access_token   =   REDACTED"),
@@ -471,7 +557,7 @@ class DisplayPathTests(unittest.TestCase):
         )
         for value, secret, safe in cases:
             with self.subTest(value=value):
-                shown = playerlist_module._redact_diagnostic_text(value)
+                shown = playerlist_module.redact_diagnostic_text(value)
                 self.assertEqual(shown, safe)
                 if secret:
                     self.assertNotIn(secret, shown)

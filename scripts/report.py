@@ -34,8 +34,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-import playerlist
-from playerlist import account_id, steam_history_url, steam_profile_url
+from playerlist import SURROGATE_RE, account_id, display_path, steam_history_url, steam_profile_url
 from policy import MAX_EVIDENCE_LINK_CHARS, MAX_EVIDENCE_LINKS, Change
 from sources import SOURCE_REPO_URL, redact_urls_in_text
 
@@ -118,8 +117,6 @@ _TEXT_ESCAPES = str.maketrans(_ESCAPES)
 # Escape backslashes and pipes inside table code spans.
 _TABLE_CODE_ESCAPES = str.maketrans({"\\": "\\\\", "|": "\\|"})
 
-# Replace lone surrogates, which JSON can represent but UTF-8 cannot encode.
-_SURROGATES_RE = re.compile(r"[\ud800-\udfff]")
 
 PROMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "Hackerpolice proof", "SteamHistory")
 DEMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "SteamHistory")
@@ -151,12 +148,12 @@ def _neutralise(value: str) -> str:
 
 def _safe(text: str) -> str:
     """Replace lone surrogates so the report is always UTF-8 encodable."""
-    return _SURROGATES_RE.sub("\ufffd", text)
+    return SURROGATE_RE.sub("\ufffd", text)
 
 
 def _safe_display_path(path: Path) -> str:
-    """Redact a path before the generic path formatter clips its preview."""
-    return playerlist.display_path(redact_urls_in_text(str(path)))
+    """A path for the report: redaction and clipping live in one shared helper."""
+    return display_path(path)
 
 
 def _shorten(value: str, limit: int) -> str:
@@ -614,6 +611,18 @@ class RunInfo:
         return name[:1].upper() + name[1:]
 
 
+def _net_change_text(added: int, removed: int) -> str:
+    """Describe the net change in DISTINCT SteamIDs.
+
+    The entry totals either side of it count raw rows (including duplicates),
+    while added/removed count distinct usable IDs -- so deriving the net from
+    the two raw totals made the line contradict itself whenever the upstream
+    file contained a duplicate row or an unusable one.
+    """
+    delta = added - removed
+    return "no net change" if delta == 0 else f"net {delta:+,d}"
+
+
 def _header_lines(info: RunInfo) -> list[str]:
     """The ``- Key: value`` bullet block at the top of the report."""
     source_note = f"{_count(info.source_total)} entries"
@@ -633,11 +642,8 @@ def _header_lines(info: RunInfo) -> list[str]:
     if info.dry_run:
         lines.append("- Mode: **dry run** (no database or snapshot written)")
     if info.previous_source_total is not None:
-        # Totals use raw entries; snapshot changes count distinct usable SteamIDs.
-        current_total = info.source_total
-        delta = current_total - info.previous_source_total
-        # State zero explicitly instead of showing a misleading +0.
-        net = "no net change" if delta == 0 else f"net {delta:+,d}"
+        # Entry totals are raw rows (duplicates included) for provenance only;
+        # added/removed, and the net derived from them, count DISTINCT IDs.
         lines.append(
             f"- Previous snapshot: {_count(info.previous_source_total)} entries; "
             f"{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} "
@@ -647,7 +653,8 @@ def _header_lines(info: RunInfo) -> list[str]:
             f"- Snapshot diff: **{_count(info.added_to_source)} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
             f"**{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} removed** "
-            f"({_count(info.previous_source_total)} → {_count(current_total)} entries; {net})"
+            f"({_count(info.previous_source_total)} → {_count(info.source_total)} entries; "
+            f"{_net_change_text(info.added_to_source, info.removed_from_source)})"
         )
     elif info.snapshot_changed:
         # With no baseline, every usable ID is new.

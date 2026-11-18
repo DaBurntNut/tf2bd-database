@@ -47,8 +47,8 @@ on:
       - ".github/dependabot.yml"
       - ".github/workflows/sync-vorobey-hackerpolice.yml"
 
-permissions:
-  contents: read
+# Least privilege by default: no job may read or write more than its own block.
+permissions: {}
 
 # Pin tool versions so both Python matrix legs use identical check tooling.
 env:
@@ -84,6 +84,8 @@ jobs:
         with:
           # Tests need no GitHub credentials; do not persist checkout credentials for tools.
           persist-credentials: false
+          # The checks need the working tree only, not the whole history.
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -126,8 +128,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      # contents:write is required to read the default branch AND push the bot branch.
       contents: write
+      # pull-requests:write is required to open/close the bot pull request.
       pull-requests: write
+      issues: none
     # Serialize sync writers without blocking pull-request checks.
     concurrency:
       group: sync-vorobey-hackerpolice

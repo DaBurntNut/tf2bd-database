@@ -246,7 +246,7 @@ class ReportTests(unittest.TestCase):
         report = render_report(
             self.info([Change("[U:1:100]", "n", ("suspicious",), ("cheater",), evidence=(long_url,))])
         )
-        self.assertIn("URL omitted: too long to inspect safely", report)
+        self.assertIn("text omitted: too long to inspect safely", report)
         self.assertNotIn(f"]({long_url})", report)
         self.assertNotIn("Proof link comes from", report)
         self.assertNotIn("a" * (MAX_EVIDENCE_LINK_CHARS + 10), report)
@@ -418,12 +418,18 @@ class ReportTests(unittest.TestCase):
         )
         self.assertIn("**1 new SteamID added**, **2 SteamIDs removed** (100 → 99 entries; net -1)", report)
 
-    def test_entry_totals_use_actual_rows_when_duplicate_ids_change_the_count(self):
-        """Raw row totals can differ from unique-ID additions/removals."""
+    def test_the_net_change_agrees_with_the_distinct_ids_beside_it(self):
+        """Raw row totals are provenance; the net must follow the ID counts.
+
+        Deriving the net from raw totals printed "1 added, 1 removed ... net -1"
+        when a duplicate row disappeared upstream: the counts and the total on
+        the same line contradicted each other.
+        """
         report = render_report(
             self.info(source_total=2, previous_source_total=3, added_to_source=1, removed_from_source=1)
         )
-        self.assertIn("(3 → 2 entries; net -1)", report)
+        self.assertIn("**1 new SteamID added**, **1 SteamID removed**", report)
+        self.assertIn("(3 → 2 entries; no net change)", report)
 
     def test_snapshot_diff_initial_snapshot_without_previous(self):
         report = render_report(self.info(added_to_source=10, snapshot_changed=True))
@@ -443,7 +449,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Vorobey hackerpolice list (13,542 entries)", report)  # Raw row totals remain exact.
         self.assertIn("- Previous snapshot: 12,345 entries", report)
         self.assertIn("**1,200 new SteamIDs added**", report)
-        self.assertIn("(12,345 → 13,542 entries; net +1,197)", report)
+        self.assertIn("(12,345 → 13,542 entries; net +1,197)", report)  # 1,200 added - 3 removed
         self.assertIn("**1 SteamID removed from the Vorobey hackerpolice list", report)
 
     def test_fetch_url_cannot_smuggle_html_into_the_report(self):

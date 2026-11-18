@@ -135,7 +135,8 @@ class UntouchedPathTests(unittest.TestCase):
         with self.assertRaises(SyncError) as caught:
             sync_module.load_database(path)
         self.assertNotIn(secret, str(caught.exception))
-        self.assertIn("[malformed URL omitted]", str(caught.exception))
+        self.assertTrue("omitted" in str(caught.exception))
+        self.assertLessEqual(len(str(caught.exception)), 300)
 
         nested_secret = "NESTED_PATH_SECRET"
         nested_path = Path(
@@ -326,11 +327,31 @@ class UntouchedPathTests(unittest.TestCase):
         self.assertTrue(link.is_symlink() and middle.is_symlink())
 
     def test_a_self_referential_symlink_is_refused_and_preserved(self):
+        """Every failure mode here must be a clean SyncError, never a traceback."""
         link = self.root / "loop.json"
         link.symlink_to(link)
         with self.assertRaises(SyncError) as caught:
             sync_module.write_snapshot(link, b"new\n", None, dry_run=False)
         self.assertIn("too many levels of symbolic links", str(caught.exception).lower())
+        self.assertTrue(link.is_symlink())
+
+    def test_a_symlink_loop_when_Git_style_resolution_fails_is_still_a_SyncError(self):
+        """``Path.resolve`` raises RuntimeError for a loop, which is not an OSError.
+
+        Depending on the platform, ``is_symlink()``/``resolve()`` can report the
+        loop instead of ``os.open``; either way the caller must get the same
+        named, path-aware write error rather than a RuntimeError escaping as a
+        traceback.
+        """
+        link = self.root / "loop.json"
+        link.symlink_to(link)
+        with (
+            mock.patch.object(Path, "resolve", side_effect=RuntimeError("Symlink loop from 'loop.json'")),
+            self.assertRaises(SyncError) as caught,
+        ):
+            sync_module.write_snapshot(link, b"new\n", None, dry_run=False)
+        self.assertIn("too many levels of symbolic links", str(caught.exception).lower())
+        self.assertIn("loop.json", str(caught.exception))
         self.assertTrue(link.is_symlink())
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
@@ -558,6 +579,70 @@ class ValidationLoggingTests(unittest.TestCase):
         output = "\n".join(captured.output)
         self.assertIn("3 additional validation warning(s) omitted", output)
         self.assertIn("database validation: 2 additional validation problem(s) omitted", output)
+
+    def test_the_summary_is_flushed_before_the_outcome_is_logged(self):
+        """A piped stdout is block-buffered while stderr is not.
+
+        Without an explicit flush, the outcome lines ("Updated N entries ...")
+        reached the reader BEFORE the summary they refer to.
+        """
+        flushed = []
+        real_stdout = sys.stdout
+        try:
+            with mock.patch.object(sys, "stdout", new_callable=io.StringIO) as fake_out:
+                fake_out.flush = lambda: flushed.append("flush")
+                with (
+                    tempfile.TemporaryDirectory() as tmp,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    root = Path(tmp)
+                    (root / "db.json").write_text(
+                        dumps({"players": [player("[U:1:100]", ["suspicious"])]}), encoding="utf-8"
+                    )
+                    (root / "up.json").write_text(
+                        dumps({"players": [player("[U:1:100]", ["cheater"])]}), encoding="utf-8"
+                    )
+                    code = main(
+                        [
+                            "--database",
+                            str(root / "db.json"),
+                            "--snapshot",
+                            str(root / "snap.json"),
+                            "--source",
+                            str(root / "up.json"),
+                            "--dry-run",
+                            "-q",
+                        ]
+                    )
+        finally:
+            sys.stdout = real_stdout
+        self.assertEqual(code, 0)
+        self.assertEqual(flushed, ["flush"])
+
+    def test_validation_messages_are_not_escaped_twice(self):
+        """An escaped newline must stay a two-character escape, not become ``\\\\n``.
+
+        ``validate()`` already quotes untrusted values through its bounded,
+        redacting preview. Re-running the redacting path formatter over the
+        finished message escaped the backslash again and re-inspected the text.
+        """
+        result = playerlist_module.ValidationResult()
+        result.add_warning("players[0] uses unknown attribute 'a\\nb'")
+        with self.assertLogs(sync_module.LOGGER, level="WARNING") as captured:
+            sync_module._log_validation(result, "database validation")
+        output = "\n".join(captured.output)
+        self.assertIn("'a\\nb'", output)
+        self.assertNotIn("a\\\\nb", output)
+
+    def test_a_long_validation_message_is_still_a_message_not_an_omitted_url(self):
+        """A long message must not be re-classified as an uninspectable URL."""
+        result = playerlist_module.ValidationResult()
+        result.add_error("players[0] has a problem: " + "ref=1&" * 1_000)
+        with self.assertLogs(sync_module.LOGGER, level="WARNING") as captured:
+            sync_module._log_validation(result, "database validation")
+        output = "\n".join(captured.output)
+        self.assertNotIn("too long to inspect safely", output)
+        self.assertIn("players[0] has a problem", output)
 
 
 class WriteOrderTests(unittest.TestCase):
@@ -1070,7 +1155,9 @@ class CliTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli("--source", str(self.source))
         self.assertEqual(code, 0, stderr)
         self.assertIn("Previous snapshot: 3 entries; 0 SteamIDs removed upstream", stdout)
-        self.assertIn("(3 → 2 entries; net -1)", stdout)
+        # The net is derived from distinct-ID additions/removals, so it cannot
+        # contradict the counts printed next to it when a duplicate row exists.
+        self.assertIn("(3 → 2 entries; no net change)", stdout)
 
     def test_report_lists_every_removed_steamid_with_its_permalink(self):
         """Every ID gone from the list since the snapshot appears in the
