@@ -1842,21 +1842,32 @@ class CapBoundaryTests(unittest.TestCase):
         mixed = "https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s&si=vZ4JnwKUJCx6a1dk&list=PLabc"
         self.assertEqual(report_module._youtube_short_url(mixed), "https://youtu.be/DXQ5gEDIhzE?t=42s")
 
-    def test_an_already_short_link_is_left_exactly_as_stored(self):
-        """The contract is on the CELL: the stored link is never altered.
+    def test_a_share_tag_is_dropped_from_every_youtube_spelling(self):
+        """``si=`` identifies a share, not evidence, so it never survives.
 
-        A bare ``youtu.be`` link may be canonicalised to an identical string,
-        and a short link carrying a query is left alone entirely (no rewrite),
-        so either way a ``?t=`` or ``?si=`` the list actually wrote survives.
+        The rule is one rule for short and long spellings alike, so the result
+        cannot depend on which form the upstream list happened to use.
         """
-        for link in (
-            "https://youtu.be/DXQ5gEDIhzE",
-            "https://youtu.be/DXQ5gEDIhzE?t=42s",
-            "https://youtu.be/DXQ5gEDIhzE?si=vZ4JnwKUJCx6a1dk",
+        for link, expected in (
+            ("https://youtu.be/DXQ5gEDIhzE?si=vZ4JnwKUJCx6a1dk", "https://youtu.be/DXQ5gEDIhzE"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&si=abc", "https://youtu.be/DXQ5gEDIhzE"),
+            ("https://youtu.be/DXQ5gEDIhzE?list=PLabc", "https://youtu.be/DXQ5gEDIhzE"),
+            ("https://youtu.be/DXQ5gEDIhzE?si=abc&t=abc", "https://youtu.be/DXQ5gEDIhzE"),
         ):
             with self.subTest(link=link):
-                self.assertEqual(report_module._evidence_cell([link]), f"[proof]({link})")
-                self.assertIn(report_module._youtube_short_url(link), (None, link))
+                self.assertEqual(report_module._youtube_short_url(link), expected)
+
+    def test_a_timestamp_survives_with_or_without_a_share_tag(self):
+        # The two examples this rule was written for.
+        for link, expected in (
+            ("https://youtu.be/DXQ5gEDIhzE?si=oqg7fzNwpk9ivsOm&t=326", "https://youtu.be/DXQ5gEDIhzE?t=326"),
+            ("https://youtu.be/DXQ5gEDIhzE?t=326&si=oqg7fzNwpk9ivsOm", "https://youtu.be/DXQ5gEDIhzE?t=326"),
+            ("https://youtu.be/DXQ5gEDIhzE?t=326", "https://youtu.be/DXQ5gEDIhzE?t=326"),
+            ("https://youtu.be/DXQ5gEDIhzE", "https://youtu.be/DXQ5gEDIhzE"),
+            ("https://youtu.be/DXQ5gEDIhzE?t=326#t=326", "https://youtu.be/DXQ5gEDIhzE?t=326"),
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._youtube_short_url(link), expected)
 
     def test_the_proof_label_is_proof_when_there_is_exactly_one(self):
         # The rule: one link shows "proof", several show "proof 1", "proof 2", ...

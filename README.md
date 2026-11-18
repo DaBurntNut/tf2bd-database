@@ -83,9 +83,12 @@ has several, whatever each link points at — a mixed row stays readable because
 every entry is named the same way. The link target points at the exact upstream
 URL, except a YouTube video, which targets YouTube's own short form
 (`https://youtu.be/<id>`): a faithful alias of the same video that keeps the
-markdown short. A timestamp in the long form (`&t=42s`, `&start=90`) is carried
-across, because a proof is often one specific moment in a long video; nothing
-else from the query survives, and no timestamp is ever invented. That is a pure text rewrite — no
+markdown short. One rule covers every YouTube spelling, short or long: the id,
+plus a timestamp (`t` / `start`) when the link actually carried one, because a
+proof is often one specific moment in a long video. Every other parameter is
+dropped, including the `si=` share tag, so
+`youtu.be/ID?si=abc` → `youtu.be/ID` and
+`youtu.be/ID?si=abc&t=326` → `youtu.be/ID?t=326`. No timestamp is ever invented. That is a pure text rewrite — no
 request and no third-party shortener — so the report stays offline and the link
 stays verifiable. A link whose credentials had to be redacted is shown as plain
 code instead, never as a clickable target.

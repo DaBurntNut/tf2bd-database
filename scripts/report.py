@@ -344,8 +344,9 @@ _YOUTUBE_HOSTS = frozenset(
 )
 # ``/shorts/<id>``, ``/embed/<id>``, ``/live/<id>`` and the legacy ``/v/<id>``.
 _YOUTUBE_ID_PATH = re.compile(r"^/(?:shorts|embed|live|v)/(?P<id>[A-Za-z0-9_-]+)$", re.ASCII)
-# The already-short host, which needs no rewrite but should display the same way.
-_YOUTUBE_SHORT = re.compile(r"^https?://youtu\.be/(?P<id>[A-Za-z0-9_-]+)$", re.ASCII)
+# The already-short host. Its query is filtered like any other, so a share tag
+# cannot survive just because the list happened to use the short spelling.
+_YOUTUBE_SHORT = re.compile(r"^https?://youtu\.be/(?P<id>[A-Za-z0-9_-]+)(?:\?(?P<query>[^#]*))?(?:#.*)?$", re.ASCII)
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
 # Query keys that name a position in the video, and the forms YouTube accepts
 # for one ("42", "42s", "1m30s", "1h2m3s"). Anything else is not a timestamp and
@@ -363,39 +364,44 @@ def _youtube_short_url(link: str) -> str | None:
     secrets. Only the exact YouTube hosts are rewritten -- a lookalike such as
     ``youtube.com.evil.invalid`` is not a YouTube link and keeps its label.
 
-    A ``/watch`` URL keeps its video id and its TIMESTAMP (``t`` / ``start``),
-    because a proof is often a specific moment in a long video and dropping it
-    makes the evidence harder to check. Nothing else from the query survives
-    (playlist, tracking, share tags), and a timestamp is carried only when the
-    long form actually had one -- none is ever invented. A link without exactly
-    one usable id is left alone rather than guessed at.
+    ONE rule for every YouTube spelling, short or long: the result is
+    ``youtu.be/<id>`` plus a timestamp if -- and only if -- the input carried a
+    real one (``t`` / ``start``, any form YouTube accepts). Every other query
+    parameter is dropped, including the ``si=`` share tag, so
+    ``youtu.be/ID?si=abc`` and ``youtube.com/watch?v=ID&si=abc`` both become
+    ``youtu.be/ID`` while ``youtu.be/ID?si=abc&t=326`` becomes
+    ``youtu.be/ID?t=326``. A timestamp is a position in the video that a proof
+    usually relies on, so it survives; a share tag identifies nothing and is
+    noise. No timestamp is ever invented. A link without exactly one usable id
+    is left alone rather than guessed at.
     """
+    pairs: list[tuple[str, str]]
+    video_id: str | None = None
     short = _YOUTUBE_SHORT.match(link)
     if short is not None:
-        return f"https://youtu.be/{short.group('id')}"
-    if not link.startswith(("https://", "http://")):
-        return None
-    try:
-        parts = urllib.parse.urlsplit(link)
-    except ValueError:
-        return None
-    if parts.netloc.lower() not in _YOUTUBE_HOSTS:
-        return None
-    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-    video_id: str | None = None
-    if parts.path == "/watch":
-        ids = [value for key, value in pairs if key == "v"]
-        if len(ids) == 1:
-            video_id = ids[0]
+        video_id = short.group("id")
+        pairs = urllib.parse.parse_qsl(short.group("query") or "", keep_blank_values=True)
     else:
-        by_path = _YOUTUBE_ID_PATH.match(parts.path)
-        if by_path is not None:
-            video_id = by_path.group("id")
+        if not link.startswith(("https://", "http://")):
+            return None
+        try:
+            parts = urllib.parse.urlsplit(link)
+        except ValueError:
+            return None
+        if parts.netloc.lower() not in _YOUTUBE_HOSTS:
+            return None
+        pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if parts.path == "/watch":
+            ids = [value for key, value in pairs if key == "v"]
+            if len(ids) == 1:
+                video_id = ids[0]
+        else:
+            by_path = _YOUTUBE_ID_PATH.match(parts.path)
+            if by_path is not None:
+                video_id = by_path.group("id")
     if video_id is None or not _VIDEO_ID.match(video_id):
         return None
-    # Keep a real timestamp, in the order it appeared, for EVERY long form --
-    # a /shorts or /live link can point at a moment just as a /watch one can.
-    # Everything else in the query is dropped.
+    # Keep a real timestamp, in the order it appeared; drop everything else.
     kept = [(key, value) for key, value in pairs if key in _YOUTUBE_TIMESTAMP_KEYS and _YOUTUBE_TIME.match(value)]
     timestamp = "?" + urllib.parse.urlencode(kept) if kept else ""
     return f"https://youtu.be/{video_id}{timestamp}"
