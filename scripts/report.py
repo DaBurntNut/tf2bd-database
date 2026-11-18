@@ -9,6 +9,8 @@ untrusted-output as well as untrusted-input territory:
   list (names, proofs, SteamIDs) is escaped for a Markdown table cell --
   pipes and newlines cannot break the table, brackets cannot forge a link,
   angle brackets cannot inject HTML, and ``@`` cannot trigger a mention;
+* credentials in URLs embedded anywhere in upstream proof text are redacted
+  before they reach the report; changed text is not shown as a misleading link;
 * every table is row-capped, and the whole body has a hard length guard,
   because GitHub rejects pull request bodies over 65,536 characters. A report
   that would exceed the budget drops more rows (announced with an "and N more"
@@ -23,20 +25,27 @@ finally the closing sentence + proof note.
 
 from __future__ import annotations
 
+import html
 import re
 import time
+import unicodedata
+import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from playerlist import account_id, steam_history_url, steam_profile_url
-from policy import Change
-from sources import SOURCE_REPO_URL, redact_url
+from playerlist import SURROGATE_RE, account_id, display_path, steam_history_url, steam_profile_url
+from policy import MAX_EVIDENCE_LINK_CHARS, MAX_EVIDENCE_LINKS, Change
+from sources import SOURCE_REPO_URL, redact_urls_in_text
 
 __all__ = [
+    "MAX_ATTRIBUTE_CELLS",
+    "MAX_ATTRIBUTE_CHARS",
     "MAX_CHANGE_TABLE_ROWS",
     "MAX_CLOSING_STEAMIDS",
+    "MAX_DATABASE_LABEL_CHARS",
     "MAX_EVIDENCE_LINKS",
+    "MAX_EVIDENCE_LINK_CHARS",
     "MAX_NAME_CHARS",
     "MAX_REMOVED_TABLE_ROWS",
     "MAX_REPORT_BYTES",
@@ -47,124 +56,187 @@ __all__ = [
     "render_report",
 ]
 
-# GitHub rejects a pull request body longer than 65,536 characters. Change
-# tables are capped, the removed table is capped, an oversized body is
-# re-rendered with smaller caps (see _SHRINK_STEPS), and a hard truncation is
-# the last resort, so publishing the PR can never fail on size -- however big a
-# single run turns out to be.
+# Limit report size below GitHub's body cap; reduce row limits before hard truncation.
 MAX_CHANGE_TABLE_ROWS = 150
 MAX_REMOVED_TABLE_ROWS = 100
-# The closing sentence names the changed SteamIDs too. A run with thousands of
-# changes would spend the whole byte budget there (and stop being readable), so
-# each clause names at most this many and says how many follow.
+# Bound closing-sentence SteamID lists to keep the summary readable.
 MAX_CLOSING_STEAMIDS = 150
-# GitHub rejects a pull request body over 65,536 BYTES, and the body doubles
-# as the job summary, so the budget is measured in bytes with room to spare.
-# Characters would be the wrong unit: 30,000 Cyrillic player names are half the
-# character budget and twice the byte budget.
+# Measure the shared report budget in UTF-8 bytes.
 MAX_REPORT_BYTES = 60_000
-# One cell can be as big as the data behind it, and a single enormous row
-# defeats every row cap: the body then gets hard-truncated and the run loses the
-# closing sentence and the removed-SteamID list it exists to publish. Two caps
-# keep one row small enough that the row caps stay in charge:
-#   * proof links shown per row (the pull request is a review list, not an
-#     archive; the list is only ever read a few links at a time),
-#   * player-name characters (Steam names are at most 32 characters, so a much
-#     longer one is abnormal -- the profile link still carries the identity).
-MAX_EVIDENCE_LINKS = 10
+# Cap row counts and cell lengths so large values cannot crowd out closing details.
 MAX_NAME_CHARS = 80
+MAX_DATABASE_LABEL_CHARS = 80
+MAX_ATTRIBUTE_CHARS = 40
+MAX_ATTRIBUTE_CELLS = 8
 
-# Characters that would break a Markdown link target.
-# "|" is percent-encoded too: a raw pipe inside a table cell ends the cell, so a
-# proof URL like .../a|b would split the row in the rendered pull request.
+# Percent-encode characters that can break a Markdown link target.
+# Escape pipes because GFM treats them as table separators.
 _LINK_ESCAPES = str.maketrans(
-    {"(": "%28", ")": "%29", " ": "%20", "<": "%3C", ">": "%3E", "|": "%7C", "\n": "%0A", "\r": "%0D"}
-)
-
-# Characters that would break out of a Markdown table cell.
-_CELL_ESCAPES = str.maketrans(
     {
-        "\\": "\\\\",
-        "|": "\\|",
-        "[": "\\[",
-        "]": "\\]",
-        "<": "&lt;",
-        ">": "&gt;",
-        "@": "&#64;",  # renders as "@" but cannot ping a user/team
-        "\n": " ",
-        "\r": " ",
+        "(": "%28",
+        ")": "%29",
+        " ": "%20",
+        "<": "%3C",
+        ">": "%3E",
+        "|": "%7C",
+        # Percent-encode backticks to prevent code spans in link URLs.
+        "`": "%60",
+        "\n": "%0A",
+        "\r": "%0D",
     }
 )
 
-# Characters that would break out of an inline code span.
-_CODE_ESCAPES = str.maketrans({"\\": "\\\\", "|": "\\|", "`": "\\`"})
+# Use one text-escaping policy for table cells and running text.
+_ESCAPES = {
+    # Escape entity introducers so HTML references cannot bypass sanitization.
+    "&": "&amp;",
+    # Escape backslashes so they cannot suppress Markdown escapes.
+    "\\": "\\\\",
+    "<": "&lt;",
+    ">": "&gt;",
+    # Escape brackets to prevent user-supplied links and images.
+    "[": "\\[",
+    "]": "\\]",
+    # Escape backticks to prevent unterminated code spans.
+    "`": "\\`",
+    # Encode @ to prevent mention notifications.
+    "@": "&#64;",
+    # Escape emphasis and strikethrough markers.
+    "*": "\\*",
+    "_": "\\_",
+    "~": "\\~",
+    # Replace line breaks to prevent extra Markdown lines or table rows.
+    "\n": " ",
+    "\r": " ",
+}
 
-# Lone UTF-16 surrogates: legal in JSON input (e.g. "\ud800" in a player
-# name) and loadable by Python, but impossible to encode as UTF-8 -- one in
-# a name or proof would crash writing/printing the report. They are rendered
-# as the replacement character instead; the database itself is unaffected
-# (it is serialised with ensure_ascii, which re-escapes them losslessly).
-_SURROGATES_RE = re.compile(r"[\ud800-\udfff]")
+# Escape pipes because they terminate table cells.
+_CELL_ESCAPES = str.maketrans({**_ESCAPES, "|": "\\|"})
+_TEXT_ESCAPES = str.maketrans(_ESCAPES)
+
+# Escape backslashes and pipes inside table code spans.
+_TABLE_CODE_ESCAPES = str.maketrans({"\\": "\\\\", "|": "\\|"})
+
 
 PROMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "Hackerpolice proof", "SteamHistory")
 DEMOTION_HEADER = ("SteamID", "Last known name", "Before", "After", "SteamHistory")
 REMOVED_HEADER = ("SteamID", "Profile Link", "SteamHistory")
 
-# Display default only: the CLI always passes the real --snapshot path in
-# RunInfo, so a custom path is reported correctly instead of the default.
+# Fallback display label; callers should pass the actual snapshot path.
 DEFAULT_SNAPSHOT_LABEL = "snapshot/playerlist.vorobey-hackerpolice.json"
 
 
-# Control characters (including newlines) in anything that reaches the page or
-# the job log. The fetch URL can be an upstream-supplied download_url, so a
-# newline in it would otherwise start a new Markdown line (e.g. an extra bullet
-# in the report header), and an ESC would repaint the terminal that `cat`s it.
-_TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f]")
+# Neutralise controls and line separators before displaying untrusted text.
+_TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
-# Bidirectional overrides flip how the rest of the line is displayed, so a name
-# like "abc\u202eDEF" shows as "abcFED" and can make the NEXT table cell read
-# as something else. They have no legitimate use in a player name; a zero-width
-# joiner does (emoji, Indic scripts), so only the bidi controls are replaced.
+# Replace bidi controls so displayed text cannot reorder adjacent content.
 _BIDI_CONTROLS = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+# Replace invisible format characters, preserving ZWNJ/ZWJ; encode URL joiners.
+_MEANINGFUL_JOINERS = frozenset(("\u200c", "\u200d"))
 
 
 def _neutralise(value: str) -> str:
     """Make a value safe to put in front of a human or a terminal."""
-    return _BIDI_CONTROLS.sub("\ufffd", _TEXT_CONTROLS.sub(" ", value))
+    value = redact_urls_in_text(value)
+    value = _TEXT_CONTROLS.sub(" ", value)
+    value = _BIDI_CONTROLS.sub("\ufffd", value)
+    return "".join(
+        "\ufffd" if unicodedata.category(char) == "Cf" and char not in _MEANINGFUL_JOINERS else char for char in value
+    )
 
 
 def _safe(text: str) -> str:
     """Replace lone surrogates so the report is always UTF-8 encodable."""
-    return _SURROGATES_RE.sub("\ufffd", text)
+    return SURROGATE_RE.sub("\ufffd", text)
+
+
+def _safe_display_path(path: Path) -> str:
+    """A path for the report: redaction and clipping live in one shared helper."""
+    return display_path(path)
+
+
+def _shorten(value: str, limit: int) -> str:
+    """Cut ``value`` to ``limit`` characters, marking the cut with an ellipsis.
+
+    Truncation happens BEFORE escaping (a cut through an escape sequence would
+    otherwise leave a half-written entity), and only ever applies to values far
+    longer than the format allows.
+    """
+    return value if len(value) <= limit else value[:limit].rstrip() + "…"
 
 
 def _cell(value: str) -> str:
     """Make a string safe inside a Markdown table cell."""
-    return _neutralise(value).translate(_CELL_ESCAPES).strip() or "-"
+    return _data_text(value, in_table=True).strip() or "-"
 
 
-def _text(value: str) -> str:
-    """Make a value safe as running text (the fetch URL line).
+def _text(value: str, *, allow_autolinks: bool = False) -> str:
+    """Make a value safe as running text, with autolinks opt-in for the fetch URL.
 
     ``<``/``>`` become entities, so they render identically but cannot open a
     tag; control characters become spaces, so they cannot start a new line.
+    ``[``/``]`` are escaped as well: this line carries a URL, and a URL holding
+    ``[click](https://elsewhere.example)`` would otherwise render as a live
+    link inside a bot-authored pull request. ``@`` becomes an entity for the
+    same reason it does in a table cell: ``@handle`` is a real mention, so a
+    URL (which can come from a document's ``download_url``, i.e. from someone
+    else) must not be able to ping a stranger from the bot's pull request.
+    Every character in ``_ESCAPES`` is escaped here too -- the same single map
+    the table cells use, so a value cannot be safe in one place and not the
+    other. Autolinks are disabled for data (database labels and demotion notes)
+    by default; only the explicitly selected fetch URL is allowed to remain a
+    clickable URI.
     """
-    return _neutralise(value).replace("<", "&lt;").replace(">", "&gt;")
+    if allow_autolinks:
+        return _neutralise(value).translate(_TEXT_ESCAPES)
+    return _data_text(value, in_table=False)
 
 
-def _code(value: str) -> str:
-    """Make a string safe inside an inline code span (``…``)."""
-    return _neutralise(value).translate(_CODE_ESCAPES)
+def _code(value: str, *, in_table: bool = False) -> str:
+    """Make a string safe inside an inline code span (``…``).
+
+    A code span is delimited by a run of backticks and can never contain a run
+    that long, so the fence is grown past the longest run in the value: a value
+    holding one backtick is wrapped in ``` ``…`` ``` instead of ending the span
+    early. A backslash does NOT escape a backtick inside a code span, so the
+    escape this used to write was not protection at all -- a value such as
+    ``x` and **bold** ` `` closed the span and rendered its tail as Markdown.
+
+    ``in_table`` additionally escapes the characters GFM's cell splitter cares
+    about (see ``_TABLE_CODE_ESCAPES``); running text does not need that, and
+    escaping it there would display a Windows path as ``C:\\x``.
+    """
+    text = _neutralise(value)
+    if in_table:
+        text = text.translate(_TABLE_CODE_ESCAPES)
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    if text.startswith("`") or text.endswith("`"):
+        # Pad boundary backticks so CommonMark does not merge them with the fence.
+        text = f" {text} "
+    return f"{fence}{text}{fence}"
 
 
 def _attributes_cell(attributes: Sequence[str]) -> str:
-    """Render an attribute list as code spans: ``cheater``, ``racist``."""
-    return ", ".join(f"`{_code(attribute)}`" for attribute in attributes)
+    """Render an attribute list as code spans: ``cheater``, ``racist``.
+
+    Bounded in both directions (see ``MAX_ATTRIBUTE_CELLS`` and
+    ``MAX_ATTRIBUTE_CHARS``): these strings come from the database, and an
+    entry carrying a pathological attribute list must not be able to push the
+    closing sentence out of the report.
+    """
+    shown = attributes[:MAX_ATTRIBUTE_CELLS]
+    cell = ", ".join(_code(_shorten(attribute, MAX_ATTRIBUTE_CHARS), in_table=True) for attribute in shown)
+    hidden = len(attributes) - len(shown)
+    if hidden:
+        cell += f", and {_count(hidden)} more"
+    return cell
 
 
 def _steamid_cell(steamid: str) -> str:
     """Render a SteamID as a code span (canonical IDs need no escaping)."""
-    return f"`{_code(steamid)}`"
+    return _code(steamid, in_table=True)
 
 
 def _name_cell(change: Change) -> str:
@@ -175,12 +247,7 @@ def _name_cell(change: Change) -> str:
     since the SteamID (and therefore the profile) is known even when the
     name is not; only an unusable SteamID renders as plain text.
     """
-    # UNKNOWN only when there is genuinely no recorded name; a player
-    # actually named "-" (or similar) keeps their name. _cell() escapes the
-    # brackets that would otherwise break the link text.
-    name = change.name
-    if len(name) > MAX_NAME_CHARS:
-        name = name[:MAX_NAME_CHARS].rstrip() + "…"  # cut BEFORE escaping
+    name = _shorten(change.name, MAX_NAME_CHARS)
     label = "UNKNOWN" if not name.strip() else _cell(name)
     url = steam_profile_url(change.steamid)
     if url is None:
@@ -188,25 +255,166 @@ def _name_cell(change: Change) -> str:
     return _markdown_link(url, label)
 
 
+# Fence URI-like text and bare www. values to prevent GitHub auto-linking.
+# Require text after ':' so prose such as 'Reason: ' remains plain text.
+_AUTOLINK_IN_TEXT = re.compile(r"(?:[a-z][a-z0-9+.-]*:[^\s]+|www\.[^\s]+)", re.IGNORECASE | re.ASCII)
+_SECOND_HTTP_URL = re.compile(r"\s+https?://", re.IGNORECASE)
+_MALFORMED_PERCENT_ESCAPE = re.compile(r"%(?![0-9a-fA-F]{2})")
+
+
+def _data_text(value: str, *, in_table: bool) -> str:
+    """Escape untrusted Markdown text and fence URI literals against autolinking.
+
+    GitHub auto-links URI schemes and bare ``www.`` text even when ordinary
+    Markdown punctuation is escaped. Fence those substrings as code rather than
+    weakening the visible text: a database label or player name can contain a
+    URL without becoming a link of its own. The intentional fetch URL uses
+    ``_text(..., allow_autolinks=True)`` instead.
+    """
+    escaped = _CELL_ESCAPES if in_table else _TEXT_ESCAPES
+    value = _neutralise(value)
+    parts: list[str] = []
+    position = 0
+    for match in _AUTOLINK_IN_TEXT.finditer(value):
+        parts.append(value[position : match.start()].translate(escaped))
+        parts.append(_code(match.group(), in_table=in_table))
+        position = match.end()
+    parts.append(value[position:].translate(escaped))
+    return "".join(parts)
+
+
 def _is_url(text: str) -> bool:
-    return text.startswith(("http://", "https://"))
+    """True only for an unambiguous absolute HTTP(S) URL.
+
+    ``urlsplit`` is intentionally permissive: it accepts ``https:relative``,
+    empty authorities and invalid ports. Markdown/browser URL parsers also
+    disagree about backslashes and whitespace in authorities. Reject those
+    ambiguous forms rather than making untrusted evidence clickable. Spaces
+    in a path remain supported and are percent-encoded by ``_markdown_link``.
+    """
+    if (
+        not text
+        or text != text.strip()
+        or "\\" in text
+        or html.unescape(text) != text
+        or any(char in text for char in "\r\n\t")
+    ):
+        return False
+    if any(char.isspace() and char != " " for char in text):
+        return False
+    if _SECOND_HTTP_URL.search(text) or _MALFORMED_PERCENT_ESCAPE.search(text):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(text)
+        hostname = parts.hostname
+        # Access .port to trigger urlsplit's deferred port validation.
+        _ = parts.port
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc or not hostname:
+        return False
+    if any(char.isspace() for char in parts.netloc) or "%" in hostname:
+        return False
+    authority = parts.netloc.rsplit("@", 1)[-1]
+    return not authority.endswith(":")
 
 
 def _markdown_link(url: str, label: str) -> str:
     """Render a link, escaping the characters that would end the target early.
 
-    Control and bidi characters cannot appear in a URL, so they are
+    Control, bidi and invisible characters cannot appear in a URL, so they are
     percent-encoded rather than dropped: the link stays faithful and nothing
-    lands raw in a terminal (an ESC would repaint it, a bidi override would
-    reverse the rest of the line).
+    lands raw in a terminal or in front of a reader (an ESC would repaint it, a
+    bidi override would reverse the rest of the line, and a zero-width space
+    would make two different targets look identical).
     """
     encoded = url.translate(_LINK_ESCAPES)
-    for pattern in (_TEXT_CONTROLS, _BIDI_CONTROLS):
-        encoded = pattern.sub(lambda match: "".join(f"%{byte:02X}" for byte in match.group().encode("utf-8")), encoded)
+    encoded = "".join(
+        "".join(f"%{byte:02X}" for byte in char.encode("utf-8"))
+        if unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"}
+        else char
+        for char in encoded
+    )
     return f"[{label}]({encoded})"
 
 
-def _evidence_cell(links: Sequence[str]) -> str:
+# YouTube hosts that serve video pages, and the path forms carrying the video id.
+_YOUTUBE_HOSTS = frozenset(
+    {"youtube.com", "www.youtube.com", "m.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com"}
+)
+# ``/shorts/<id>``, ``/embed/<id>``, ``/live/<id>`` and the legacy ``/v/<id>``.
+_YOUTUBE_ID_PATH = re.compile(r"^/(?:shorts|embed|live|v)/(?P<id>[A-Za-z0-9_-]+)$", re.ASCII)
+# The already-short host. Its query is filtered like any other, so a share tag
+# cannot survive just because the citation happened to use the short spelling.
+_YOUTUBE_SHORT = re.compile(r"^https?://youtu\.be/(?P<id>[A-Za-z0-9_-]+)(?:\?(?P<query>[^#]*))?(?:#.*)?$", re.ASCII)
+_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
+# Query keys that name a position in the video, and the forms YouTube accepts
+# for one ("42", "42s", "1m30s", "1h2m3s"). Anything else is not a timestamp and
+# is dropped rather than pasted into the link.
+_YOUTUBE_TIMESTAMP_KEYS = frozenset({"t", "start"})
+_YOUTUBE_TIME = re.compile(r"^(?:\d+h)?(?:\d+m)?(?:\d+s?)$", re.ASCII)
+
+
+def _youtube_short_url(link: str) -> str | None:
+    """The ``youtu.be`` spelling of a YouTube video link, or ``None``.
+
+    YouTube's own short domain is how a video is normally shared, and this is a
+    PURE TEXT REWRITE: no request is made and no third-party shortener is
+    involved, so the report stays offline, verifiable and free of extra
+    secrets. Only the exact YouTube hosts are rewritten -- a lookalike such as
+    ``youtube.com.evil.invalid`` is not a YouTube link and keeps its label.
+
+    ONE rule for every YouTube spelling, short or long: the result is
+    ``youtu.be/<id>`` plus a timestamp if -- and only if -- the input carried a
+    real one (``t`` / ``start``, any form YouTube accepts). Every other query
+    parameter is dropped, including the ``si=`` share tag, so
+    ``youtu.be/ID?si=abc`` and ``youtube.com/watch?v=ID&si=abc`` both become
+    ``youtu.be/ID`` while ``youtu.be/ID?si=abc&t=326`` becomes
+    ``youtu.be/ID?t=326``. A timestamp is a position in the video that a proof
+    usually relies on, so it survives; a share tag identifies nothing and is
+    noise. No timestamp is ever invented. A link without exactly one usable id
+    is left alone rather than guessed at.
+    """
+    pairs: list[tuple[str, str]]
+    video_id: str | None = None
+    short = _YOUTUBE_SHORT.match(link)
+    if short is not None:
+        video_id = short.group("id")
+        pairs = urllib.parse.parse_qsl(short.group("query") or "", keep_blank_values=True)
+    else:
+        if not link.startswith(("https://", "http://")):
+            return None
+        try:
+            parts = urllib.parse.urlsplit(link)
+        except ValueError:
+            return None
+        if parts.netloc.lower() not in _YOUTUBE_HOSTS:
+            return None
+        pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if parts.path == "/watch":
+            ids = [value for key, value in pairs if key == "v"]
+            if len(ids) == 1:
+                video_id = ids[0]
+        else:
+            by_path = _YOUTUBE_ID_PATH.match(parts.path)
+            if by_path is not None:
+                video_id = by_path.group("id")
+    if video_id is None or not _VIDEO_ID.match(video_id):
+        return None
+    # Keep a real timestamp, in the order it appeared; drop everything else.
+    kept = [(key, value) for key, value in pairs if key in _YOUTUBE_TIMESTAMP_KEYS and _YOUTUBE_TIME.match(value)]
+    timestamp = "?" + urllib.parse.urlencode(kept) if kept else ""
+    return f"https://youtu.be/{video_id}{timestamp}"
+
+
+def _evidence_link_status(link: str) -> tuple[str, bool]:
+    """Return safe display text and whether the value is a rendered link."""
+    safe_link = redact_urls_in_text(link)
+    clickable = len(link) <= MAX_EVIDENCE_LINK_CHARS and safe_link == link and _is_url(link)
+    return safe_link, clickable
+
+
+def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     """Proof column: real links where possible, escaped text otherwise.
 
     Each link is labelled "proof" (or "proof 1", "proof 2" when there are
@@ -214,20 +422,40 @@ def _evidence_cell(links: Sequence[str]) -> str:
     by side rather than separated by an HTML ``<br>``, because the report never
     emits raw HTML -- a cell then renders the same in a pull request, in a job
     summary and in any plain Markdown preview, where a tag would show as text.
+    Untrusted values that are redacted, malformed or merely prose are kept out
+    of Markdown's automatic-link parser too: a code span is literal, not a
+    second chance for GitHub to turn a supposedly non-clickable URL into one.
     """
     if not links:
         return "-"
     shown = links[:MAX_EVIDENCE_LINKS]
     single = len(shown) == 1
-    rendered = [
-        _markdown_link(link, "proof" if single else f"proof {position}") if _is_url(link) else _cell(link)
-        for position, link in enumerate(shown, start=1)
-    ]
+    rendered: list[str] = []
+    for position, link in enumerate(shown, start=1):
+        safe_link, clickable = _evidence_link_status(link)
+        if clickable:
+            # One uniform label scheme: "proof" for a lone link, "proof N" when
+            # there are several. Keeping the SAME label shape for every target
+            # is what lets a reader tell the entries apart in a mixed row; a
+            # per-target label made a YouTube row look different from a Discord
+            # one for no gain, because both are already one click away.
+            label = "proof" if single else f"proof {position}"
+            # The TARGET still uses YouTube's own short domain, which is a
+            # faithful alias of the same video: the raw URL stays as short as
+            # the rewritten label used to be, and the label stops carrying it.
+            target = _youtube_short_url(link) or link
+            rendered.append(_markdown_link(target, label))
+        else:
+            preview = _shorten(safe_link, MAX_EVIDENCE_LINK_CHARS)
+            if safe_link != link or _AUTOLINK_IN_TEXT.search(link):
+                rendered.append(_code(preview, in_table=True))
+            else:
+                rendered.append(_cell(preview))
     cell = ", ".join(rendered)
-    hidden = len(links) - len(shown)
+    hidden = max(0, len(links) - len(shown)) + max(0, omitted)
     if hidden:
-        # Plain text, not a link: it must never look clickable.
-        cell += f", and {_count(hidden)} more"
+        # Keep the overflow note plain; it counts evidence links not shown.
+        cell += f", and {_count(hidden)} more evidence entries"
     return cell
 
 
@@ -245,16 +473,20 @@ def _count(value: int) -> str:
     return f"{value:,}"
 
 
-def _capped(rows: Sequence[str], limit: int, singular: str, plural_form: str) -> tuple[list[str], str | None]:
-    """Trim a table body to ``limit`` rows, returning an overflow note if needed."""
-    if len(rows) <= limit:
-        return list(rows), None
-    hidden = len(rows) - limit
-    note = (
+def _overflow_note(total: int, limit: int, singular: str, plural_form: str) -> str | None:
+    """The "and N more" note for a table whose body was cut to ``limit`` rows.
+
+    Callers cut the SEQUENCE first and render only ``limit`` rows: building
+    every row and throwing all but a hundred away cost 2.3 s for a 50,000-row
+    run, to produce a 46 kB report either way.
+    """
+    if total <= limit:
+        return None
+    hidden = total - limit
+    return (
         f"… and {_count(hidden)} more {plural(hidden, singular, plural_form)} not shown here "
         "(the table would make the pull request body too long)."
     )
-    return list(rows[:limit]), note
 
 
 def _row(cells: Sequence[str]) -> str:
@@ -330,11 +562,14 @@ def render_removed_table(steamids: Sequence[str], limit: int = MAX_REMOVED_TABLE
 
     ordered = _sorted_steamids(steamids)
     count = len(ordered)
-    rows = [_row((_steamid_cell(steamid), _profile_cell(steamid), _steam_history_cell(steamid))) for steamid in ordered]
-    rows, overflow = _capped(rows, limit, "SteamID", "SteamIDs")
+    rows = [
+        _row((_steamid_cell(steamid), _profile_cell(steamid), _steam_history_cell(steamid)))
+        for steamid in ordered[:limit]
+    ]
+    overflow = _overflow_note(count, limit, "SteamID", "SteamIDs")
     headline = (
         f"**{_count(count)} {plural(count, 'SteamID', 'SteamIDs')} removed from the Vorobey hackerpolice list "
-        "since the previous snapshot.**"
+        "since the previous snapshot:**"
     )
     return [
         headline,
@@ -350,27 +585,29 @@ def _with_removed_table(lines: list[str], steamids: Sequence[str], limit: int = 
     if not table:
         return lines
     while lines and not lines[-1].strip():
-        lines.pop()  # exactly one blank line before the new section
+        lines.pop()
     return [*lines, "", *table]
 
 
 def render_closing(changes: Sequence[Change], database: str | None = None) -> str:
     """Build the present-tense closing sentence describing what changed.
 
-    With a database name the file scopes the whole sentence and is named
-    exactly once, up front::
+    With a database name the friendly label scopes the whole sentence and is
+    named exactly once, up front::
 
-        In `playerlist.garou3299.json`: attributes are changed for these
-        SteamIDs: ...; entry is removed for this SteamID: ...; nothing else
-        is modified.
+        In the Garou3299 database: attributes are changed for these SteamIDs:
+        ...; entry is removed for this SteamID: ...; nothing else is modified.
+
+    The label rather than the file name, because the table headlines use it too
+    and the exact path is already named in the header bullet -- repeating a
+    code-span path here made the summary the clumsiest line in the report.
 
     Without one (callers that only have the changes) it falls back to the
     standalone phrasing: "Attribute is changed for this SteamID: ...; Entry
     is removed from the database for this SteamID: ...; nothing else is
     modified."
     """
-    # Same numeric order as the tables above, so the sentence reads the way
-    # the report does regardless of the order the changes were discovered in.
+    # Use the same numeric SteamID order as the tables above.
     changed_steamids = _sorted_steamids(
         [change.steamid for change in changes if (change.kind == "promote") or change.after]
     )
@@ -380,7 +617,8 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
 
     def clause(head: str, target: str, steamids: list[str]) -> str:
         if database is None:
-            head = head[:1].upper() + head[1:]  # standalone sentence starts capitalised
+            # Capitalize standalone clauses only.
+            head = head[:1].upper() + head[1:]
         return f"{head} for {target}: " + _steamid_list(steamids)
 
     parts: list[str] = []
@@ -400,9 +638,12 @@ def render_closing(changes: Sequence[Change], database: str | None = None) -> st
             head += " from the database"
         parts.append(clause(head, "this SteamID" if one else "these SteamIDs", removed_steamids))
 
+    if not parts:
+        # Avoid an empty clause when there are no changes.
+        return f"In the {_text(database)} database: nothing has changed." if database else "Nothing has changed."
     body = "; ".join(parts)
-    if database is not None:
-        body = f"In `{_code(database)}`: {body}"
+    if database:
+        body = f"In the {_text(database)} database: {body}"
     return body + "; nothing else is modified."
 
 
@@ -412,40 +653,53 @@ class RunInfo:
 
     database_path: Path
     source: str
-    source_total: int
-    source_skipped: int
+    source_total: int  # Raw entries, including duplicates.
+    source_skipped: int  # Rows without usable SteamIDs.
     dry_run: bool
-    include_proof: bool = False
     changes: tuple[Change, ...] = ()
-    # Demotion provenance: how many IDs disappeared upstream vs. the snapshot,
-    # and (when demotion was skipped despite --demote) the reason why.
-    previous_source_total: int | None = None
-    added_to_source: int = 0
-    removed_from_source: int = 0
-    # SteamIDs that were in the previous snapshot but are gone from the
-    # current list. Reported whether or not demotion ran (and even when the
-    # mass-demotion guard skipped demotion), because it is the raw fact the
-    # pull request exists to communicate.
+    # Snapshot provenance and reasons a requested demotion was skipped.
+    previous_source_total: int | None = None  # Raw entries in the previous snapshot.
+    added_to_source: int = 0  # Distinct usable IDs added upstream.
+    removed_from_source: int = 0  # Distinct usable IDs removed upstream.
+    # IDs missing upstream since the previous snapshot, even when demotion is skipped.
     removed_upstream: tuple[str, ...] = ()
     demotion_note: str | None = None
-    # Why the snapshot was left alone (--no-update-snapshot, or a run that
-    # could not apply the removals it found).
+    # Explain why the snapshot was not refreshed.
     snapshot_note: str | None = None
-    # True when the snapshot file itself was refreshed this run, so a
-    # snapshot-only PR does not misleadingly report "No changes."
+    # Include snapshot-only changes in the report status.
     snapshot_changed: bool = False
-    # The snapshot file this run used (--snapshot), so the report never names
-    # a path the run did not actually touch.
+    # Distinguish file-only normalisation from no database changes.
+    database_changed: bool = False
+    # Report the snapshot path actually used.
     snapshot_path: Path | None = None
 
     @property
-    def database_name(self) -> str:
-        """File name of the database the changes are written to.
+    def database_label(self) -> str:
+        """Friendly name of the database, derived from its file name.
 
-        Only the file name, never the full (possibly temporary) path, so the
-        closing sentence reads the same on every machine.
+        ``playerlist.garou3299.json`` becomes ``Garou3299``: the owner part of
+        the usual ``playerlist.<owner>.json`` shape, capitalised. Any other
+        file name is used as it is (``mylist.json`` becomes ``Mylist``), so
+        the headline always names the file the run actually writes and no
+        repository name is hardcoded here.
         """
-        return Path(self.database_path).name
+        stem = self.database_path.stem
+        head, _, owner = stem.partition(".")
+        name = owner if head == "playerlist" and owner else stem
+        name = _shorten(name, MAX_DATABASE_LABEL_CHARS)
+        return name[:1].upper() + name[1:]
+
+
+def _net_change_text(added: int, removed: int) -> str:
+    """Describe the net change in DISTINCT SteamIDs.
+
+    The entry totals either side of it count raw rows (including duplicates),
+    while added/removed count distinct usable IDs -- so deriving the net from
+    the two raw totals made the line contradict itself whenever the upstream
+    file contained a duplicate row or an unusable one.
+    """
+    delta = added - removed
+    return "no net change" if delta == 0 else f"net {delta:+,d}"
 
 
 def _header_lines(info: RunInfo) -> list[str]:
@@ -453,20 +707,22 @@ def _header_lines(info: RunInfo) -> list[str]:
     source_note = f"{_count(info.source_total)} entries"
     if info.source_skipped:
         source_note += f", {_count(info.source_skipped)} unusable"
+    source = redact_urls_in_text(info.source)
+    source_display = _text(source, allow_autolinks=True) if _is_url(source) else _code(source)
 
     lines = [
         "## Vorobey hackerpolice sync",
         "",
-        f"- Database: `{_code(str(info.database_path))}`",
+        f"- Database: {_code(_safe_display_path(info.database_path))}",
         f"- Vorobey hackerpolice list ({source_note}): {SOURCE_REPO_URL}",
-        f"- Fetched from: {_text(redact_url(info.source))}",
+        f"- Fetched from: {source_display}",
         f"- Run at: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
     ]
     if info.dry_run:
         lines.append("- Mode: **dry run** (no database or snapshot written)")
     if info.previous_source_total is not None:
-        current_total = info.previous_source_total + info.added_to_source - info.removed_from_source
-        net = info.added_to_source - info.removed_from_source
+        # Entry totals are raw rows (duplicates included) for provenance only;
+        # added/removed, and the net derived from them, count DISTINCT IDs.
         lines.append(
             f"- Previous snapshot: {_count(info.previous_source_total)} entries; "
             f"{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} "
@@ -476,29 +732,41 @@ def _header_lines(info: RunInfo) -> list[str]:
             f"- Snapshot diff: **{_count(info.added_to_source)} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
             f"**{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} removed** "
-            f"({_count(info.previous_source_total)} → {_count(current_total)} entries; net {net:+,d})"
+            f"({_count(info.previous_source_total)} → {_count(info.source_total)} entries; "
+            f"{_net_change_text(info.added_to_source, info.removed_from_source)})"
         )
     elif info.snapshot_changed:
-        # No baseline existed: every current ID is new in the initial snapshot.
+        # With no baseline, every usable ID is new.
         lines.append(
             f"- Snapshot diff: **{_count(info.added_to_source)} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
             "**0 SteamIDs removed** (no previous snapshot; initial snapshot)"
         )
     if info.demotion_note:
-        lines.append(f"- Demotion: **{info.demotion_note}**")
+        # Escape data-derived paths included in the demotion note.
+        lines.append(f"- Demotion: **{_text(info.demotion_note)}**")
     if info.snapshot_note:
+        # Snapshot notes contain code-authored Markdown; preserve their formatting.
         lines.append(f"- Snapshot: {info.snapshot_note}")
     elif info.snapshot_changed:
         verb = "would be updated" if info.dry_run else "updated"
-        label = _code(str(info.snapshot_path) if info.snapshot_path is not None else DEFAULT_SNAPSHOT_LABEL)
-        lines.append(f"- Snapshot: `{label}` {verb} to an exact copy of the current upstream file")
+        snapshot_label = (
+            _safe_display_path(info.snapshot_path) if info.snapshot_path is not None else DEFAULT_SNAPSHOT_LABEL
+        )
+        label = _code(snapshot_label)
+        lines.append(f"- Snapshot: {label} {verb} to an exact copy of the current upstream file")
     lines.append("")
     return lines
 
 
-def _promotion_lines(promotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS) -> list[str]:
-    """Render the "promoted to cheater" table block."""
+def _promotion_lines(promotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS, *, database: str) -> list[str]:
+    """Render the "promoted to cheater" table block.
+
+    ``database`` is escaped here: it is derived from a file name, which is
+    data like any other -- a database called ``<b>x.json`` must not open a tag
+    in the report.
+    """
+    count = len(promotions)
     rows = [
         _row(
             (
@@ -506,24 +774,21 @@ def _promotion_lines(promotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE
                 _name_cell(change),
                 _attributes_cell(change.before),
                 _attributes_cell(change.after),
-                _evidence_cell(change.evidence),
+                _evidence_cell(change.evidence, change.evidence_omitted),
                 _steam_history_cell(change.steamid),
             )
         )
-        for change in promotions
+        for change in promotions[:limit]
     ]
-    rows, overflow = _capped(rows, limit, "entry", "entries")
-    count = len(promotions)
-    return [
-        f"**{_count(count)} {plural(count, 'entry', 'entries')} promoted to `cheater`.**",
-        "",
-        *_table(PROMOTION_HEADER, rows, overflow),
-        "",
-    ]
+    overflow = _overflow_note(count, limit, "entry", "entries")
+    entries = plural(count, "entry", "entries")
+    headline = f"**{_count(count)} {entries} promoted to `cheater` in the {_text(database)} database:**"
+    return [headline, "", *_table(PROMOTION_HEADER, rows, overflow), ""]
 
 
-def _demotion_lines(demotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS) -> list[str]:
+def _demotion_lines(demotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS, *, database: str) -> list[str]:
     """Render the "demoted" table block."""
+    count = len(demotions)
     rows = [
         _row(
             (
@@ -534,13 +799,12 @@ def _demotion_lines(demotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_R
                 _steam_history_cell(change.steamid),
             )
         )
-        for change in demotions
+        for change in demotions[:limit]
     ]
-    rows, overflow = _capped(rows, limit, "entry", "entries")
-    count = len(demotions)
+    overflow = _overflow_note(count, limit, "entry", "entries")
     headline = (
-        f"**{_count(count)} {plural(count, 'entry', 'entries')} demoted (in the previous snapshot, "
-        "removed from the hackerpolice list since).**"
+        f"**{_count(count)} {plural(count, 'entry', 'entries')} demoted (present in the previous snapshot, "
+        f"absent from the current Vorobey hackerpolice list) in the {_text(database)} database:**"
     )
     return [
         headline,
@@ -564,7 +828,7 @@ def _truncate_to_bytes(text: str, limit: int) -> str:
     """Longest prefix of ``text`` whose UTF-8 encoding fits in ``limit`` bytes."""
     if limit <= 0:
         return ""
-    return text.encode("utf-8", "surrogatepass")[:limit].decode("utf-8", "ignore")  # never a half character
+    return text.encode("utf-8", "surrogatepass")[:limit].decode("utf-8", "ignore")
 
 
 def _fit_body(text: str) -> str:
@@ -584,48 +848,77 @@ def _fit_body(text: str) -> str:
     return (keep[:cut] if cut > 0 else keep) + note
 
 
-def _render_body(info: RunInfo, change_limit: int, removed_limit: int) -> str:
-    """Render the body with at most ``change_limit``/``removed_limit`` rows per table."""
-    lines = _header_lines(info)
+def _prepare_changes(info: RunInfo) -> tuple[list[Change], list[Change]]:
+    """Split the changes into promotions and demotions, in numeric SteamID order.
 
-    # Numeric SteamID order: the same run always renders the same table, and
-    # the reader can find an ID at a glance (changes arrive in database order).
-    promotions = sorted((change for change in info.changes if change.kind == "promote"), key=_change_sort_key)
-    demotions = sorted((change for change in info.changes if change.kind == "demote"), key=_change_sort_key)
+    Numeric order means the same run always renders the same table, and the
+    reader can find an ID at a glance (changes arrive in database order).
+    Computed once per report: the body is rendered up to ten times while it
+    shrinks to fit, and re-sorting every change each time cost 1.6 s on a
+    100,000-change run.
+    """
+    return (
+        sorted((change for change in info.changes if change.kind == "promote"), key=_change_sort_key),
+        sorted((change for change in info.changes if change.kind == "demote"), key=_change_sort_key),
+    )
+
+
+def _render_body(
+    info: RunInfo,
+    change_limit: int,
+    removed_limit: int,
+    promotions: Sequence[Change] | None = None,
+    demotions: Sequence[Change] | None = None,
+    closing_sentence: str | None = None,
+) -> str:
+    """Render the body with at most ``change_limit``/``removed_limit`` rows per table.
+
+    ``render_report`` passes the prepared (sorted) sequences and the closing
+    sentence in, because it renders the body repeatedly; the defaults keep the
+    function usable on its own.
+    """
+    lines = _header_lines(info)
+    if promotions is None or demotions is None:
+        promotions, demotions = _prepare_changes(info)
 
     if not promotions and not demotions:
-        if info.snapshot_changed:
+        if info.database_changed:
+            # Describe file-only normalisation accurately instead of claiming no changes.
+            verb = "would be normalised" if info.dry_run else "was normalised"
+            detail = "entries re-sorted, formatting restored"
+            if info.snapshot_changed:
+                refreshed = "would be refreshed" if info.dry_run else "was refreshed"
+                detail += f"; the snapshot {refreshed} too"
+            lines += [f"**No player changes** (the database file {verb}: {detail}).", ""]
+        elif info.snapshot_changed:
             lines += ["**No database changes** (snapshot refresh only).", ""]
         else:
             lines += ["**No changes.**", ""]
         return "\n".join(_with_removed_table(lines, info.removed_upstream, removed_limit))
 
     if promotions:
-        lines += _promotion_lines(promotions, change_limit)
+        lines += _promotion_lines(promotions, change_limit, database=info.database_label)
     if demotions:
-        lines += _demotion_lines(demotions, change_limit)
+        lines += _demotion_lines(demotions, change_limit, database=info.database_label)
 
-    # Upstream removals first: the closing sentence and the proof note that
-    # follow are always the last thing in the report.
+    # Place the removed-ID table before the closing summary and proof note.
     lines = _with_removed_table(lines, info.removed_upstream, removed_limit)
 
-    closing = render_closing(info.changes, database=info.database_name)
+    if closing_sentence is None:
+        closing_sentence = render_closing(info.changes, database=info.database_label)
 
     while lines and not lines[-1].strip():
-        lines.pop()  # exactly one blank line before the closing sentence
-    lines += ["", closing]
+        lines.pop()
+    lines += ["", closing_sentence]
 
-    total_links = sum(len(change.evidence) for change in promotions)
-    if info.include_proof:
-        lines += [
-            "",
-            "**Note:** `--include-proof` was enabled, so an `[auto]` proof line citing the",
-            "hackerpolice list was also written into each entry above.",
-        ]
-        if total_links:
-            lines.append("")
+    # Count visible rows only; do not reference evidence omitted from the table.
+    total_links = sum(
+        _evidence_link_status(link)[1]
+        for change in promotions[:change_limit]
+        for link in change.evidence[:MAX_EVIDENCE_LINKS]
+    )
     if total_links:
-        # Deliberately the last line of the report.
+        # Keep attribution as the report's final content line.
         note = (
             "Proof link comes from the Vorobey hackerpolice list and is shown for review only."
             if total_links == 1
@@ -636,13 +929,7 @@ def _render_body(info: RunInfo, change_limit: int, removed_limit: int) -> str:
     return "\n".join(lines)
 
 
-# Tried in order when a report would exceed MAX_REPORT_BYTES. Rows are dropped
-# (each drop is announced with an "and N more" note) instead of the body being
-# cut off, because the closing sentence and the removed-SteamID list are what
-# the pull request exists to communicate. The change tables shrink first --
-# the same changes are visible in the PR's own diff -- and the removed list
-# only after them; the last resort is one row per table, and _fit_body() after
-# that for a single row that is itself enormous.
+# Reduce change-table rows first, then removed IDs; hard-truncate only as a last resort.
 _SHRINK_STEPS: tuple[tuple[int, int], ...] = (
     (100, MAX_REMOVED_TABLE_ROWS),
     (50, MAX_REMOVED_TABLE_ROWS),
@@ -663,9 +950,11 @@ def render_report(info: RunInfo) -> str:
     re-rendered with fewer rows rather than truncated, so it always ends with
     its closing sentence.
     """
-    text = _render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS)
+    promotions, demotions = _prepare_changes(info)
+    closing_sentence = render_closing(info.changes, database=info.database_label)
+    text = _render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS, promotions, demotions, closing_sentence)
     for change_limit, removed_limit in _SHRINK_STEPS:
         if _utf8_len(text) <= MAX_REPORT_BYTES:
             break
-        text = _render_body(info, change_limit, removed_limit)
+        text = _render_body(info, change_limit, removed_limit, promotions, demotions, closing_sentence)
     return _safe(_fit_body(text))

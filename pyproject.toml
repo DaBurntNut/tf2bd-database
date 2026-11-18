@@ -1,5 +1,4 @@
-# Tooling configuration only: the scripts run on a bare Python 3.10+ install,
-# ruff is used by contributors and by CI to keep the code tidy.
+# Tooling config only; runtime scripts support Python 3.10+.
 
 [tool.ruff]
 line-length = 120
@@ -19,14 +18,24 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = ["playerlist", "sources", "policy", "report", "sync_vorobey_hackerpolice"]
 
-# The scripts are imported as top-level modules (scripts/ is on sys.path in
-# tests and in the workflow), so tell type checkers where to find them.
-[tool.pyright]
-include = ["scripts"]
-extraPaths = ["scripts"]
-
+# mypy is the type checker CI runs; a second, unenforced config would only drift.
 [tool.mypy]
-# Strict on the shipped code: it is five small modules, and the bot runs
-# unattended, so a type error is worth failing a pull request over.
+# Strictly type-check the small, unattended runtime.
 strict = true
 mypy_path = "scripts"
+
+[tool.coverage.run]
+# Require branch coverage; failure paths are especially important for the bot.
+branch = true
+source = ["scripts"]
+
+[tool.coverage.report]
+# Keep coverage honest without demanding the impossible last few percent. The
+# suite currently sits at 100%; the floor exists so it cannot silently rot, not
+# so a contributor has to invent a test for an unreachable branch to pass CI.
+fail_under = 95
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+]
