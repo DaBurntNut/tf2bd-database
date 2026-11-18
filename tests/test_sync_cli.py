@@ -1990,6 +1990,18 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 100)
         self.assertEqual(report_module.MAX_REPORT_BYTES, 60_000)
 
+    def test_the_readme_states_the_report_byte_cap_it_enforces(self):
+        """The prose must name the cap the code enforces.
+
+        The number was pinned in tests already, but the README described the cap
+        only as "its last-resort byte limit", so a reader could not tell what it
+        was and a change to the constant would leave the prose stale.
+        """
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        stated = f"{report_module.MAX_REPORT_BYTES // 1000:,} KB"
+        self.assertIn(stated, readme)
+        self.assertIn(f"stops at {report_module.MAX_CHANGE_TABLE_ROWS}", readme)
+
     def test_the_display_caps(self):
         self.assertEqual(report_module.MAX_NAME_CHARS, 80)
         self.assertEqual(report_module.MAX_ATTRIBUTE_CHARS, 40)

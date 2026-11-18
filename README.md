@@ -95,8 +95,8 @@ code instead, never as a clickable target.
 
 The report is kept below GitHub's body limit: each change table stops at 150 rows
 and the removed-ID table at 100, with an `… and N more` overflow note. If needed,
-the report reduces those caps further; its last-resort byte limit is also marked
-rather than silently cutting text. The tables aid review; the repository diff
+the report reduces those caps further, and a last-resort 60 KB byte cap (well
+under GitHub's limit) is marked rather than silently cutting text. The tables aid review; the repository diff
 remains the complete record.
 
 Entry totals in the header count the raw rows the upstream file contains, so a
