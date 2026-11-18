@@ -99,9 +99,15 @@ than from the raw totals, so the line can never contradict itself.
   not forgotten.
   `--no-update-snapshot` holds the baseline back on purpose; every later run then
   re-reports the same candidates (and re-applies nothing).
-- **Mass-removal guard** — more than 50 IDs *and* more than 20 % gone at once means
-  demotion is skipped; `--allow-mass-demotion` overrides this guard, not the
-  separate incomplete-source safety check.
+- **Mass-removal guard** — demotion is skipped when the removals look like an
+  upstream accident rather than real news. Two independent tests, because the
+  upstream list is an order of magnitude larger than this database (5,574 snapshot
+  entries against 108 demotable cheaters at the time of writing): more than 50 IDs
+  *and* more than 20 % of the snapshot gone at once, **or** more than 25 % of the
+  entries this database could actually lose. The second test exists because a purge
+  of *every* tracked cheater was only 1.9 % of the snapshot, so the first test alone
+  would have let it through silently. `--allow-mass-demotion` overrides this guard,
+  not the separate incomplete-source safety check.
 - **Incomplete-source guard** — if the current list has unusable SteamID rows and
   the snapshot shows removals, demotion and snapshot refresh are postponed until a
   clean list can confirm them. A single malformed row cannot silently look like

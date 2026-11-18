@@ -45,7 +45,7 @@ import os
 import stat
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import TextIO
 
@@ -57,6 +57,7 @@ from playerlist import (
     dumps,
     error_reason,
     load,
+    normalize_steamid,
     validate,
 )
 from policy import Change, sync
@@ -83,6 +84,12 @@ DEFAULT_SNAPSHOT = "snapshot/playerlist.vorobey-hackerpolice.json"
 # Veto demotion if removals exceed both the minimum count and fraction thresholds.
 MASS_DEMOTION_MIN_IDS = 50
 MASS_DEMOTION_MAX_FRACTION = 0.2
+# Also veto when the removal would demote a large share of THIS database's own
+# demotable entries. The snapshot is far larger than the database (5,574 vs 108
+# demotable cheaters at the time of writing), so the snapshot-relative rule alone
+# let a purge of every demotable entry look like 1.9% of the baseline and pass.
+MASS_DEMOTION_MAX_DATABASE_FRACTION = 0.25
+MASS_DEMOTION_MIN_DATABASE_IDS = 5
 
 
 def display_path(path: Path | str) -> str:
@@ -444,6 +451,73 @@ def _load_index(args: argparse.Namespace) -> tuple[HackerpoliceIndex, str, bytes
     return index, source, source_bytes
 
 
+def _demotion_impact(
+    database: PlayerList, removed: Collection[str], previous_index: HackerpoliceIndex
+) -> tuple[int, int]:
+    """Return ``(to_demote, at_risk)`` for this database, in entries.
+
+    ``at_risk`` is every entry carrying ``cheater`` that the PREVIOUS snapshot
+    lists -- the whole population upstream could ever demote. Entries upstream
+    never listed were added by hand and are never demoted, so counting them
+    would make the guard fire on runs that are actually harmless.
+
+    ``to_demote`` is the part of that population this run would really change,
+    i.e. the ones among ``removed`` (previous snapshot minus the current list).
+
+    Measuring against the CURRENT index would be useless: demotion targets are
+    precisely the entries missing from it, so that denominator collapses to
+    zero exactly when a purge is largest and the guard is most needed.
+    """
+    players = database.get("players")
+    if not isinstance(players, list):
+        return 0, 0
+    to_demote = 0
+    at_risk = 0
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        attributes = player.get("attributes")
+        if not isinstance(attributes, list) or "cheater" not in attributes:
+            continue
+        canonical = normalize_steamid(player.get("steamid"))
+        if canonical is None or canonical not in previous_index.by_steamid:
+            continue
+        at_risk += 1
+        if canonical in removed:
+            to_demote += 1
+    return to_demote, at_risk
+
+
+def _looks_like_mass_removal(removed: int, baseline: int, to_demote: int, at_risk: int) -> bool:
+    """True when these removals look like an upstream accident, not real news.
+
+    Two independent tests, because they catch different shapes of accident:
+
+    * the removals are a large share of the SNAPSHOT (upstream collapsed). This
+      measures ALL removals: upstream losing most of its list is a problem even
+      if this database happens to track few of them.
+    * the removals are a large share of what THIS database could lose. The
+      snapshot is much bigger than the database, so a purge of every tracked
+      cheater can still be a tiny fraction of the baseline and slip past the
+      first test.
+    """
+    if removed > MASS_DEMOTION_MIN_IDS and baseline and removed > MASS_DEMOTION_MAX_FRACTION * baseline:
+        return True
+    return (
+        to_demote >= MASS_DEMOTION_MIN_DATABASE_IDS
+        and at_risk > 0
+        and to_demote > MASS_DEMOTION_MAX_DATABASE_FRACTION * at_risk
+    )
+
+
+def _demotion_scale(to_demote: int, at_risk: int) -> str:
+    """Describe the removal against the database when it is the tighter bound."""
+    if at_risk <= 0:
+        return "no tracked cheaters to compare against"
+    share = min(to_demote, at_risk) / at_risk
+    return f"{share:.0%} of the {at_risk:,} cheater(s) this database could lose"
+
+
 def _plan_demotion(
     args: argparse.Namespace,
     previous_index: HackerpoliceIndex | None,
@@ -451,12 +525,19 @@ def _plan_demotion(
     snapshot_path: Path,
     *,
     source_skipped: int = 0,
+    demotion_impact: tuple[int, int] = (0, 0),
 ) -> tuple[set[str], bool, str | None, str | None]:
     """Decide what may be demoted, and whether the baseline may advance.
 
     Returns ``(removed, update_snapshot, demotion_note, snapshot_note)``. The
     snapshot is held back whenever removals could not be applied, so a
     skipped removal is never silently forgotten.
+
+    ``demotion_impact`` is ``(to_demote, at_risk)`` for this database (see
+    :func:`_demotion_impact`). It is a separate guard from the snapshot-relative
+    one because the snapshot is an order of magnitude larger than the database:
+    a removal that looks like a rounding error of the baseline can still wipe
+    out most of the database's tracked cheaters.
     """
     demotion_note: str | None = None
     # Hold the snapshot when demotion is vetoed, or skipped removals would be lost.
@@ -488,15 +569,14 @@ def _plan_demotion(
                     "**not refreshed** - the current list is incomplete, so these removals stay "
                     "demotion candidates until a clean list can confirm them"
                 )
-            elif (
-                not args.allow_mass_demotion
-                and len(removed) > MASS_DEMOTION_MIN_IDS
-                and len(removed) > MASS_DEMOTION_MAX_FRACTION * len(previous_index.by_steamid)
+            elif not args.allow_mass_demotion and _looks_like_mass_removal(
+                len(removed), len(previous_index.by_steamid), *demotion_impact
             ):
                 demotion_note = (
                     f"skipped - {len(removed):,} of {len(previous_index.by_steamid):,} snapshot entries "
-                    "disappeared upstream at once, which looks like an upstream problem, "
-                    "not real removals (re-run with --allow-mass-demotion to force)"
+                    f"disappeared upstream at once ({_demotion_scale(*demotion_impact)}), which looks "
+                    "like an upstream problem, not real removals "
+                    "(re-run with --allow-mass-demotion to force)"
                 )
                 LOGGER.warning("Demotion %s.", demotion_note)
                 removed = set()
@@ -543,8 +623,14 @@ def run(args: argparse.Namespace) -> int:
             len(index.by_steamid),
         )
 
+    demotion_impact = (0, 0) if previous_index is None else _demotion_impact(database, removed_upstream, previous_index)
     removed, update_snapshot, demotion_note, snapshot_note = _plan_demotion(
-        args, previous_index, removed_upstream, snapshot_path, source_skipped=index.skipped
+        args,
+        previous_index,
+        removed_upstream,
+        snapshot_path,
+        source_skipped=index.skipped,
+        demotion_impact=demotion_impact,
     )
     changes = sync(database, index, enable_demote=args.demote, removed_ids=removed)
 

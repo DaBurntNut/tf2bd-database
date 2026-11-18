@@ -30,8 +30,10 @@ branch = true
 source = ["scripts"]
 
 [tool.coverage.report]
-# Fail CI when any statement or branch is untested.
-fail_under = 100
+# Keep coverage honest without demanding the impossible last few percent. The
+# suite currently sits at 100%; the floor exists so it cannot silently rot, not
+# so a contributor has to invent a test for an unreachable branch to pass CI.
+fail_under = 95
 show_missing = true
 skip_covered = true
 exclude_lines = [

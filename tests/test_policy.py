@@ -53,12 +53,93 @@ class MassDemotionGuardTests(unittest.TestCase):
         with mock.patch.object(sync_module.LOGGER, "info"), mock.patch.object(sync_module.LOGGER, "warning"):
             yield
 
-    def plan(self, removed_count, snapshot_entries, *, demote=True, allow=False, no_update=False):
+    def plan(self, removed_count, snapshot_entries, *, demote=True, allow=False, no_update=False, impact=(0, 0)):
         args = SimpleNamespace(demote=demote, allow_mass_demotion=allow, no_update_snapshot=no_update)
         previous = index_of(*[hackerpolice_entry(f"[U:1:{1000 + n}]") for n in range(snapshot_entries)])
         removed = {f"[U:1:{1000 + n}]" for n in range(removed_count)}
         with self.quiet():
-            return sync_module._plan_demotion(args, previous, removed, Path("snapshot.json"))
+            return sync_module._plan_demotion(args, previous, removed, Path("snapshot.json"), demotion_impact=impact)
+
+    def test_a_purge_of_the_databases_own_cheaters_is_vetoed(self):
+        # The snapshot is far larger than the database, so the snapshot-relative
+        # rule alone let a purge of every tracked cheater look harmless: 108 of
+        # 5,574 snapshot entries is 1.9%, well under the 20% threshold. The
+        # database-relative rule exists so that case is still caught.
+        removed, update_snapshot, note, snapshot_note = self.plan(108, 5574, impact=(108, 108))
+        self.assertEqual(removed, set())
+        self.assertFalse(update_snapshot)
+        self.assertIn("looks like an upstream problem", note)
+        self.assertIn("not refreshed", snapshot_note)
+
+    def test_the_smallest_purge_that_matters_is_still_caught(self):
+        # 25% of 108 tracked cheaters is 27, so the guard trips once past it.
+        for removed_count, expected_veto in ((27, False), (28, True)):
+            with self.subTest(removed=removed_count):
+                removed, _, note, _ = self.plan(removed_count, 5574, impact=(removed_count, 108))
+                self.assertEqual(bool(note), expected_veto)
+                self.assertEqual(len(removed), 0 if expected_veto else removed_count)
+
+    def test_a_tiny_purge_does_not_trip_the_database_guard(self):
+        # A handful of real removals is ordinary news, not an upstream accident.
+        removed, update_snapshot, note, _ = self.plan(4, 5574, impact=(4, 108))
+        self.assertEqual(len(removed), 4)
+        self.assertTrue(update_snapshot)
+        self.assertIsNone(note)
+
+    def test_the_database_guard_needs_something_to_guard(self):
+        # With no demotable entries there is nothing to protect, so the
+        # database-relative rule stays quiet and only the snapshot rule applies.
+        self.assertFalse(sync_module._looks_like_mass_removal(40, 5574, 0, 0))
+        self.assertTrue(sync_module._looks_like_mass_removal(2000, 5574, 0, 0))
+
+    def test_the_guard_reports_how_much_of_the_database_is_at_stake(self):
+        self.assertIn("26% of the 108 cheater(s)", sync_module._demotion_scale(28, 108))
+        self.assertIn("no tracked cheaters", sync_module._demotion_scale(9, 0))
+        # Never claim more than the whole database.
+        self.assertIn("100%", sync_module._demotion_scale(500, 108))
+
+    def test_removals_beyond_the_demotable_count_are_still_measured(self):
+        # More removals than demotable entries cannot happen in a real run (sync
+        # drops IDs upstream still lists), but the guard must not under-report.
+        self.assertTrue(sync_module._looks_like_mass_removal(60, 5574, 60, 20))
+
+    def test_the_demotion_impact_counts_only_entries_upstream_could_ever_demote(self):
+        """A hand-added cheater upstream never listed is never demoted.
+
+        Counting those would overstate the blast radius and veto harmless runs.
+        """
+        database = {
+            "players": [
+                player("[U:1:1]", ["cheater"]),  # in previous snapshot -> at risk
+                player("[U:1:2]", ["cheater"]),  # never known to upstream -> exonerated
+                player("[U:1:3]", ["racist"]),  # no cheater tag -> untouched
+                player("[U:1:4]", ["cheater", "racist"]),  # in snapshot -> at risk
+                {"attributes": ["cheater"]},  # unusable SteamID -> skipped
+                {"steamid": "[U:1:5]", "attributes": "cheater"},  # malformed attributes
+                "not an entry",
+            ]
+        }
+        previous = index_of(hackerpolice_entry("[U:1:1]"), hackerpolice_entry("[U:1:4]"), hackerpolice_entry("[U:1:9]"))
+        # 1 and 4 are at risk; only 1 is actually removed this run.
+        self.assertEqual(sync_module._demotion_impact(database, {"[U:1:1]"}, previous), (1, 2))
+
+    def test_the_impact_uses_the_previous_snapshot_not_the_current_list(self):
+        """Demotion targets are by definition MISSING from the current list.
+
+        Measuring against the current index collapsed the denominator to zero
+        exactly when a purge was largest -- the guard went blind on the only
+        case it exists to catch. This pins the fix.
+        """
+        database = {"players": [player(f"[U:1:{n}]", ["cheater"]) for n in range(1, 11)]}
+        previous = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in range(1, 11)])
+        removed = {f"[U:1:{n}]" for n in range(1, 11)}
+        to_demote, at_risk = sync_module._demotion_impact(database, removed, previous)
+        self.assertEqual((to_demote, at_risk), (10, 10))
+        # Every tracked cheater gone at once is still caught.
+        self.assertTrue(sync_module._looks_like_mass_removal(to_demote, 5574, to_demote, at_risk))
+
+    def test_the_impact_tolerates_a_malformed_database(self):
+        self.assertEqual(sync_module._demotion_impact({"players": "nope"}, {"[U:1:1]"}, index_of()), (0, 0))
 
     def test_exactly_fifty_removals_are_not_a_mass_removal(self):
         # Exactly 50 stays below the guard; the count must exceed 50.

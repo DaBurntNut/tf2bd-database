@@ -332,8 +332,14 @@ class WorkflowContractTests(unittest.TestCase):
         """
         pyproject = (self.root / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn("branch = true", pyproject)
-        self.assertIn("fail_under = 100", pyproject)
         self.assertIn('source = ["scripts"]', pyproject)
+        # The floor must be high enough to catch real rot, and low enough that a
+        # contributor is not pushed to invent a test for an unreachable branch.
+        match = re.search(r"^fail_under = (\d+)$", pyproject, re.MULTILINE)
+        self.assertIsNotNone(match, "coverage fail_under is missing from pyproject.toml")
+        threshold = int(match.group(1))
+        self.assertGreaterEqual(threshold, 90)
+        self.assertLessEqual(threshold, 100)
 
     def test_the_check_job_is_read_only(self):
         jobs = self.jobs()

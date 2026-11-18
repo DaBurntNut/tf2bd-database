@@ -2014,6 +2014,10 @@ class DocumentedLimitsTests(unittest.TestCase):
         # README contract: the guard requires more than 50 IDs and more than 20% removal.
         self.assertEqual(sync_module.MASS_DEMOTION_MIN_IDS, 50)
         self.assertEqual(sync_module.MASS_DEMOTION_MAX_FRACTION, 0.2)
+        # The second, database-relative guard: the snapshot dwarfs the database,
+        # so a purge of every tracked cheater stayed under the snapshot rule.
+        self.assertEqual(sync_module.MASS_DEMOTION_MAX_DATABASE_FRACTION, 0.25)
+        self.assertEqual(sync_module.MASS_DEMOTION_MIN_DATABASE_IDS, 5)
         # Steam account IDs are 32-bit; instance identifiers use 20 bits.
         self.assertEqual(playerlist_module.MAX_ACCOUNT_ID, 2**32)
         self.assertEqual(playerlist_module.MAX_STEAMID_INSTANCE, 2**20)
