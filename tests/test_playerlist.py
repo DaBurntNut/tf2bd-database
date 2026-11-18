@@ -29,6 +29,7 @@ from playerlist import (
     normalize_steamid,
     order_attributes,
     player_name,
+    redact_diagnostic_text,
     sort_players,
     steam_history_url,
     steam_profile_url,
@@ -526,6 +527,36 @@ class DisplayPathTests(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 shown = display_path(value)
+                self.assertNotIn(secret, shown)
+                self.assertIn("REDACTED", shown)
+
+    def test_ordinary_english_after_bearer_or_basic_is_not_redacted(self):
+        # These words are ordinary English, and this redactor runs over player
+        # names on their way into the published report, so redacting them would
+        # rename innocent players in the output.
+        for name in (
+            "Bearer of bad news",
+            "bearer of the flame",
+            "Bearer Token King",
+            "Basic Instinct",
+            "The Bearer",
+            "a Bearer",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(redact_diagnostic_text(name), name)
+
+    def test_a_bearer_credential_is_still_redacted_whatever_it_looks_like(self):
+        for value, secret in (
+            ("Bearer S3CRET", "S3CRET"),
+            ("Bearer = S3CRET", "S3CRET"),
+            ("Bearer: S3CRET", "S3CRET"),
+            ("bearer  =  'S3CRET'", "S3CRET"),
+            ("Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Bearer eyJhbGciOi.eyJzdWIi.SflK", "eyJhbGciOi"),
+            ("Bearer HUNTER2", "HUNTER2"),
+        ):
+            with self.subTest(value=value):
+                shown = redact_diagnostic_text(value)
                 self.assertNotIn(secret, shown)
                 self.assertIn("REDACTED", shown)
 

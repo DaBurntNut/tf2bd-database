@@ -68,7 +68,14 @@ _DIAGNOSTIC_FIELD_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq
 _DIAGNOSTIC_VALUE_DELIMITERS = frozenset(",;&\r\n\t ")
 _AUTHORIZATION_HEADER = re.compile(r"(?i)(?P<header>\b(?:proxy-)?authorization\s*:\s*)[^\r\n]*", re.ASCII)
 # ``Bearer <token>``, also written ``Bearer = <token>`` or ``Bearer: <token>``.
-_BEARER_CREDENTIAL = re.compile(r"(?i)\b(?P<scheme>Bearer|Basic)\s*[:=]?\s+(?P<credential>[^\s,;&]+)", re.ASCII)
+# The separator is captured because it separates a credential from English: nobody
+# writes "Bearer = of", so an explicit separator always means a credential, while a
+# bare space has to be judged on the word that follows.
+_BEARER_CREDENTIAL = re.compile(
+    r"(?i)\b(?P<scheme>Bearer|Basic)(?P<separator>\s*[:=]\s*|\s+)(?P<credential>[^\s,;&]+)", re.ASCII
+)
+# Characters that practically never appear inside an ordinary English word.
+_CREDENTIAL_CHARS = re.compile(r"[0-9_\-./+=:~]", re.ASCII)
 # Also sanitize URL userinfo when the generic path formatter is used directly.
 _URL_USERINFO_PREFIX = re.compile(r"(?:https?:/{0,4}|//)", re.IGNORECASE | re.ASCII)
 _URL_USERINFO_IN_TEXT = re.compile(
@@ -220,10 +227,41 @@ def _redact_encoded_query_pairs(value: str) -> str:
     return "".join(parts)
 
 
+def _looks_like_credential(token: str, separator: str) -> bool:
+    """True when the word after ``Bearer``/``Basic`` is a token, not English.
+
+    Both words are ordinary English (``Bearer of bad news``, ``Basic
+    Instinct``), and this redactor runs over player names on their way into the
+    published report, so redacting unconditionally would rename innocent
+    players in the output. A credential is recognised by its shape instead:
+
+    - an explicit separator (``Bearer = ...``, ``Bearer: ...``) always wins,
+      because prose does not write one there;
+    - otherwise the token must carry a character an English word does not
+      (a digit, an underscore, a dot, a slash...) or be a long mixed-case blob.
+    """
+    if separator.strip():
+        return True
+    token = token.rstrip(".,;:!?)]}>\"'")
+    if _CREDENTIAL_CHARS.search(token):
+        return True
+    # No digits or punctuation: only a long mixed-case blob is a credential. An
+    # ordinary word ("of", "Instinct", "King") has neither.
+    return len(token) >= 12 and any(c.isupper() for c in token) and any(c.islower() for c in token)
+
+
+def _redact_bearer_match(match: re.Match[str]) -> str:
+    """Redact a bearer/basic match only when its credential looks like one."""
+    token = match.group("credential")
+    if not _looks_like_credential(token, match.group("separator")):
+        return match.group(0)
+    return f"{match.group('scheme')} REDACTED"
+
+
 def redact_diagnostic_text(value: str) -> str:
     """Redact common bare secrets, authorization headers, and URL userinfo."""
     value = _AUTHORIZATION_HEADER.sub(r"\g<header>REDACTED", value)
-    value = _BEARER_CREDENTIAL.sub(r"\g<scheme> REDACTED", value)
+    value = _BEARER_CREDENTIAL.sub(_redact_bearer_match, value)
     value = _URL_USERINFO_IN_TEXT.sub(r"\g<prefix>REDACTED@", value)
     return _redact_encoded_query_pairs(_redact_diagnostic_secret_pairs(value))
 
