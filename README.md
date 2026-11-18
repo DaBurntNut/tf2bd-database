@@ -77,7 +77,13 @@ links stay in the pull request: they are shown for review and are never written
 into the database.
 A promotion only ever changes `attributes` — never `proof`. Each promotion row
 shows at most 10 distinct upstream evidence links; any remaining proof entries
-are counted as omitted rather than retained in the change record.
+are counted as omitted rather than retained in the change record. A link is shown
+as a clickable `proof` label pointing at the exact upstream URL, except a YouTube
+video, which is labelled with YouTube's own short form (`https://youtu.be/<id>`,
+derived from the video id alone). That is a pure text rewrite — no request and no
+third-party shortener — so the report stays offline and the link stays
+verifiable; a link whose credentials had to be redacted is shown as plain code
+instead, never as a clickable target.
 
 The report is kept below GitHub's body limit: each change table stops at 150 rows
 and the removed-ID table at 100, with an `… and N more` overflow note. If needed,

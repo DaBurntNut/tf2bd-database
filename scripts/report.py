@@ -338,6 +338,61 @@ def _markdown_link(url: str, label: str) -> str:
     return f"[{label}]({encoded})"
 
 
+# YouTube hosts that serve video pages, and the path forms carrying the video id.
+_YOUTUBE_HOSTS = frozenset(
+    {"youtube.com", "www.youtube.com", "m.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com"}
+)
+# ``/shorts/<id>``, ``/embed/<id>``, ``/live/<id>`` and the legacy ``/v/<id>``.
+_YOUTUBE_ID_PATH = re.compile(r"^/(?:shorts|embed|live|v)/(?P<id>[A-Za-z0-9_-]+)$", re.ASCII)
+# The already-short host, which needs no rewrite but should display the same way.
+_YOUTUBE_SHORT = re.compile(r"^https?://youtu\.be/(?P<id>[A-Za-z0-9_-]+)$", re.ASCII)
+_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
+
+
+def _youtube_short_label(link: str) -> str | None:
+    """The ``youtu.be`` spelling of a YouTube video link, or ``None``.
+
+    YouTube's own short domain is how a video is normally shared, and this is a
+    PURE TEXT REWRITE: no request is made and no third-party shortener is
+    involved, so the report stays offline, verifiable and free of extra
+    secrets. Only the exact YouTube hosts are rewritten -- a lookalike such as
+    ``youtube.com.evil.invalid`` is not a YouTube link and keeps its label.
+
+    ``/watch`` URLs keep ONLY the video id, so the label cannot expose the rest
+    of the query (a playlist parameter, or anything else a link may carry). A
+    link without exactly one usable id is left alone rather than guessed at.
+    """
+    short = _YOUTUBE_SHORT.match(link)
+    if short is not None:
+        return f"https://youtu.be/{short.group('id')}"
+    if not link.startswith(("https://", "http://")):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(link)
+    except ValueError:
+        return None
+    if parts.netloc.lower() not in _YOUTUBE_HOSTS:
+        return None
+    video_id: str | None = None
+    if parts.path == "/watch":
+        ids = [value for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True) if key == "v"]
+        if len(ids) == 1:
+            video_id = ids[0]
+    else:
+        by_path = _YOUTUBE_ID_PATH.match(parts.path)
+        if by_path is not None:
+            video_id = by_path.group("id")
+    if video_id is None or not _VIDEO_ID.match(video_id):
+        return None
+    return f"https://youtu.be/{video_id}"
+
+
+def _evidence_label(link: str, default: str) -> str:
+    """The visible text for a proof link: the short form when one exists."""
+    short = _youtube_short_label(link)
+    return short if short is not None else default
+
+
 def _evidence_link_status(link: str) -> tuple[str, bool]:
     """Return safe display text and whether the value is a rendered link."""
     safe_link = redact_urls_in_text(link)
@@ -365,7 +420,8 @@ def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     for position, link in enumerate(shown, start=1):
         safe_link, clickable = _evidence_link_status(link)
         if clickable:
-            rendered.append(_markdown_link(link, "proof" if single else f"proof {position}"))
+            label = _evidence_label(link, "proof" if single else f"proof {position}")
+            rendered.append(_markdown_link(link, label))
         else:
             preview = _shorten(safe_link, MAX_EVIDENCE_LINK_CHARS)
             if safe_link != link or _AUTOLINK_IN_TEXT.search(link):

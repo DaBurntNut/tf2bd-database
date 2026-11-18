@@ -1777,6 +1777,79 @@ class CapBoundaryTests(unittest.TestCase):
         self.assertEqual(display_path("/tmp/über.json"), "/tmp/über.json")
         self.assertEqual(display_path("a\u2028b"), "a\\u2028b")
 
+    def test_a_youtube_link_displays_its_short_form(self):
+        """YouTube's own short domain is the normal way to share a video.
+
+        This is a pure text rewrite: no request, no third-party shortener, so
+        the report stays offline and verifiable.
+        """
+        expected = "https://youtu.be/DXQ5gEDIhzE"
+        for link in (
+            "https://www.youtube.com/watch?v=DXQ5gEDIhzE",
+            "https://youtube.com/watch?v=DXQ5gEDIhzE",
+            "https://m.youtube.com/watch?v=DXQ5gEDIhzE",
+            "http://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s",
+            "https://www.youtube.com/watch?v=DXQ5gEDIhzE&list=PLabc&index=3",
+            "https://youtu.be/DXQ5gEDIhzE",
+            "https://www.youtube.com/shorts/DXQ5gEDIhzE",
+            "https://www.youtube.com/embed/DXQ5gEDIhzE",
+            "https://www.youtube.com/live/DXQ5gEDIhzE",
+            "https://www.youtube.com/v/DXQ5gEDIhzE",
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._youtube_short_label(link), expected)
+
+    def test_the_short_label_never_exposes_the_rest_of_the_query(self):
+        # A playlist or tracking parameter must not reach the visible text.
+        cell = report_module._evidence_cell(["https://www.youtube.com/watch?v=DXQ5gEDIhzE&list=SECRETLIST"])
+        self.assertIn("[https://youtu.be/DXQ5gEDIhzE]", cell)
+        self.assertNotIn("SECRETLIST", cell.split("]")[0])
+
+    def test_a_youtube_link_without_one_usable_id_keeps_the_plain_label(self):
+        for link in (
+            "https://www.youtube.com/watch?v=",
+            "https://www.youtube.com/watch?list=PLabc",
+            "https://www.youtube.com/watch?v=A&v=B",
+            "https://www.youtube.com/watch?v=bad!id",
+            "https://www.youtube.com/playlist?list=PLabc",
+            "https://www.youtube.com/",
+            "https://www.youtube.com/watch",
+        ):
+            with self.subTest(link=link):
+                self.assertIsNone(report_module._youtube_short_label(link))
+                self.assertTrue(report_module._evidence_cell([link]).startswith("[proof]("))
+
+    def test_a_lookalike_host_is_not_rewritten(self):
+        for link in (
+            "https://www.youtube.com.evil.invalid/watch?v=X",
+            "https://evil.invalid/youtube.com/watch?v=X",
+            "https://notyoutube.com/watch?v=X",
+        ):
+            with self.subTest(link=link):
+                self.assertIsNone(report_module._youtube_short_label(link))
+
+    def test_a_non_youtube_link_keeps_the_proof_label(self):
+        # A Discord channel link is 68 characters: showing it as text would make
+        # the cell wider, not shorter, so the count label stays.
+        cell = report_module._evidence_cell(["https://discord.com/channels/354/1526"])
+        self.assertEqual(cell, "[proof](https://discord.com/channels/354/1526)")
+
+    def test_a_youtube_link_that_is_not_a_stringlike_url_is_left_alone(self):
+        for link in ("youtu.be/DXQ5gEDIhzE", "ftp://www.youtube.com/watch?v=X", ""):
+            with self.subTest(link=link):
+                self.assertIsNone(report_module._youtube_short_label(link))
+
+    def test_an_unparsable_youtube_url_is_left_alone(self):
+        # urlsplit raises on a malformed IPv6 authority; the label must not.
+        self.assertIsNone(report_module._youtube_short_label("http://[::1youtube.com/watch?v=X"))
+
+    def test_numbered_proof_labels_survive_numbering(self):
+        cell = report_module._evidence_cell(
+            ["https://discord.com/channels/1/2", "https://www.youtube.com/watch?v=DXQ5gEDIhzE"]
+        )
+        self.assertIn("[proof 1](https://discord.com/channels/1/2)", cell)
+        self.assertIn("[https://youtu.be/DXQ5gEDIhzE]", cell)
+
     def test_shorten_is_exact_at_the_limit(self):
         self.assertEqual(_shorten("abc", 3), "abc")
         self.assertEqual(_shorten("abcd", 3), "abc…")
