@@ -13,6 +13,7 @@ import math
 import os
 import re
 import stat
+import urllib.parse
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +56,132 @@ MAX_SHOWN_VALUE_CHARS = 120
 _MAX_SHOWN_INT_BITS = MAX_SHOWN_VALUE_CHARS * 4
 MAX_VALIDATION_MESSAGES = 100
 
+# Diagnostics can contain free-form values, not just URLs. Redact common
+# credential fields and authorization headers even when they appear in prose.
+_DIAGNOSTIC_SECRET_MARKER = re.compile(
+    r"token|secret|password|passwd|pwd|auth|credential|session|sid|cookie|csrf|xsrf|code|sig|"
+    r"api[_-]?key|private[_-]?key|access[_-]?key|jwt|bearer|signature|hmac|nonce|state|ticket|otp|mfa",
+    re.IGNORECASE | re.ASCII,
+)
+_DIAGNOSTIC_FIELD_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+_DIAGNOSTIC_VALUE_DELIMITERS = frozenset(",;&\r\n\t ")
+_AUTHORIZATION_HEADER = re.compile(r"(?i)(?P<header>\b(?:proxy-)?authorization\s*:\s*)[^\r\n]*", re.ASCII)
+_BEARER_CREDENTIAL = re.compile(r"(?i)\b(?P<scheme>Bearer|Basic)\s+[^\s,;&]+", re.ASCII)
+# Also sanitize URL userinfo when the generic path formatter is used directly.
+_URL_USERINFO_PREFIX = re.compile(r"(?:https?:/{0,4}|//)", re.IGNORECASE | re.ASCII)
+_URL_USERINFO_IN_TEXT = re.compile(
+    r"(?P<prefix>(?:https?:/{0,4}|//))[^/\s?#<>\"'`@]*@",
+    re.IGNORECASE | re.ASCII,
+)
+# Identify nested percent-encoded URL schemes before they are clipped out of view.
+_ENCODED_HTTP_SCHEME = re.compile(r"https?(?:%(?:25)*3a|:(?:%(?:25)*2f))", re.IGNORECASE | re.ASCII)
+_PERCENT_ESCAPE_IN_TEXT = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
+_MAX_DIAGNOSTIC_DECODE_DEPTH = 8
+
+
+def _redact_diagnostic_secret_pairs(value: str) -> str:
+    """Redact sensitive fields with a linear scan instead of a backtracking regex."""
+    parts: list[str] = []
+    copied_through = 0
+    separator = 0
+    while separator < len(value):
+        if value[separator] not in "=:":
+            separator += 1
+            continue
+
+        key_end = separator
+        while key_end and value[key_end - 1].isspace():
+            key_end -= 1
+        quote = value[key_end - 1] if key_end and value[key_end - 1] in "'\"" else ""
+        if quote:
+            key_end -= 1
+        key_start = key_end
+        while key_start and value[key_start - 1] in _DIAGNOSTIC_FIELD_CHARS:
+            key_start -= 1
+        name = value[key_start:key_end]
+        if not name or _DIAGNOSTIC_SECRET_MARKER.search(name) is None:
+            separator += 1
+            continue
+        value_start = separator + 1
+        while value_start < len(value) and value[value_start].isspace():
+            value_start += 1
+        if value_start == len(value) or value[value_start] in _DIAGNOSTIC_VALUE_DELIMITERS:
+            separator += 1
+            continue
+
+        value_end = value_start
+        value_quote = value[value_start] if value[value_start] in "'\"" else ""
+        if value_quote:
+            value_end += 1
+            escaped = False
+            while value_end < len(value):
+                char = value[value_end]
+                value_end += 1
+                if char == value_quote and not escaped:
+                    break
+                escaped = char == "\\" and not escaped
+                if char != "\\":
+                    escaped = False
+        else:
+            while value_end < len(value) and value[value_end] not in _DIAGNOSTIC_VALUE_DELIMITERS:
+                value_end += 1
+
+        raw_value = value[value_start:value_end]
+        trailing = ""
+        if not value_quote:
+            unpunctuated = raw_value.rstrip(".,:!?)]}>")
+            if unpunctuated:
+                trailing = raw_value[len(unpunctuated) :]
+
+        parts.extend((value[copied_through:value_start], "REDACTED", trailing))
+        copied_through = value_end
+        separator = value_end
+
+    if not parts:
+        return value
+    parts.append(value[copied_through:])
+    return "".join(parts)
+
+
+def _redact_diagnostic_text(value: str) -> str:
+    """Redact common bare secrets, authorization headers, and URL userinfo."""
+    value = _AUTHORIZATION_HEADER.sub(r"\g<header>REDACTED", value)
+    value = _BEARER_CREDENTIAL.sub(r"\g<scheme> REDACTED", value)
+    value = _URL_USERINFO_IN_TEXT.sub(r"\g<prefix>REDACTED@", value)
+    return _redact_diagnostic_secret_pairs(value)
+
+
+def _redact_diagnostic_preview(value: str, limit: int) -> str:
+    """Sanitize a bounded preview without clipping credentials before inspection."""
+    preview = value[: limit + 1]
+    if len(value) > len(preview):
+        url_prefix = _URL_USERINFO_PREFIX.search(preview)
+        if url_prefix is not None and value.find("@", url_prefix.start()) >= len(preview):
+            return "[credential-bearing URL omitted: too long to inspect safely]"
+
+    encoded_scheme = _ENCODED_HTTP_SCHEME.search(preview)
+    encoded_component = _PERCENT_ESCAPE_IN_TEXT.search(preview)
+    has_url_prefix = _URL_USERINFO_PREFIX.search(preview) is not None
+    inspect_encoded_url = encoded_scheme is not None or (encoded_component is not None and has_url_prefix)
+    if inspect_encoded_url:
+        if len(value) > len(preview):
+            return "[nested URL omitted: too long to inspect safely]"
+        candidate = preview
+        safe_candidate: str | None = None
+        for _ in range(_MAX_DIAGNOSTIC_DECODE_DEPTH):
+            candidate = urllib.parse.unquote(candidate)
+            safe = _redact_diagnostic_text(candidate)
+            if safe != candidate:
+                safe_candidate = safe
+            if _PERCENT_ESCAPE_IN_TEXT.search(candidate) is None:
+                break
+        if _PERCENT_ESCAPE_IN_TEXT.search(candidate):
+            return "[nested URL omitted: too deep to inspect safely]"
+        if safe_candidate is not None:
+            return safe_candidate
+
+    return _redact_diagnostic_text(preview)
+
 
 def _shown(value: Any) -> str:
     """A bounded, quoted preview so one bad entry cannot flood the log or RAM.
@@ -66,7 +193,8 @@ def _shown(value: Any) -> str:
     newline cannot start a fake log line and an ESC cannot repaint the terminal.
     """
     if isinstance(value, str):
-        text = repr(value if len(value) <= MAX_SHOWN_VALUE_CHARS else value[:MAX_SHOWN_VALUE_CHARS])
+        preview = _redact_diagnostic_preview(value, MAX_SHOWN_VALUE_CHARS - 1)
+        text = repr(preview)
     elif isinstance(value, dict):
         count = len(value)
         text = f"<object with {count:,} {'key' if count == 1 else 'keys'}>"
@@ -93,11 +221,14 @@ def display_path(path: Any) -> str:
     escapes rather than dropped, so the message still names the file exactly;
     ``str`` keeps it readable where ``repr`` would add quotes as well. Build
     only the preview: escaping an arbitrarily long input before clipping it
-    would allocate an arbitrarily long second string.
+    would allocate an arbitrarily long second string. URL userinfo and common
+    bare credential fields are redacted before this preview is clipped.
     """
+    raw = str(path)
+    preview = _redact_diagnostic_preview(raw, MAX_SHOWN_PATH_CHARS)
     parts: list[str] = []
     length = 0
-    for char in str(path):
+    for char in preview:
         if char.isprintable() and char not in "\u2028\u2029":
             piece = char
         else:
@@ -106,7 +237,10 @@ def display_path(path: Any) -> str:
             return "".join(parts) + "…"
         parts.append(piece)
         length += len(piece)
-    return "".join(parts)
+    shown = "".join(parts)
+    if len(raw) > MAX_SHOWN_PATH_CHARS:
+        return shown + "…"
+    return shown
 
 
 def error_reason(exc: BaseException) -> str:

@@ -93,6 +93,26 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(source, self.URL)
         self.assertIn("[U:1:100]", [p["steamid"] for p in document["players"]])
 
+    def test_untrusted_duplicate_json_keys_are_redacted_from_source_errors(self):
+        secret = "DUPLICATE_KEY_PASSWORD"
+        keys = (
+            f"https://user:{secret}@example.invalid/x",
+            f"https%3A%2F%2Fuser%3A{secret}%40example.invalid%2Fx",
+            f"access_token={secret}",
+            f"Authorization: Bearer {secret}",
+        )
+        for key in keys:
+            with self.subTest(key=key):
+                body = f'{{"players":[],"{key}":1,"{key}":2}}'.encode()
+                with (
+                    mock.patch("sources._OPENER.open", return_value=_FakeResponse(body)),
+                    mock.patch("sources.time.sleep"),
+                    self.assertRaises(SyncError) as caught,
+                ):
+                    load_first_available_raw([self.URL])
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertIn("not valid JSON", str(caught.exception))
+
     def test_github_contents_envelope_is_unwrapped_to_the_file_bytes(self):
         inner = b'{"players": [{"steamid": "[U:1:100]", "attributes": ["cheater"]}]}'
         envelope = json.dumps({"encoding": "base64", "content": base64.b64encode(inner).decode("ascii")}).encode(
@@ -228,6 +248,76 @@ class SourceFetchTests(unittest.TestCase):
         # identifying the requested source.
         self.assertIn("ref=main", redacted)
 
+    def test_percent_encoded_userinfo_delimiters_are_redacted(self):
+        cases = (
+            (
+                "https://user%3AENCODED_COLON_PASSWORD%40example.invalid/list.json",
+                "ENCODED_COLON_PASSWORD",
+            ),
+            (
+                "https://user:ENCODED_AT_PASSWORD%40example.invalid/list.json",
+                "ENCODED_AT_PASSWORD",
+            ),
+            (
+                "https://user%253AENCODED_DOUBLE_PASSWORD%2540example.invalid/list.json",
+                "ENCODED_DOUBLE_PASSWORD",
+            ),
+            (
+                "https:user%3AMALFORMED_ENCODED_PASSWORD%40example.invalid/list.json",
+                "MALFORMED_ENCODED_PASSWORD",
+            ),
+            (
+                "https://user%2Fsegment%40ENCODED_PATH_AUTHORITY_SECRET.example.invalid/list.json",
+                "ENCODED_PATH_AUTHORITY_SECRET",
+            ),
+        )
+        for url, secret in cases:
+            with self.subTest(url=url):
+                for shown in (sources.redact_url(url), sources.redact_urls_in_text(url)):
+                    self.assertNotIn(secret, shown)
+                    self.assertTrue("example.invalid" in shown or "omitted" in shown)
+
+        nested = "https://outer.invalid/?next=https://user%3ANESTED_ENCODED_PASSWORD%40client.invalid/path"
+        self.assertNotIn("NESTED_ENCODED_PASSWORD", sources.redact_url(nested))
+
+    def test_malformed_http_components_with_ambiguous_encoded_delimiters_fail_closed(self):
+        self.assertEqual(sources.redact_url("https:/example.invalid/a%20b"), "https:/example.invalid/a%20b")
+        self.assertEqual(sources.redact_url("https://host%20name.invalid/path"), "https://host%20name.invalid/path")
+
+        encoded_space = "%20"
+        for _ in range(sources._MAX_NESTED_URL_DEPTH + 2):
+            encoded_space = sources.urllib.parse.quote(encoded_space, safe="")
+        malformed_path = "https:/example.invalid/" + encoded_space
+        self.assertIn("omitted", sources.redact_url(malformed_path))
+
+        encoded_host = "%20"
+        for _ in range(sources._MAX_NESTED_URL_DEPTH + 2):
+            encoded_host = sources.urllib.parse.quote(encoded_host, safe="")
+        malformed_authority = "https://host" + encoded_host + ".invalid/path"
+        self.assertIn("omitted", sources.redact_url(malformed_authority))
+
+    def test_bare_secret_fields_and_authorization_headers_are_redacted(self):
+        cases = (
+            ("Diagnostic: access_token=BARE_ACCESS_TOKEN_SECRET", "BARE_ACCESS_TOKEN_SECRET"),
+            ("Authorization: Bearer HEADER_BEARER_SECRET", "HEADER_BEARER_SECRET"),
+            ("client_secret=BARE_CLIENT_SECRET", "BARE_CLIENT_SECRET"),
+            (
+                "https://example.invalid/?note=access_token%3DQUERY_BARE_SECRET",
+                "QUERY_BARE_SECRET",
+            ),
+            (
+                "https://example.invalid/?note=Authorization%3A%20Bearer%20QUERY_BEARER_SECRET",
+                "QUERY_BEARER_SECRET",
+            ),
+        )
+        for text, secret in cases:
+            with self.subTest(text=text):
+                shown = sources.redact_urls_in_text(text)
+                self.assertNotIn(secret, shown)
+                self.assertIn("REDACTED", shown)
+                if text.startswith("https://"):
+                    self.assertNotIn(secret, sources.redact_url(text))
+
     def test_html_character_references_cannot_hide_url_credentials(self):
         """Markdown's character references can spell URL delimiters."""
         probes = (
@@ -323,6 +413,8 @@ class SourceFetchTests(unittest.TestCase):
             "secret_key",
             "password",
             "passwd",
+            "passphrase",
+            "pwd",
             "pass",
             "authorization",
             "bearer",
@@ -341,6 +433,15 @@ class SourceFetchTests(unittest.TestCase):
             "hmac",
             "SAMLResponse",
             "ticket",
+            "cookie",
+            "csrf",
+            "xsrf",
+            "X-CSRF-Token",
+            "X-XSRF-Token",
+            "client_assertion",
+            "assertion",
+            "otp",
+            "mfa",
             "code",
         ):
             with self.subTest(name=name):
@@ -494,10 +595,64 @@ class SourceFetchTests(unittest.TestCase):
                 self.assertIn("client.invalid", redacted)
         self.assertIn("REDACTED", sources.redact_url(urls[0][0]))
 
+    def test_nested_url_credentials_in_path_and_fragment_are_redacted(self):
+        urls = (
+            (
+                "https://example.invalid/redirect/https%3A%2F%2Fuser%3APATH_SECRET%40client.invalid%2Fcallback",
+                "PATH_SECRET",
+            ),
+            (
+                "https://example.invalid/redirect/"
+                "https%3A%2F%2Fclient.invalid%2Fcallback%3Faccess_token%3DPATH_TOKEN_SECRET",
+                "PATH_TOKEN_SECRET",
+            ),
+            (
+                "https://example.invalid/#https%3A%2F%2Fuser%3AFRAGMENT_SECRET%40client.invalid%2Fcallback",
+                "FRAGMENT_SECRET",
+            ),
+            (
+                "https://example.invalid/#"
+                "https%3A%2F%2Fclient.invalid%2Fcallback%3Faccess_token%3DFRAGMENT_TOKEN_SECRET",
+                "FRAGMENT_TOKEN_SECRET",
+            ),
+            (
+                "https://example.invalid/redirect/https://user:RAW_PATH_SECRET@client.invalid/callback",
+                "RAW_PATH_SECRET",
+            ),
+        )
+        for url, secret in urls:
+            with self.subTest(url=url):
+                shown = sources.redact_url(url)
+                self.assertNotIn(secret, shown)
+                self.assertIn("example.invalid", shown)
+                prose = sources.redact_urls_in_text(f"Proof: {url}")
+                self.assertNotIn(secret, prose)
+
+        # Pathlib collapses an apparent URL's double slash; inspect encoded schemes in prose and paths too.
+        normalized_path = (
+            "https:/example.invalid/https%3A%2F%2Fuser%3ANORMALIZED_PATH_SECRET%40client.invalid%2Fcallback"
+        )
+        self.assertNotIn("NORMALIZED_PATH_SECRET", sources.redact_urls_in_text(normalized_path))
+        encoded_prose = "Proof: https%253A%252F%252Fuser%253AENCODED_TEXT_SECRET%2540client.invalid%252Fcallback"
+        self.assertNotIn("ENCODED_TEXT_SECRET", sources.redact_urls_in_text(encoded_prose))
+        self.assertEqual(
+            sources.redact_urls_in_text("See https%3A%2F%2Fclient.invalid%2Fcallback"),
+            "See https%3A%2F%2Fclient.invalid%2Fcallback",
+        )
+
+        # Inspect encoded components without normalizing a harmless URL's spelling.
+        benign = "https://example.invalid/redirect/https%3A%2F%2Fclient.invalid%2Fcallback#section"
+        self.assertEqual(sources.redact_url(benign), benign)
+
     def test_deeply_nested_url_redaction_is_bounded_and_fails_closed(self):
         url = "https://example.invalid/?next=" + "?next=" * 300 + "token=DEEP_SECRET"
         shown = sources.redact_url(url)
         self.assertNotIn("DEEP_SECRET", shown)
+        self.assertIn("nested", shown)
+
+        at_limit = "https%3A%2F%2Fuser%3ADEPTH_LIMIT_SECRET%40client.invalid/callback"
+        shown = sources._redact_urls_in_text(at_limit, sources._MAX_NESTED_URL_DEPTH)
+        self.assertNotIn("DEPTH_LIMIT_SECRET", shown)
         self.assertIn("nested", shown)
 
     def test_over_encoded_nested_url_fails_closed_when_decode_budget_is_exceeded(self):
@@ -506,6 +661,13 @@ class SourceFetchTests(unittest.TestCase):
             nested = sources.urllib.parse.quote(nested, safe="")
         shown = sources.redact_url("https://example.invalid/?redirect_uri=" + nested)
         self.assertNotIn("OVER_ENCODED_NESTED_SECRET", shown)
+        self.assertIn("nested", shown.lower())
+
+        encoded_proof = "https://user:OVER_ENCODED_PROSE_SECRET@client.invalid/callback"
+        for _ in range(sources._MAX_NESTED_URL_DEPTH + 2):
+            encoded_proof = sources.urllib.parse.quote(encoded_proof, safe="?=&")
+        shown = sources.redact_urls_in_text("Proof: " + encoded_proof)
+        self.assertNotIn("OVER_ENCODED_PROSE_SECRET", shown)
         self.assertIn("nested", shown.lower())
 
     def test_redact_url_credentials_inside_prose_without_rewriting_the_prose(self):
@@ -525,6 +687,11 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(shown, "Context: //example.invalid/watch?token=REDACTED.")
         self.assertNotIn("RELATIVE_PASSWORD", shown)
         self.assertNotIn("RELATIVE_TOKEN", shown)
+
+        encoded_relative = "Context ?redirect_uri=%2F%2Fuser%3AENCODED_RELATIVE_PASSWORD%40client.invalid/watch"
+        shown = sources.redact_urls_in_text(encoded_relative)
+        self.assertNotIn("ENCODED_RELATIVE_PASSWORD", shown)
+        self.assertIn("client.invalid", shown)
 
         split_query = "Proof: https://example.invalid/watch\nb?token=LINEBREAK_TOKEN."
         shown = sources.redact_urls_in_text(split_query)
@@ -1055,6 +1222,29 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("QUERY_SECRET", message)
         self.assertNotIn("\n", message)
 
+    def test_malformed_http_userinfo_is_not_echoed_from_path_or_nested_url_text(self):
+        """urlsplit treats a missing authority as a path, so userinfo can escape normal stripping."""
+        for url in (
+            "https:user:PATH_PASSWORD@example.invalid/list.json",
+            "https:/user:PATH_PASSWORD@example.invalid/list.json",
+            "https:///user:PATH_PASSWORD@example.invalid/list.json",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(sources.redact_url(url), "[malformed URL omitted]")
+                shown = sources.redact_urls_in_text(f"Proof: {url}")
+                self.assertNotIn("PATH_PASSWORD", shown)
+                self.assertIn("[malformed URL omitted]", shown)
+
+                nested = "https://example.invalid/?redirect_uri=" + urllib.parse.quote(url, safe="")
+                self.assertNotIn("PATH_PASSWORD", sources.redact_url(nested))
+
+                with (
+                    mock.patch("sources._OPENER.open", side_effect=ValueError("malformed")),
+                    self.assertRaises(SyncError) as caught,
+                ):
+                    sources._fetch_bytes(url)
+                self.assertNotIn("PATH_PASSWORD", str(caught.exception))
+
     def test_server_controlled_http_reason_is_not_logged_or_echoed(self):
         url = "https://example.invalid/list?token=URL_SECRET"
         responses = [
@@ -1340,6 +1530,17 @@ class SourceFetchTests(unittest.TestCase):
 
 
 class SnapshotReadTests(unittest.TestCase):
+    def test_snapshot_path_errors_redact_url_like_credentials_before_clipping(self):
+        secret = "SNAPSHOT_SECRET"
+        path = Path("https:/user:" + secret + "x" * 180 + "@example.invalid/snapshot.json")
+        with (
+            mock.patch.object(Path, "resolve", side_effect=OSError(13, "Permission denied", str(path))),
+            self.assertRaises(SyncError) as caught,
+        ):
+            sources.load_snapshot(path)
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIn("[malformed URL omitted]", str(caught.exception))
+
     def test_a_self_referential_symlink_is_a_read_error_not_a_missing_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "loop.json"

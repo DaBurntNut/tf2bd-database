@@ -34,7 +34,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from playerlist import account_id, display_path, steam_history_url, steam_profile_url
+import playerlist
+from playerlist import account_id, steam_history_url, steam_profile_url
 from policy import MAX_EVIDENCE_LINK_CHARS, MAX_EVIDENCE_LINKS, Change
 from sources import SOURCE_REPO_URL, redact_urls_in_text
 
@@ -151,6 +152,11 @@ def _neutralise(value: str) -> str:
 def _safe(text: str) -> str:
     """Replace lone surrogates so the report is always UTF-8 encodable."""
     return _SURROGATES_RE.sub("\ufffd", text)
+
+
+def _safe_display_path(path: Path) -> str:
+    """Redact a path before the generic path formatter clips its preview."""
+    return playerlist.display_path(redact_urls_in_text(str(path)))
 
 
 def _shorten(value: str, limit: int) -> str:
@@ -619,7 +625,7 @@ def _header_lines(info: RunInfo) -> list[str]:
     lines = [
         "## Vorobey hackerpolice sync",
         "",
-        f"- Database: {_code(display_path(info.database_path))}",
+        f"- Database: {_code(_safe_display_path(info.database_path))}",
         f"- Vorobey hackerpolice list ({source_note}): {SOURCE_REPO_URL}",
         f"- Fetched from: {source_display}",
         f"- Run at: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
@@ -658,7 +664,10 @@ def _header_lines(info: RunInfo) -> list[str]:
         lines.append(f"- Snapshot: {info.snapshot_note}")
     elif info.snapshot_changed:
         verb = "would be updated" if info.dry_run else "updated"
-        label = _code(display_path(info.snapshot_path) if info.snapshot_path is not None else DEFAULT_SNAPSHOT_LABEL)
+        snapshot_label = (
+            _safe_display_path(info.snapshot_path) if info.snapshot_path is not None else DEFAULT_SNAPSHOT_LABEL
+        )
+        label = _code(snapshot_label)
         lines.append(f"- Snapshot: {label} {verb} to an exact copy of the current upstream file")
     lines.append("")
     return lines

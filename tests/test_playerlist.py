@@ -7,6 +7,7 @@ import itertools
 import json
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 
 from _support import (
@@ -415,6 +416,65 @@ class DisplayPathTests(unittest.TestCase):
         shown = display_path("/tmp/" + "d" * 5_000)
         self.assertEqual(len(shown), MAX_SHOWN_PATH_CHARS + 1)
         self.assertTrue(shown.endswith("…"))
+
+    def test_bare_secrets_and_url_credentials_are_redacted_before_clipping(self):
+        nested_secret = "NESTED_ENCODED_PATH_SECRET"
+        nested_url = f"https://user:{nested_secret}@client.invalid/cb?access_token={nested_secret}"
+        for safe in ("?=&", ".:", ".:", "/"):
+            nested_url = urllib.parse.quote(nested_url, safe=safe)
+        nested_path = "https://outer.invalid/?redirect=" + urllib.parse.quote(nested_url, safe="")
+
+        for value, secret in (
+            ("access_token=BARE_TOKEN_SECRET", "BARE_TOKEN_SECRET"),
+            ("Authorization: Bearer HEADER_TOKEN_SECRET", "HEADER_TOKEN_SECRET"),
+            ("Bearer STANDALONE_BEARER_SECRET", "STANDALONE_BEARER_SECRET"),
+            ("https:/user:URL_PASSWORD_SECRET@example.invalid/list.json", "URL_PASSWORD_SECRET"),
+            (
+                "https:/user:LONG_URL_PASSWORD_SECRET" + "x" * 180 + "@example.invalid/list.json",
+                "LONG_URL_PASSWORD_SECRET",
+            ),
+            (
+                "https%3A%2F%2Fuser%3AENCODED_PATH_SECRET%40example.invalid%2Flist.json",
+                "ENCODED_PATH_SECRET",
+            ),
+            (nested_path, nested_secret),
+        ):
+            with self.subTest(value=value):
+                shown = display_path(value)
+                self.assertNotIn(secret, shown)
+                self.assertTrue("REDACTED" in shown or "omitted" in shown)
+
+        benign_encoded = "https%3A%2F%2Fclient.invalid%2Fcallback"
+        self.assertEqual(display_path(benign_encoded), benign_encoded)
+        self.assertIn(
+            "too long to inspect safely",
+            display_path("https%3A%2F%2Fclient.invalid%2F" + "x" * MAX_SHOWN_PATH_CHARS),
+        )
+        deep_marker = "https%" + "25" * (playerlist_module._MAX_DIAGNOSTIC_DECODE_DEPTH + 2) + "3a"
+        self.assertIn(
+            "too deep to inspect safely",
+            playerlist_module._redact_diagnostic_preview(deep_marker, len(deep_marker)),
+        )
+
+    def test_bare_secret_pair_parser_handles_quoted_empty_and_punctuated_values(self):
+        cases = (
+            ("access_token   =   SPACED_SECRET", "SPACED_SECRET", "access_token   =   REDACTED"),
+            ('"access_token": "JSON_VALUE_SECRET"', "JSON_VALUE_SECRET", '"access_token": REDACTED'),
+            ('"client_secret":"value\\"STILL_SECRET"', "STILL_SECRET", '"client_secret":REDACTED'),
+            ('"client_secret":"', "", '"client_secret":REDACTED'),
+            ("access_token=...", "...", "access_token=REDACTED"),
+            ("access_token=TRAILING_SECRET.", "TRAILING_SECRET", "access_token=REDACTED."),
+            ("access_token=TRAILING_SECRET).", "TRAILING_SECRET", "access_token=REDACTED)."),
+            ("access_token=LEFT#RIGHT]TAIL", "LEFT#RIGHT]TAIL", "access_token=REDACTED"),
+            ("access_token=", "", "access_token="),
+            ("access_token=&ref=main", "", "access_token=&ref=main"),
+        )
+        for value, secret, safe in cases:
+            with self.subTest(value=value):
+                shown = playerlist_module._redact_diagnostic_text(value)
+                self.assertEqual(shown, safe)
+                if secret:
+                    self.assertNotIn(secret, shown)
 
     def test_a_path_that_is_not_a_string_still_works(self):
         self.assertEqual(display_path(Path("/tmp/x.json")), "/tmp/x.json")

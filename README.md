@@ -177,7 +177,7 @@ The interface (`--help` prints the long version):
 - `--dry-run` — report changes without updating the database or snapshot; a
   requested `--report` file is still written
 - `--quiet` / `--verbose` — log level (`-q` / `-v`)
-- `--version`, `--help`
+- `--help`
 
 Exit `0` means success. Exit `130` means you interrupted it (Ctrl-C; no report,
 database or snapshot file is left half-written, and the handler cleans up its

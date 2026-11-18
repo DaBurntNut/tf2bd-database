@@ -213,8 +213,10 @@ def _demoted_entry(player: Player, removed: frozenset[str]) -> tuple[bool, Chang
     Returns ``(keep_entry, change)``: ``change`` is ``None`` when the rule does
     not apply to this entry, and ``keep_entry`` says whether the entry survives
     (a ``cheater``+``racist`` entry keeps ``racist``; a ``cheater``-only entry
-    is dropped). Every malformed case is left untouched -- ``validate()``
-    reports those before a run ever writes anything.
+    is dropped). Entries with an unusable SteamID or malformed attributes are
+    left untouched -- ``validate()`` reports those before a run ever writes
+    anything. A malformed proof on a racist entry is discarded by the proof
+    filter because it cannot be trusted to justify the remaining tag.
     """
     if not isinstance(player, dict):
         return True, None

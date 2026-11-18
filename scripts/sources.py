@@ -33,6 +33,7 @@ from typing import IO, Any
 from playerlist import (
     MAX_FILE_BYTES,
     _read_bounded_regular_file,
+    _redact_diagnostic_text,
     display_path,
     error_reason,
     normalize_steamid,
@@ -48,11 +49,7 @@ DEFAULT_SOURCES: tuple[str, ...] = (
     "https://api.github.com/repos/Nocrex/Tom/contents/playerlist.vorobey-hackerpolice.json",
 )
 
-VERSION = "5.0"
-
-USER_AGENT = (
-    f"Garou3299-tf2bd-database-vorobey-hackerpolice-sync/{VERSION} (+https://github.com/Garou3299/tf2bd-database)"
-)
+USER_AGENT = "Garou3299-tf2bd-database-vorobey-hackerpolice-sync (+https://github.com/Garou3299/tf2bd-database)"
 
 FETCH_TIMEOUT_SECONDS = 30
 FETCH_ATTEMPTS = 3
@@ -71,7 +68,6 @@ __all__ = [
     "MAX_URL_DISPLAY_CHARS",
     "REDACTED",
     "SOURCE_REPO_URL",
-    "VERSION",
     "HackerpoliceIndex",
     "SyncError",
     "added_steamids",
@@ -225,11 +221,17 @@ def _parse_document(raw: bytes, source: str) -> dict[str, Any]:
     try:
         document = strict_json_loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValueError) as exc:
-        # ValueError also covers Python's integer digit limit.
-        raise SyncError(f"{_redact_source(source)} is not valid JSON: {exc}") from exc
+        # ValueError also covers Python's integer digit limit; duplicate-key errors may include untrusted keys.
+        detail = _one_line(_no_surrogates(redact_urls_in_text(str(exc))))
+        raise SyncError(f"{_redact_source(source)} is not valid JSON: {detail}") from exc
     if not isinstance(document, dict):
         raise SyncError(f"{_redact_source(source)} does not contain a JSON object")
     return document
+
+
+def _display_path(path: Path) -> str:
+    """Redact a path before clipping it for diagnostics."""
+    return display_path(redact_urls_in_text(str(path)))
 
 
 def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
@@ -253,22 +255,22 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     except UnicodeError:
         return None
     except RuntimeError as exc:
-        raise SyncError(f"cannot read {display_path(path)}: symbolic link loop") from exc
+        raise SyncError(f"cannot read {_display_path(path)}: symbolic link loop") from exc
     except (OSError, ValueError) as exc:
-        raise SyncError(f"cannot read {display_path(path)}: {error_reason(exc)}") from exc
+        raise SyncError(f"cannot read {_display_path(path)}: {error_reason(exc)}") from exc
     try:
         raw = _read_bounded_regular_file(path, MAX_FILE_BYTES)
     except (OSError, ValueError) as exc:
-        raise SyncError(f"cannot read {display_path(path)}: {error_reason(exc)}") from exc
+        raise SyncError(f"cannot read {_display_path(path)}: {error_reason(exc)}") from exc
     if len(raw) > MAX_FILE_BYTES:
-        raise SyncError(f"{display_path(path)} is larger than the {MAX_FILE_BYTES // (1024 * 1024)} MiB safety limit")
+        raise SyncError(f"{_display_path(path)} is larger than the {MAX_FILE_BYTES // (1024 * 1024)} MiB safety limit")
     document = _parse_document(raw, str(path))
-    return HackerpoliceIndex.build(document, what=f"the previous snapshot {display_path(path)}"), raw
+    return HackerpoliceIndex.build(document, what=f"the previous snapshot {_display_path(path)}"), raw
 
 
 # Match credential-like parameter names broadly; false positives are safer than leaks.
 _SECRET_QUERY_PARAM = re.compile(
-    r"token|secret|passw|^pass$|pass$|auth|credential|session|sid|bearer|jwt|nonce|state|ticket|"
+    r"token|secret|pass|pwd|auth|credential|session|sid|cookie|csrf|xsrf|bearer|jwt|assertion|otp|mfa|nonce|state|ticket|"
     r"apikey|api[_-]?key|sig|hmac|saml|key|x-amz|x-goog|code",
     re.IGNORECASE,
 )
@@ -329,6 +331,10 @@ def _html_unescape_bounded(value: str) -> str | None:
 
 # Neutralise control and format characters in URLs before logging or publishing.
 _URL_IN_TEXT = re.compile(r"(?:(?:[a-z][a-z0-9+.-]*:)?//)[^\s<>\"'`]+", re.IGNORECASE | re.ASCII)
+# A malformed HTTP URL can leave userinfo in its path instead of its authority.
+_HTTP_URL_WITH_AT_IN_TEXT = re.compile(r"https?:[^\s<>\"'`]*@[^\s<>\"'`]+", re.IGNORECASE | re.ASCII)
+# Find URL schemes whose colon (or colon and slashes) are percent-encoded, including repeated encoding layers.
+_ENCODED_HTTP_URL_MARKER = re.compile(r"https?(?:%(?:25)*3a|:(?:%(?:25)*2f))", re.IGNORECASE | re.ASCII)
 # Scan query parameters separately when malformed URLs split at whitespace or controls.
 _QUERY_PARAM_IN_TEXT = re.compile(
     r"(?P<separator>[?&#;])"
@@ -388,7 +394,9 @@ def _redact_nested_url(value: str, depth: int) -> str:
     candidate = value
 
     def has_url_markers(text: str) -> bool:
-        return any(marker in text for marker in ("://", "//", "?", "#"))
+        return any(marker in text for marker in ("://", "//", "?", "#")) or (
+            _HTTP_URL_WITH_AT_IN_TEXT.search(text) is not None
+        )
 
     if not has_url_markers(candidate):
         for _ in range(_MAX_NESTED_URL_DEPTH):
@@ -409,7 +417,9 @@ def _redact_nested_url(value: str, depth: int) -> str:
     if depth >= _MAX_NESTED_URL_DEPTH:
         # Fail closed when nested URL depth exceeds the inspection limit.
         return "[nested URL omitted: too deep to inspect safely]"
-    return _redact_urls_in_text(candidate, depth + 1)
+    safe = _redact_urls_in_text(candidate, depth + 1)
+    # Preserve the caller's encoding unless inspecting the nested URL changed it.
+    return value if safe == candidate else safe
 
 
 def _sanitised_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tuple[str, str]], bool]:
@@ -428,7 +438,9 @@ def _sanitised_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tup
         # Redact the whole parameter name when it contains an encoded delimiter or value.
         safe_name = name if not sensitive or _SAFE_QUERY_NAME.fullmatch(name) else "REDACTED"
         safe_name = _no_surrogates(safe_name)
-        safe_value = REDACTED if sensitive else _no_surrogates(_redact_nested_url(value, depth))
+        safe_value = (
+            REDACTED if sensitive else _redact_diagnostic_text(_no_surrogates(_redact_nested_url(value, depth)))
+        )
         changed |= safe_name != name or safe_value != value
         safe_items.append((safe_name, safe_value))
     return safe_items, changed
@@ -459,8 +471,45 @@ def _redact_url(url: str, depth: int) -> str:
     except ValueError:
         # Omit unparseable URLs rather than risk echoing credentials.
         return "[malformed URL omitted]"
+    is_http_without_authority = parts.scheme.lower() in {"http", "https"} and not parts.netloc
+    if is_http_without_authority and (
+        "@" in parts.path
+        or (_PERCENT_ESCAPE.search(parts.path) and _ENCODED_HTTP_URL_MARKER.search(parts.path) is None)
+    ):
+        # urllib leaves userinfo-looking text in the path of malformed URLs such as ``https:user@host``.
+        if "@" in parts.path:
+            return "[malformed URL omitted]"
+        candidate = parts.path
+        for _ in range(_MAX_NESTED_URL_DEPTH):
+            decoded = urllib.parse.unquote(candidate)
+            if decoded == candidate:
+                break
+            candidate = decoded
+            if "@" in candidate:
+                return "[malformed URL omitted]"
+        if _PERCENT_ESCAPE.search(candidate):
+            return "[malformed URL omitted]"
 
     netloc = parts.netloc
+    if parts.username is None and _PERCENT_ESCAPE.search(netloc):
+        # Encoded reserved characters are not delimiters to urlsplit(), but a later consumer may decode them.
+        candidate = netloc
+        found_encoded_userinfo = False
+        for _ in range(_MAX_NESTED_URL_DEPTH):
+            decoded = urllib.parse.unquote(candidate)
+            if decoded == candidate:
+                break
+            candidate = decoded
+            at = candidate.rfind("@")
+            if at >= 0:
+                if any(char in candidate[:at] for char in "/?#"):
+                    return "[malformed URL omitted]"
+                netloc = candidate[at + 1 :]
+                found_encoded_userinfo = True
+                break
+        if not found_encoded_userinfo and _PERCENT_ESCAPE.search(candidate):
+            return "[malformed URL omitted]"
+
     if parts.username is not None:
         host = parts.hostname or ""
         # Restore IPv6 brackets when rebuilding the authority.
@@ -474,25 +523,33 @@ def _redact_url(url: str, depth: int) -> str:
             host = f"{host}:{port}"
         netloc = host
 
+    path = parts.path
+    safe_path = _redact_nested_url(path, depth)
+    if safe_path != path:
+        # Keep nested URL separators inside the path; never let a decoded ? or # escape its component.
+        path = urllib.parse.quote(_no_surrogates(safe_path), safe="/:@!$&'()*+,;=-._~")
+
     query = parts.query
     if query:
         safe_items, changed = _sanitised_pairs(_query_pairs(query), depth)
         if changed:
             query = urllib.parse.urlencode(safe_items)
 
-    # Redact query-shaped fragments (for example, OAuth tokens); preserve ordinary anchors.
+    # Redact query-shaped fragments (for example, OAuth tokens) and nested URLs in ordinary anchors.
     fragment = parts.fragment
     if fragment and "=" in fragment:
         safe_items, changed = _sanitised_pairs(_query_pairs(fragment), depth)
         if changed:
             fragment = urllib.parse.urlencode(safe_items)
+    if fragment:
+        fragment = _redact_nested_url(fragment, depth)
 
-    if netloc == parts.netloc and query == parts.query and fragment == parts.fragment:
+    if netloc == parts.netloc and path == parts.path and query == parts.query and fragment == parts.fragment:
         shown = original_url  # Preserve the caller's original spelling when nothing needs redaction
     else:
-        shown = urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+        shown = urllib.parse.urlunsplit((parts.scheme, netloc, path, query, fragment))
     # Keep output encodable and on one line
-    shown = _one_line(_no_surrogates(shown))
+    shown = _redact_diagnostic_text(_one_line(_no_surrogates(shown)))
     return shown if len(shown) <= MAX_URL_DISPLAY_CHARS else shown[:MAX_URL_DISPLAY_CHARS] + "…"
 
 
@@ -520,15 +577,17 @@ def _redact_multiline_userinfo(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}REDACTED@"
 
 
-def _redact_text_query_parameter(match: re.Match[str]) -> str:
-    """Redact secret-looking query pairs even if malformed URL text is split."""
+def _redact_text_query_parameter(match: re.Match[str], depth: int) -> str:
+    """Redact sensitive pairs and inspect nested URLs in malformed prose queries."""
     raw_name = match.group("name")
     name = urllib.parse.unquote_plus(_no_surrogates(raw_name))
+    value = match.group("value")
     if not _has_sensitive_query_name(name):
-        return match.group()
+        safe_value = _redact_nested_url(value, depth)
+        return match.group() if safe_value == value else f"{match.group('separator')}{raw_name}={safe_value}"
+
     # Redact parameter names that contain an encoded delimiter or secret.
     safe_name = raw_name if _SAFE_QUERY_NAME.fullmatch(raw_name) else "REDACTED"
-    value = match.group("value")
     end = len(value)
     while end and value[end - 1] in ".,:!?":
         end -= 1
@@ -540,7 +599,13 @@ def _redact_text_query_parameter(match: re.Match[str]) -> str:
     return f"{match.group('separator')}{safe_name}=REDACTED{value[end:]}"
 
 
-def _redact_urls_in_text(text: str, depth: int, *, decode_entities: bool = True) -> str:
+def _redact_urls_in_text(
+    text: str,
+    depth: int,
+    *,
+    decode_entities: bool = True,
+    inspect_encoded_urls: bool = True,
+) -> str:
     """Redact text while carrying the current nested-URL depth."""
     if len(text) > _MAX_URL_PARSE_CHARS:
         return "[URL omitted: too long to inspect safely]"
@@ -554,20 +619,52 @@ def _redact_urls_in_text(text: str, depth: int, *, decode_entities: bool = True)
             if safe_decoded != decoded:
                 return safe_decoded
     text = _MULTILINE_USERINFO_IN_TEXT.sub(_redact_multiline_userinfo, text)
+    # Inspect HTTP strings containing @ even when malformed syntax left userinfo in the path.
+    text = _HTTP_URL_WITH_AT_IN_TEXT.sub(lambda match: _redact_url_occurrence(match, depth), text)
     # Do not parse prose colons as schemes; redact standalone queries and embedded URLs separately.
     stripped = text.strip()
     has_html_reference = html.unescape(stripped) != stripped
+    looks_like_http_url = stripped[:5].casefold() == "http:" or stripped[:6].casefold() == "https:"
     if not any(char.isspace() for char in stripped) and (
-        "?" in stripped or ("#" in stripped and not has_html_reference)
+        looks_like_http_url or "?" in stripped or ("#" in stripped and not has_html_reference)
     ):
         text = _redact_url(text, depth)
     text = _URL_IN_TEXT.sub(lambda match: _redact_url_occurrence(match, depth), text)
-    return _QUERY_PARAM_IN_TEXT.sub(_redact_text_query_parameter, text)
+    text = _QUERY_PARAM_IN_TEXT.sub(lambda match: _redact_text_query_parameter(match, depth), text)
+
+    # Inspect percent-encoded URL schemes anywhere in prose or path text, not only in parsed query values.
+    if inspect_encoded_urls and _ENCODED_HTTP_URL_MARKER.search(text):
+        if depth >= _MAX_NESTED_URL_DEPTH:
+            return "[nested URL omitted: too deep to inspect safely]"
+        candidate = text
+        safe_candidate: str | None = None
+        inspected_url = False
+        for _ in range(_MAX_NESTED_URL_DEPTH):
+            decoded = urllib.parse.unquote(candidate)
+            if decoded == candidate:
+                break
+            candidate = decoded
+            if _URL_IN_TEXT.search(candidate) or _HTTP_URL_WITH_AT_IN_TEXT.search(candidate):
+                inspected_url = True
+                safe = _redact_urls_in_text(
+                    candidate,
+                    depth + 1,
+                    decode_entities=False,
+                    inspect_encoded_urls=False,
+                )
+                if safe != candidate:
+                    # Keep decoding the original view: another layer may reveal userinfo hidden beside a redacted query.
+                    safe_candidate = safe
+        if _ENCODED_HTTP_URL_MARKER.search(candidate) or (inspected_url and _PERCENT_ESCAPE.search(candidate)):
+            return "[nested URL omitted: too deep to inspect safely]"
+        if safe_candidate is not None:
+            return safe_candidate
+    return text
 
 
 def redact_urls_in_text(text: str) -> str:
-    """Redact URL credentials even when a URL is embedded in untrusted prose."""
-    return _redact_urls_in_text(text, 0)
+    """Redact URL credentials and common bare secrets in untrusted prose."""
+    return _redact_diagnostic_text(_redact_urls_in_text(text, 0))
 
 
 def _redact_source(value: str) -> str:

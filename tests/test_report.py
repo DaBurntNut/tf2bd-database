@@ -832,13 +832,16 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(row.count("|"), 7)
 
     def test_a_redacted_proof_url_cannot_become_an_automatic_markdown_link(self):
-        url = "https://example.invalid/x?access_token=SECRET"
+        url = "https://example.invalid/x?access_token=SECRET&cookie=COOKIE_SECRET&csrf=CSRF_SECRET"
         report = render_report(self.info([Change("[U:1:1]", "a", ("suspicious",), ("cheater",), (url,))]))
-        self.assertNotIn("SECRET", report)
+        for secret in ("SECRET", "COOKIE_SECRET", "CSRF_SECRET"):
+            self.assertNotIn(secret, report)
         self.assertNotIn("[proof]", report)
         self.assertNotIn("Proof link", report)
         row = next(line for line in report.splitlines() if line.startswith("| `[U:1:1]`"))
-        self.assertIn("`https://example.invalid/x?access_token=REDACTED`", row)
+        self.assertIn("access_token=REDACTED", row)
+        self.assertIn("cookie=REDACTED", row)
+        self.assertIn("csrf=REDACTED", row)
 
     def test_html_entities_cannot_hide_credentials_in_a_proof_link(self):
         links = (
@@ -1091,6 +1094,39 @@ class ReportTests(unittest.TestCase):
         self.assertIn("[U:1:3]", rows[0])
         self.assertIn("[U:1:20]", rows[1])
         self.assertIn("nope", rows[2])
+
+    def test_database_and_snapshot_paths_redact_url_like_credentials(self):
+        database_secret = "DATABASE_PATH_SECRET"
+        snapshot_secret = "SNAPSHOT_PATH_SECRET"
+        source_secret = "SOURCE_PATH_SECRET"
+        info = RunInfo(
+            database_path=Path("https:/user:" + database_secret + "x" * 180 + "@example.invalid/db.json"),
+            source=("https:/example.invalid/https%3A%2F%2Fuser%3A" + source_secret + "%40client.invalid%2Flist.json"),
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+            snapshot_changed=True,
+            snapshot_path=Path("https:user:" + snapshot_secret + "@example.invalid/snapshot.json"),
+        )
+        report = render_report(info)
+        self.assertNotIn(database_secret, report)
+        self.assertNotIn(snapshot_secret, report)
+        self.assertNotIn(source_secret, report)
+        self.assertIn("example.invalid", report)
+        self.assertIn("[malformed URL omitted]", report)
+
+    def test_encoded_nested_credentials_in_database_path_are_redacted(self):
+        secret = "ENCODED_DATABASE_PATH_SECRET"
+        path = Path("/tmp/https%3A%2F%2Fuser%3A" + secret + "%40client.invalid%2Fdb.json")
+        info = RunInfo(
+            database_path=path,
+            source="https://example.invalid/list.json",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+        )
+        report = render_report(info)
+        self.assertNotIn(secret, report)
 
     def test_an_absurd_database_path_is_clipped_instead_of_truncating_the_report(self):
         """A 100,000-character path can no longer blow the body budget.

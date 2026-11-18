@@ -128,6 +128,24 @@ class UntouchedPathTests(unittest.TestCase):
             sources._fetch_bytes("file:///etc/passwd")
         urlopen.assert_not_called()
 
+    def test_database_path_errors_redact_url_like_credentials_before_clipping(self):
+        secret = "PATH_SECRET"
+        path = Path("https:/user:" + secret + "x" * 180 + "@example.invalid/db.json")
+        self.assertNotIn(secret, sync_module.display_path(path))
+        with self.assertRaises(SyncError) as caught:
+            sync_module.load_database(path)
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIn("[malformed URL omitted]", str(caught.exception))
+
+        nested_secret = "NESTED_PATH_SECRET"
+        nested_path = Path(
+            "https://example.invalid/https%3A%2F%2Fuser%3A" + nested_secret + "%40client.invalid%2Fdb.json"
+        )
+        self.assertNotIn(nested_secret, sync_module.display_path(nested_path))
+        with self.assertRaises(SyncError) as caught:
+            sync_module.load_database(nested_path)
+        self.assertNotIn(nested_secret, str(caught.exception))
+
     def test_unreadable_local_source_falls_through_to_the_next_one(self):
         local = self.root / "present.json"
         local.write_text("{}", encoding="utf-8")
@@ -499,6 +517,35 @@ class UntouchedPathTests(unittest.TestCase):
 
 
 class ValidationLoggingTests(unittest.TestCase):
+    def test_untrusted_validation_values_are_redacted_before_logging(self):
+        secret = "VALIDATION_LOG_PASSWORD"
+        bearer = "VALIDATION_BEARER_SECRET"
+        result = playerlist_module.validate(
+            {
+                "players": [
+                    {
+                        "steamid": f"https://user:{secret}@example.invalid/bad-id?access_token={secret}",
+                        "attributes": ["cheater"],
+                    },
+                    {
+                        "steamid": "[U:1:1]",
+                        "attributes": [
+                            f"https://user:{secret}@example.invalid/unknown-attribute?access_token={secret}"
+                        ],
+                    },
+                    {"steamid": f"access_token={secret}", "attributes": ["cheater"]},
+                    {"steamid": "[U:1:2]", "attributes": [f"Authorization: Bearer {bearer}"]},
+                ]
+            }
+        )
+        with self.assertLogs(sync_module.LOGGER, level="WARNING") as captured:
+            sync_module._log_validation(result, "database validation")
+        output = "\n".join(captured.output)
+        self.assertNotIn(secret, output)
+        self.assertNotIn(bearer, output)
+        self.assertIn("example.invalid", output)
+        self.assertIn("REDACTED", output)
+
     def test_omitted_validation_messages_are_summarised(self):
         result = playerlist_module.ValidationResult(
             errors=["invalid entry"],
@@ -890,20 +937,14 @@ class CliTests(unittest.TestCase):
         self.assertIn("ref=main", body)
         self.assertIn("access_token=REDACTED", body)
 
-    def test_version_flag(self):
-        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as exit_:
+    def test_version_flag_is_not_part_of_the_cli(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit_:
             build_parser().parse_args(["--version"])
-        self.assertEqual(exit_.exception.code, 0)
-        self.assertIn(sources.VERSION, out.getvalue())
+        self.assertEqual(exit_.exception.code, 2)
 
-    def test_the_version_is_plain_digits_and_dots(self):
-        """VERSION is interpolated into a User-Agent header.
-
-        urllib rejects a header value holding a newline, so a version typo
-        would turn every fetch into an exception rather than a request.
-        """
-        self.assertRegex(sources.VERSION, r"^[0-9]+\.[0-9]+$")
-        self.assertIn(f"/{sources.VERSION} (", sources.USER_AGENT)
+    def test_user_agent_identifies_the_bot_without_a_software_version(self):
+        self.assertTrue(sources.USER_AGENT.startswith("Garou3299-tf2bd-database-vorobey-hackerpolice-sync ("))
+        self.assertIn("+https://github.com/Garou3299/tf2bd-database", sources.USER_AGENT)
         self.assertNotIn("\n", sources.USER_AGENT)
 
     def test_snapshot_default_path_and_flags(self):

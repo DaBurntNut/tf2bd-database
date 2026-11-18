@@ -49,22 +49,29 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
 
-from playerlist import PlayerList, PlayerListError, ValidationResult, display_path, dumps, error_reason, load, validate
+import playerlist
+from playerlist import (
+    PlayerList,
+    PlayerListError,
+    ValidationResult,
+    dumps,
+    error_reason,
+    load,
+    validate,
+)
 from policy import Change, sync
 from report import RunInfo, plural, render_report
 from sources import (
     DEFAULT_SOURCES,
-    VERSION,
     HackerpoliceIndex,
     SyncError,
     added_steamids,
     http_scheme,
     load_first_available_raw,
     load_snapshot,
+    redact_urls_in_text,
     removed_steamids,
 )
-
-__version__ = VERSION
 
 __all__ = ["DEFAULT_SNAPSHOT", "build_parser", "load_database", "main", "run", "write_database", "write_snapshot"]
 
@@ -76,6 +83,11 @@ DEFAULT_SNAPSHOT = "snapshot/playerlist.vorobey-hackerpolice.json"
 # Veto demotion if removals exceed both the minimum count and fraction thresholds.
 MASS_DEMOTION_MIN_IDS = 50
 MASS_DEMOTION_MAX_FRACTION = 0.2
+
+
+def display_path(path: Path | str) -> str:
+    """Redact a path before clipping it for display."""
+    return playerlist.display_path(redact_urls_in_text(str(path)))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,7 +142,6 @@ def build_parser() -> argparse.ArgumentParser:
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-q", "--quiet", action="store_true", help="only print the Markdown summary")
     verbosity.add_argument("-v", "--verbose", action="store_true", help="log fetch attempts and index details")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
@@ -199,13 +210,14 @@ def _check_github_output() -> None:
 
 def _log_validation(result: ValidationResult, context: str) -> None:
     for warning in result.warnings:
-        LOGGER.warning("%s", warning)
+        LOGGER.warning("%s", display_path(warning))
     if result.warnings_omitted:
         LOGGER.warning("%s additional validation warning(s) omitted", result.warnings_omitted)
+    safe_context = display_path(context)
     for error in result.errors:
-        LOGGER.error("%s: %s", context, error)
+        LOGGER.error("%s: %s", safe_context, display_path(error))
     if result.errors_omitted:
-        LOGGER.error("%s: %s additional validation problem(s) omitted", context, result.errors_omitted)
+        LOGGER.error("%s: %s additional validation problem(s) omitted", safe_context, result.errors_omitted)
 
 
 def load_database(path: Path) -> tuple[PlayerList, str]:
@@ -213,7 +225,9 @@ def load_database(path: Path) -> tuple[PlayerList, str]:
     try:
         database, original = load(path)
     except PlayerListError as exc:
-        raise SyncError(str(exc)) from exc
+        # ``load()`` clips the raw path before this boundary can redact it; replace that preview using the full path.
+        message = str(exc).replace(playerlist.display_path(path), display_path(path))
+        raise SyncError(redact_urls_in_text(message)) from exc
 
     result = validate(database)
     _log_validation(result, f"{display_path(path)} is not a usable playerlist")
