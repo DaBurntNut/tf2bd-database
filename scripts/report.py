@@ -349,7 +349,7 @@ _YOUTUBE_SHORT = re.compile(r"^https?://youtu\.be/(?P<id>[A-Za-z0-9_-]+)$", re.A
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
 
 
-def _youtube_short_label(link: str) -> str | None:
+def _youtube_short_url(link: str) -> str | None:
     """The ``youtu.be`` spelling of a YouTube video link, or ``None``.
 
     YouTube's own short domain is how a video is normally shared, and this is a
@@ -387,12 +387,6 @@ def _youtube_short_label(link: str) -> str | None:
     return f"https://youtu.be/{video_id}"
 
 
-def _evidence_label(link: str, default: str) -> str:
-    """The visible text for a proof link: the short form when one exists."""
-    short = _youtube_short_label(link)
-    return short if short is not None else default
-
-
 def _evidence_link_status(link: str) -> tuple[str, bool]:
     """Return safe display text and whether the value is a rendered link."""
     safe_link = redact_urls_in_text(link)
@@ -420,8 +414,17 @@ def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     for position, link in enumerate(shown, start=1):
         safe_link, clickable = _evidence_link_status(link)
         if clickable:
-            label = _evidence_label(link, "proof" if single else f"proof {position}")
-            rendered.append(_markdown_link(link, label))
+            # One uniform label scheme: "proof" for a lone link, "proof N" when
+            # there are several. Keeping the SAME label shape for every target
+            # is what lets a reader tell the entries apart in a mixed row; a
+            # per-target label made a YouTube row look different from a Discord
+            # one for no gain, because both are already one click away.
+            label = "proof" if single else f"proof {position}"
+            # The TARGET still uses YouTube's own short domain, which is a
+            # faithful alias of the same video: the raw URL stays as short as
+            # the rewritten label used to be, and the label stops carrying it.
+            target = _youtube_short_url(link) or link
+            rendered.append(_markdown_link(target, label))
         else:
             preview = _shorten(safe_link, MAX_EVIDENCE_LINK_CHARS)
             if safe_link != link or _AUTOLINK_IN_TEXT.search(link):
