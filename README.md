@@ -115,8 +115,8 @@ than from the raw totals, so the line can never contradict itself.
   re-reports the same candidates (and re-applies nothing).
 - **Mass-removal guard** — demotion is skipped when the removals look like an
   upstream accident rather than real news. Two independent tests, because the
-  upstream list is an order of magnitude larger than this database (5,574 snapshot
-  entries against 108 demotable cheaters at the time of writing): more than 50 IDs
+  upstream list is an order of magnitude larger than this database (at the time of
+  writing, 5,574 snapshot entries against 108 demotable cheaters): more than 50 IDs
   *and* more than 20 % of the snapshot gone at once, **or** more than 25 % of the
   entries this database could actually lose. The second test exists because a purge
   of *every* tracked cheater was only 1.9 % of the snapshot, so the first test alone

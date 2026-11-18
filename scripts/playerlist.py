@@ -476,7 +476,7 @@ def normalize_steamid(value: Any) -> str | None:
     and complete Steam Community
     ``/profiles/<SteamID64>`` permalinks (optionally with scheme/``www``/slash).
     """
-    if isinstance(value, bool):  # bool is an int subclass, but not a SteamID
+    if isinstance(value, bool):  # bool is an int subclass, but not a SteamID.
         return None
 
     if isinstance(value, int):
@@ -519,10 +519,11 @@ def normalize_steamid(value: Any) -> str | None:
         account = _account_from_steamid64(int(text))
         if account is not None:
             return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
-        # A 17-digit string below the SteamID64 base may be a zero-padded account ID.
 
     if text.isascii() and text.isdigit():
-        # Accept bare account IDs as strings as well as integers.
+        # Accept bare account IDs as strings as well as integers. A 17-digit
+        # string below the SteamID64 base reaches here and may be a zero-padded
+        # account ID, which the range check below still has to validate.
         account = _bounded_int(text)
         if account is None or not 0 < account < MAX_ACCOUNT_ID:
             return None
@@ -588,7 +589,8 @@ def player_name(player: Player) -> str:
     if not isinstance(last_seen, dict):
         return ""
     value = last_seen.get("player_name")
-    if isinstance(value, bool) or not isinstance(value, (str, int)):  # bool is an int subclass, but not a player name
+    # bool is an int subclass, but not a player name.
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
         return ""
     return value if isinstance(value, str) else _shown(value)
 

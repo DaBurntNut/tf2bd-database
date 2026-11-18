@@ -345,7 +345,7 @@ _YOUTUBE_HOSTS = frozenset(
 # ``/shorts/<id>``, ``/embed/<id>``, ``/live/<id>`` and the legacy ``/v/<id>``.
 _YOUTUBE_ID_PATH = re.compile(r"^/(?:shorts|embed|live|v)/(?P<id>[A-Za-z0-9_-]+)$", re.ASCII)
 # The already-short host. Its query is filtered like any other, so a share tag
-# cannot survive just because the list happened to use the short spelling.
+# cannot survive just because the citation happened to use the short spelling.
 _YOUTUBE_SHORT = re.compile(r"^https?://youtu\.be/(?P<id>[A-Za-z0-9_-]+)(?:\?(?P<query>[^#]*))?(?:#.*)?$", re.ASCII)
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
 # Query keys that name a position in the video, and the forms YouTube accepts
@@ -653,14 +653,14 @@ class RunInfo:
 
     database_path: Path
     source: str
-    source_total: int  # Raw entries, including duplicates
-    source_skipped: int  # Rows without usable SteamIDs
+    source_total: int  # Raw entries, including duplicates.
+    source_skipped: int  # Rows without usable SteamIDs.
     dry_run: bool
     changes: tuple[Change, ...] = ()
     # Snapshot provenance and reasons a requested demotion was skipped.
-    previous_source_total: int | None = None  # Raw entries in the previous snapshot
-    added_to_source: int = 0  # Distinct usable IDs added upstream
-    removed_from_source: int = 0  # Distinct usable IDs removed upstream
+    previous_source_total: int | None = None  # Raw entries in the previous snapshot.
+    added_to_source: int = 0  # Distinct usable IDs added upstream.
+    removed_from_source: int = 0  # Distinct usable IDs removed upstream.
     # IDs missing upstream since the previous snapshot, even when demotion is skipped.
     removed_upstream: tuple[str, ...] = ()
     demotion_note: str | None = None

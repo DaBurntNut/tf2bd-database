@@ -116,7 +116,7 @@ def http_scheme(value: str) -> str:
         return ""
     try:
         scheme = urllib.parse.urlsplit(value).scheme.lower()
-    except ValueError:  # Invalid URLs have no usable HTTP scheme
+    except ValueError:  # Invalid URLs have no usable HTTP scheme.
         return ""
     return scheme if scheme in {"http", "https"} else ""
 
@@ -557,10 +557,10 @@ def _redact_url(url: str, depth: int) -> str:
         fragment = _redact_nested_url(fragment, depth)
 
     if netloc == parts.netloc and path == parts.path and query == parts.query and fragment == parts.fragment:
-        shown = original_url  # Preserve the caller's original spelling when nothing needs redaction
+        shown = original_url  # Preserve the caller's original spelling when nothing needs redaction.
     else:
         shown = urllib.parse.urlunsplit((parts.scheme, netloc, path, query, fragment))
-    # Keep output encodable and on one line
+    # Keep output encodable and on one line.
     shown = redact_diagnostic_text(_one_line(_no_surrogates(shown)))
     return shown if len(shown) <= MAX_URL_DISPLAY_CHARS else shown[:MAX_URL_DISPLAY_CHARS] + "…"
 
@@ -713,7 +713,7 @@ def _safe_fetch_error(exc: Exception) -> str:
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP status {exc.code}"
     if isinstance(exc, _ShortRead):
-        return str(exc)  # Generated locally from byte counts; safe to display
+        return str(exc)  # Generated locally from byte counts; safe to display.
     if isinstance(exc, http.client.IncompleteRead):
         return "incomplete HTTP response"
     if isinstance(exc, (ValueError, http.client.HTTPException)):
@@ -786,11 +786,11 @@ def _fetch_bytes(url: str) -> bytes:
                     exc.close()
             last_error = exc
             if exc.code != 429 and not 500 <= exc.code < 600:
-                break  # Non-retryable client error; try the next source
+                break  # Non-retryable client error; try the next source.
             if attempt < FETCH_ATTEMPTS:
                 _log_retry(attempt, exc)
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-        except OSError as exc:  # Retry network and socket errors
+        except OSError as exc:  # Retry network and socket errors.
             last_error = exc
             if attempt < FETCH_ATTEMPTS:
                 _log_retry(attempt, exc)

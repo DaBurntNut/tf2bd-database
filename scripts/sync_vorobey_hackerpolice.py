@@ -85,9 +85,10 @@ DEFAULT_SNAPSHOT = "snapshot/playerlist.vorobey-hackerpolice.json"
 MASS_DEMOTION_MIN_IDS = 50
 MASS_DEMOTION_MAX_FRACTION = 0.2
 # Also veto when the removal would demote a large share of THIS database's own
-# demotable entries. The snapshot is far larger than the database (5,574 vs 108
-# demotable cheaters at the time of writing), so the snapshot-relative rule alone
-# let a purge of every demotable entry look like 1.9% of the baseline and pass.
+# demotable entries. The snapshot is an order of magnitude larger than the
+# database (at the time of writing, 5,574 entries against 108 demotable
+# cheaters), so the snapshot-relative rule alone let a purge of every demotable
+# entry look like 1.9% of the baseline and pass.
 MASS_DEMOTION_MAX_DATABASE_FRACTION = 0.25
 MASS_DEMOTION_MIN_DATABASE_IDS = 5
 
@@ -176,7 +177,7 @@ def _open_github_output(path: str) -> TextIO:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, "not a regular file", os.fspath(target))
         handle = os.fdopen(fd, "a", encoding="utf-8")
-        fd = -1  # The text handle now owns the descriptor
+        fd = -1  # The text handle now owns the descriptor.
         return handle
     finally:
         if fd >= 0:
@@ -268,7 +269,7 @@ def _fsync_directory(directory: Path) -> None:
         finally:
             os.close(fd)
     except OSError:
-        pass  # Directory fsync is best-effort; some platforms do not support it
+        pass  # Directory fsync is best-effort; some platforms do not support it.
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -296,7 +297,7 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
-            os.fsync(handle.fileno())  # Fsync file contents before publishing the rename
+            os.fsync(handle.fileno())  # Fsync file contents before publishing the rename.
         # Restore the existing mode, or use the process umask for a new file.
         try:
             existing = target.stat()
@@ -308,13 +309,13 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             existing_mode = stat.S_IMODE(existing.st_mode)
         if existing_mode is None:
             mask = os.umask(0)
-            os.umask(mask)  # Restore immediately; os.umask has no read-only query
+            os.umask(mask)  # Restore immediately; os.umask has no read-only query.
             mode = 0o666 & ~mask
         else:
             mode = existing_mode
         tmp.chmod(mode)
         tmp.replace(target)
-        _fsync_directory(target.parent)  # Persist the rename
+        _fsync_directory(target.parent)  # Persist the rename.
     finally:
         # Always remove the temp file on exit; after a successful rename this is a no-op.
         tmp.unlink(missing_ok=True)
