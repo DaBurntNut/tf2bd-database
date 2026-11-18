@@ -1,0 +1,4 @@
+#!/bin/sh
+DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export LD_LIBRARY_PATH="$DIR/bin/linux64:$DIR/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$DIR/tf_linux64" "$@"
