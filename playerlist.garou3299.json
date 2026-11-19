@@ -4096,6 +4096,16 @@
 		},
 		{
 			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "Skibddi Ballz",
+				"time": 1795022384
+			},
+			"steamid": "[U:1:1209488435]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -4978,7 +4988,6 @@
 		},
 		{
 			"attributes": [
-				"cheater",
 				"racist"
 			],
 			"last_seen": {
@@ -5221,6 +5230,19 @@
 				"[auto] automatically marked: Racist | reason: \"dumbass nigga i did't tell you\""
 			],
 			"steamid": "[U:1:1692545728]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "JARD",
+				"time": 1795024265
+			},
+			"proof": [
+				"ESP"
+			],
+			"steamid": "[U:1:1697810101]"
 		},
 		{
 			"attributes": [
