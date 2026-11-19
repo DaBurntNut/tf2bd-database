@@ -2429,6 +2429,19 @@
 				"cheater"
 			],
 			"last_seen": {
+				"player_name": "wesley",
+				"time": 1795109559
+			},
+			"proof": [
+				"Bhop"
+			],
+			"steamid": "[U:1:748421496]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
 				"player_name": "Ninjaneer",
 				"time": 1777736175
 			},
@@ -2587,6 +2600,16 @@
 				"Silent Aim & ESP"
 			],
 			"steamid": "[U:1:789528422]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "NastyPISS",
+				"time": 1795095827
+			},
+			"steamid": "[U:1:799214342]"
 		},
 		{
 			"attributes": [
@@ -4130,6 +4153,19 @@
 		},
 		{
 			"attributes": [
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "Beating",
+				"time": 1795108214
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"nigga no\""
+			],
+			"steamid": "[U:1:1219783323]"
+		},
+		{
+			"attributes": [
 				"cheater"
 			],
 			"last_seen": {
@@ -4599,6 +4635,19 @@
 				"time": 1778686631
 			},
 			"steamid": "[U:1:1443258911]"
+		},
+		{
+			"attributes": [
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "Timatsu",
+				"time": 1795095843
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"boohoo nigga\""
+			],
+			"steamid": "[U:1:1443466275]"
 		},
 		{
 			"attributes": [
@@ -5127,6 +5176,16 @@
 				"cheater"
 			],
 			"last_seen": {
+				"player_name": "0000",
+				"time": 1795112460
+			},
+			"steamid": "[U:1:1604712786]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
 				"player_name": "Void Matrix",
 				"time": 1779032195
 			},
@@ -5597,6 +5656,19 @@
 				"ESP"
 			],
 			"steamid": "[U:1:1848914193]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "\ua7fbU\u1d1bZY",
+				"time": 1795107320
+			},
+			"proof": [
+				"ESP"
+			],
+			"steamid": "[U:1:1855774407]"
 		},
 		{
 			"attributes": [
