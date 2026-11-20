@@ -678,16 +678,24 @@ def run(args: argparse.Namespace) -> int:
         snapshot_removed=removed_count,
     )
 
+    # Print before the report file is written. Showing the summary cannot fail in a way
+    # that needs to abort anything: a closed stdout raises here, and aborting AFTER the
+    # report file was written used to leave a report describing changes that were never
+    # applied -- the file is also the pull request body, so it would have been published
+    # as if the sync had happened. Failing before any file is written keeps the two in
+    # step. Flush before the outcome logging: stdout is block-buffered when it is a pipe
+    # or a workflow log file, while stderr (where log records go) is not, so without this
+    # the summary and the "Updated ..." lines could reach the reader out of order.
+    # No usable stdout (closed or broken) is not fatal on its own: the --report file
+    # below still carries the same summary, which is what gets published.
+    with contextlib.suppress(OSError, ValueError):
+        print(body, end="", flush=True)
     if args.report:
         # Write the report atomically; it is also the pull request body.
         try:
             _atomic_write_bytes(Path(args.report), body.encode("utf-8"))
         except (OSError, ValueError) as exc:
             raise SyncError(f"cannot write report {display_path(args.report)}: {error_reason(exc)}") from exc
-    # Flush before the outcome logging: stdout is block-buffered when it is a pipe or a
-    # workflow log file, while stderr (where log records go) is not, so without this the
-    # summary and the "Updated ..." lines could reach the reader out of order.
-    print(body, end="", flush=True)
 
     # Write the database before advancing the snapshot; skipped demotions remain candidates.
     # Safe snapshot-only changes still refresh the baseline.

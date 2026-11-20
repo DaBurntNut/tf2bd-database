@@ -224,5 +224,8 @@ or an output that cannot be written. Outputs are
 written in report → database → snapshot order. A failure can leave an earlier
 atomic output updated (including the report, or the database if the final
 snapshot write fails), but the snapshot can never advance before the database.
+A stdout that is closed or broken is the one exception: printing the summary is
+allowed to fail, because `--report` carries the same text, and aborting there
+would have left a report describing changes that were never written.
 Keeping an old snapshot only re-evaluates removals next run; advancing it before
 the database write could lose them.
