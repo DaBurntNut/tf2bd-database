@@ -690,7 +690,9 @@ def _redact_source(value: str) -> str:
     may contain embedded URLs, for which ``redact_urls_in_text`` preserves the
     surrounding text.
     """
-    if http_scheme(value) or value[:8].casefold() == "https://" or value[:7].casefold() == "http://":
+    if http_scheme(value):
+        # ``http_scheme`` already recognises the http/https prefixes itself, including
+        # for a URL too long to parse, so repeating the prefix test here added nothing.
         return redact_url(value)
     return _one_line(_no_surrogates(redact_urls_in_text(value)))
 
