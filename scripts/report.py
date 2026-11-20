@@ -465,14 +465,14 @@ def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
         safe_link, clickable = _evidence_link_status_cached(link)
         if clickable:
             # One uniform label scheme: "proof" for a lone link, "proof N" when
-            # there are several. Keeping the SAME label shape for every target
-            # is what lets a reader tell the entries apart in a mixed row; a
-            # per-target label made a YouTube row look different from a Discord
-            # one for no gain, because both are already one click away.
+            # there are several. A single label shape for every target is what
+            # lets a reader tell the entries apart in a mixed row: naming each
+            # target instead ("YouTube", "Discord") would make the same row read
+            # differently per host for no gain, since both are one click away.
             label = "proof" if single else f"proof {position}"
-            # The TARGET still uses YouTube's own short domain, which is a
-            # faithful alias of the same video: the raw URL stays as short as
-            # the rewritten label used to be, and the label stops carrying it.
+            # A YouTube target is shortened to YouTube's own domain, a faithful
+            # alias of the same video, so the Markdown stays short. The label is
+            # already uniform, so this only shortens the target, not the name.
             target = _youtube_short_url(link) or link
             rendered.append(_markdown_link(target, label))
         else:
