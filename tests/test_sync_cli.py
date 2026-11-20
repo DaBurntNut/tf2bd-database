@@ -687,6 +687,47 @@ class WriteOrderTests(unittest.TestCase):
             self.assertEqual([p.name for p in root.iterdir() if ".tmp" in p.name], [])
 
 
+class UnusableStdoutTests(unittest.TestCase):
+    """A stdout that cannot accept the summary must not cost the run its writes.
+
+    The summary is also the ``--report`` file, i.e. the pull request body. If a dead
+    stdout aborted the run after that file was written, the report would describe
+    changes that were never applied -- and it would be published as if they had been.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        # Two entries: one promotable, so the run genuinely has something to write.
+        (self.root / "up.json").write_text(dumps({"players": [player("[U:1:1]", ["cheater"])]}), encoding="utf-8")
+        (self.root / "db.json").write_text(dumps({"players": [player("[U:1:1]", ["suspicious"])]}), encoding="utf-8")
+
+    def test_a_closed_stdout_still_lets_the_database_and_report_be_written(self):
+        stdout = io.StringIO()
+        stdout.close()  # Every write raises ValueError, as a closed fd 1 does on flush.
+        with contextlib.redirect_stdout(stdout):
+            code = main(
+                [
+                    "--database",
+                    str(self.root / "db.json"),
+                    "--snapshot",
+                    str(self.root / "snap.json"),
+                    "--source",
+                    str(self.root / "up.json"),
+                    "--report",
+                    str(self.root / "r.md"),
+                    "-q",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            (self.root / "db.json").read_text(encoding="utf-8"),
+            dumps({"players": [player("[U:1:1]", ["cheater"])]}),
+        )
+        self.assertIn("[U:1:1]", (self.root / "r.md").read_text(encoding="utf-8"))
+
+
 class IdempotencyTests(unittest.TestCase):
     """Running the sync again on its own output must find nothing to do.
 

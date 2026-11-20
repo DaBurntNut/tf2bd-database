@@ -280,6 +280,29 @@ class SourceFetchTests(unittest.TestCase):
         nested = "https://outer.invalid/?next=https://user%3ANESTED_ENCODED_PASSWORD%40client.invalid/path"
         self.assertNotIn("NESTED_ENCODED_PASSWORD", sources.redact_url(nested))
 
+    def test_source_naming_a_url_is_redacted_as_one_url(self):
+        """A ``--source`` that *is* a URL must be redacted whole, then bounded.
+
+        The two paths are not interchangeable. Redacting a URL as if it were prose
+        leaves the surrounding text intact; redacting it whole drops userinfo. An
+        oversized URL must also still report that it was omitted *as a URL*, since
+        the operator is looking for a link, not a paragraph.
+        """
+        self.assertEqual(sources._redact_source("/tmp/plain.json"), "/tmp/plain.json")
+        self.assertEqual(
+            sources._redact_source("https://user:SOURCE_USERINFO_SECRET@example.invalid/list.json"),
+            "https://example.invalid/list.json",
+        )
+        self.assertNotIn(
+            "SOURCE_QUERY_SECRET", sources._redact_source("https://example.invalid/l.json?token=SOURCE_QUERY_SECRET")
+        )
+        # Uppercase schemes are URLs too (RFC 3986), and so is one too long to parse.
+        self.assertNotIn("UPPER_SECRET", sources._redact_source("HTTPS://example.invalid/l.json?token=UPPER_SECRET"))
+        oversized = "https://example.invalid/" + "a" * (sources._MAX_URL_PARSE_CHARS + 1)
+        self.assertEqual(sources._redact_source(oversized), "[URL omitted: too long to inspect safely]")
+        # A path that merely CONTAINS a URL keeps its surrounding text.
+        self.assertIn("/tmp/", sources._redact_source("/tmp/see https://example.invalid/l.json"))
+
     def test_malformed_http_components_with_ambiguous_encoded_delimiters_fail_closed(self):
         self.assertEqual(sources.redact_url("https:/example.invalid/a%20b"), "https:/example.invalid/a%20b")
         self.assertEqual(sources.redact_url("https://host%20name.invalid/path"), "https://host%20name.invalid/path")
@@ -1004,6 +1027,16 @@ class SourceFetchTests(unittest.TestCase):
         self.assertIsNone(sources._github_blob_url(self.URL, "a" * 40))  # Reject non-API hosts.
         self.assertIsNone(sources._github_blob_url(self.API_URL, "not-a-sha"))
         self.assertIsNone(sources._github_blob_url(self.API_URL, None))
+        # A SHA is lowercase hex of exactly 40 or 64 characters: a shorter digest is
+        # truncated, and uppercase is not the spelling the API emits. Both are refused
+        # rather than pasted into a URL, so a malformed envelope cannot steer a fetch.
+        self.assertIsNone(sources._github_blob_url(self.API_URL, "A" * 40))
+        self.assertIsNone(sources._github_blob_url(self.API_URL, "a" * 39))
+        self.assertIsNone(sources._github_blob_url(self.API_URL, "a" * 65))
+        # The repository part must come from a /contents/ API path, or the built URL
+        # would point at an unrelated endpoint on the same trusted host.
+        self.assertIsNone(sources._github_blob_url("https://api.github.com/repos/o/r/git/blobs/x", "a" * 40))
+        self.assertIsNone(sources._github_blob_url("https://api.github.com/o/r/contents/x.json", "a" * 40))
         self.assertEqual(
             sources._github_blob_url(self.API_URL, "c" * 64),
             "https://api.github.com/repos/Nocrex/Tom/git/blobs/" + "c" * 64,

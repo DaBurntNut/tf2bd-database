@@ -119,12 +119,14 @@ than from the raw totals, so the line can never contradict itself.
   re-reports the same candidates (and re-applies nothing).
 - **Mass-removal guard** — demotion is skipped when the removals look like an
   upstream accident rather than real news. Two independent tests: more than 50 IDs
-  *and* more than 20 % of the snapshot gone at once, **or** more than 25 % of the
-  entries this database could actually lose. The second test exists because the
-  upstream list is an order of magnitude larger than this database, so a purge of
-  *every* tracked cheater is still only a few percent of the snapshot — the first
-  test alone would have let it through silently. `--allow-mass-demotion` overrides
-  this guard, not the separate incomplete-source safety check.
+  *and* more than 20 % of the snapshot gone at once, **or** at least 5 entries *and*
+  more than 25 % of the cheaters this database could actually lose. The second test
+  exists because the upstream list is an order of magnitude larger than this
+  database, so a purge of *every* tracked cheater is still only a few percent of the
+  snapshot — the first test alone would have let it through silently. The 5-entry
+  floor is what keeps it from vetoing a small database for losing, say, four of its
+  five tracked cheaters. `--allow-mass-demotion` overrides this guard, not the
+  separate incomplete-source safety check.
 - **Incomplete-source guard** — if the current list has unusable SteamID rows and
   the snapshot shows removals, demotion and snapshot refresh are postponed until a
   clean list can confirm them. A single malformed row cannot silently look like
@@ -195,8 +197,10 @@ python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m un
 python3 -m coverage report
 ```
 
-Python 3.10 or newer; CI checks both 3.10 (the minimum) and 3.12 (the runtime
-used by the sync job).
+Python 3.10 or newer. CI checks both 3.10 and 3.12, the version the sync job runs
+on. The three scripts use nothing newer than 3.8, so 3.10 is a supported floor
+rather than a hard requirement — the 3.10 leg is what keeps an accidental 3.11+
+API out of the code that a smaller machine might still be running.
 
 The interface (`--help` prints the long version):
 
@@ -224,5 +228,8 @@ or an output that cannot be written. Outputs are
 written in report → database → snapshot order. A failure can leave an earlier
 atomic output updated (including the report, or the database if the final
 snapshot write fails), but the snapshot can never advance before the database.
+A stdout that is closed or broken is the one exception: printing the summary is
+allowed to fail, because `--report` carries the same text, and aborting there
+would have left a report describing changes that were never written.
 Keeping an old snapshot only re-evaluates removals next run; advancing it before
 the database write could lose them.

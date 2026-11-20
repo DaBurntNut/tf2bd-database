@@ -2014,5 +2014,63 @@ class CapBoundaryTests(unittest.TestCase):
             self.assertEqual(render_report(info), full)  # Exact fit: no shrink or truncation.
 
 
+class RenderMemoTests(unittest.TestCase):
+    """The per-run proof-link memo must never change what the report says."""
+
+    def test_a_link_is_redacted_once_across_repeated_renders(self):
+        """Redacting a proof link twice for the same report is wasted work.
+
+        Redaction is the most expensive step in the renderer (it parses and
+        re-encodes URLs, decodes entities and walks nested layers) and it is a
+        pure function of the link text, so a second sighting must reuse the first
+        answer rather than recompute it.
+        """
+        change = Change(
+            "[U:1:1]",
+            "name",
+            ("suspicious",),
+            ("cheater",),
+            evidence=("https://example.invalid/watch?t=1",),
+        )
+        report_module._EVIDENCE_STATUS_CACHE.clear()
+        with mock.patch.object(
+            report_module, "_evidence_link_status", wraps=report_module._evidence_link_status
+        ) as redaction:
+            for _ in range(3):
+                report_module._evidence_cell(change.evidence)
+        report_module._EVIDENCE_STATUS_CACHE.clear()
+        self.assertEqual(redaction.call_count, 1)
+
+    def test_the_memo_stops_growing_at_its_bound(self):
+        """A list full of distinct links cannot grow the memo without limit.
+
+        Past the bound, lookups still answer correctly -- they are simply not
+        retained -- so a report larger than the bound loses speed, never accuracy.
+        """
+        link_a, link_b = "https://a.invalid/1", "https://b.invalid/2"
+        with mock.patch.object(report_module, "_MAX_EVIDENCE_STATUS_CACHE", 1):
+            report_module._EVIDENCE_STATUS_CACHE.clear()
+            first = report_module._evidence_link_status_cached(link_a)
+            overflow = report_module._evidence_link_status_cached(link_b)
+            self.assertEqual(len(report_module._EVIDENCE_STATUS_CACHE), 1)
+        report_module._EVIDENCE_STATUS_CACHE.clear()
+
+        self.assertEqual(first, report_module._evidence_link_status(link_a))
+        self.assertEqual(overflow, report_module._evidence_link_status(link_b))
+
+    def test_render_report_leaves_no_proof_text_in_the_memo(self):
+        """The memo is per-report state, not a cache that outlives the run."""
+        info = RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://example.invalid/list.json",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+            changes=(Change("[U:1:1]", "name", ("suspicious",), ("cheater",), evidence=("https://e.invalid/1",)),),
+        )
+        render_report(info)
+        self.assertEqual(report_module._EVIDENCE_STATUS_CACHE, {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
