@@ -61,10 +61,10 @@ class MassDemotionGuardTests(unittest.TestCase):
             return sync_module._plan_demotion(args, previous, removed, Path("snapshot.json"), demotion_impact=impact)
 
     def test_a_purge_of_the_databases_own_cheaters_is_vetoed(self):
-        # Modelled on the real baseline: 108 demotable cheaters against 5,574
-        # snapshot entries. The snapshot-relative rule alone let a purge of every
-        # tracked cheater look harmless -- 108/5,574 is 1.9%, well under the 20%
-        # threshold -- so the database-relative rule exists to catch it.
+        # A representative baseline: 108 demotable cheaters against 5,574 snapshot
+        # entries, i.e. about 2%, well under the 20% snapshot threshold. The
+        # numbers are fixture values chosen to make that ratio obvious; they are
+        # not a measurement of the live data, which changes every run.
         removed, update_snapshot, note, snapshot_note = self.plan(108, 5574, impact=(108, 108))
         self.assertEqual(removed, set())
         self.assertFalse(update_snapshot)

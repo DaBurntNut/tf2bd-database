@@ -86,9 +86,9 @@ MASS_DEMOTION_MIN_IDS = 50
 MASS_DEMOTION_MAX_FRACTION = 0.2
 # Also veto when the removal would demote a large share of THIS database's own
 # demotable entries. The snapshot is an order of magnitude larger than the
-# database (at the time of writing, 5,574 entries against 108 demotable
-# cheaters), so the snapshot-relative rule alone let a purge of every demotable
-# entry look like 1.9% of the baseline and pass.
+# database, so the snapshot-relative rule alone let a purge of every demotable
+# entry look like ~2% of the baseline and pass. Counts are deliberately not
+# quoted here: the snapshot advances every run, so any figure would go stale.
 MASS_DEMOTION_MAX_DATABASE_FRACTION = 0.25
 MASS_DEMOTION_MIN_DATABASE_IDS = 5
 
