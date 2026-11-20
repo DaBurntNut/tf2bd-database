@@ -65,16 +65,20 @@ Only players who were in the previous snapshot and are gone now are demoted, so
 
 The pull request summarizes each change in tables with the SteamID, last known
 name, tags before/after, and links (Steam profile, SteamHistory, and upstream
-evidence). The full diff remains the complete record. The report never quotes
-`proof` text stored in the database — those auto-marked chat lines stay in the
-database and are not copied into the public report. The removed-ID table lists
-up to 100 SteamIDs with profile and [SteamHistory](https://steamhistory.net/)
-links, then reports how many more were omitted. `snapshot/playerlist.vorobey-hackerpolice.json`
-is the previous byte-for-byte copy of Vorobey's list — the bot compares against
-it to know who was removed, and refreshes it alongside the database whenever
-the upstream bytes differ (in the same pull request or direct commit). Evidence
-links stay in the pull request: they are shown for review and are never written
-into the database.
+evidence). The full diff remains the complete record. Evidence links shown in
+the review tables come from Vorobey's list, so the auto-marked chat lines stored
+in this database's own `proof` fields are never copied into the report; a
+demotion note quotes one only when that `[auto] automatically marked: Racist`
+line is the record that justifies a surviving `racist` tag.
+
+The removed-ID table lists up to 100 SteamIDs with profile and
+[SteamHistory](https://steamhistory.net/) links, then reports how many more were
+omitted. `snapshot/playerlist.vorobey-hackerpolice.json` is the previous
+byte-for-byte copy of Vorobey's list — the bot compares against it to know who
+was removed, and refreshes it alongside the database whenever the upstream bytes
+differ (in the same pull request or direct commit). Evidence links stay in the
+pull request: they are shown for review and are never written into the database.
+
 A promotion only ever changes `attributes` — never `proof`. Each promotion row
 shows at most 10 distinct upstream evidence links; any remaining proof entries
 are counted as omitted rather than retained in the change record. The label is
@@ -114,14 +118,13 @@ than from the raw totals, so the line can never contradict itself.
   `--no-update-snapshot` holds the baseline back on purpose; every later run then
   re-reports the same candidates (and re-applies nothing).
 - **Mass-removal guard** — demotion is skipped when the removals look like an
-  upstream accident rather than real news. Two independent tests, because the
-  upstream list is an order of magnitude larger than this database (at the time of
-  writing, 5,574 snapshot entries against 108 demotable cheaters): more than 50 IDs
+  upstream accident rather than real news. Two independent tests: more than 50 IDs
   *and* more than 20 % of the snapshot gone at once, **or** more than 25 % of the
-  entries this database could actually lose. The second test exists because a purge
-  of *every* tracked cheater was only 1.9 % of the snapshot, so the first test alone
-  would have let it through silently. `--allow-mass-demotion` overrides this guard,
-  not the separate incomplete-source safety check.
+  entries this database could actually lose. The second test exists because the
+  upstream list is an order of magnitude larger than this database, so a purge of
+  *every* tracked cheater is still only a few percent of the snapshot — the first
+  test alone would have let it through silently. `--allow-mass-demotion` overrides
+  this guard, not the separate incomplete-source safety check.
 - **Incomplete-source guard** — if the current list has unusable SteamID rows and
   the snapshot shows removals, demotion and snapshot refresh are postponed until a
   clean list can confirm them. A single malformed row cannot silently look like
@@ -162,13 +165,12 @@ than from the raw totals, so the line can never contradict itself.
   unpublished database or snapshot change behind.
 - **Checked changes** — a pull request touching `scripts/`, `tests/`,
   `playerlist.garou3299.json`, `playerlist.scammers.json`, `rules.garou3299.json`,
-  the hackerpolice snapshot,
-  `pyproject.toml`, `.gitattributes`, `.gitignore`, `README.md`, `.github/dependabot.yml` or
-  the workflow runs ruff, `mypy --strict`,
-  a bandit security scan, vulture (dead code) and the tests under a coverage gate
-  that keeps statements *and branches* at 100 %, in a read-only job. The same
-  checks gate every scheduled/manual sync; only the separate sync job gets write
-  permissions.
+  the hackerpolice snapshot, `pyproject.toml`, `.gitattributes`, `.gitignore`,
+  `README.md`, `.github/dependabot.yml` or the workflow runs ruff, `mypy --strict`,
+  a bandit security scan, vulture (dead code) and the tests under a branch-coverage
+  gate whose floor is 95 % (the suite currently reaches 100 % of statements and
+  branches), in a read-only job. The same checks gate every scheduled/manual sync;
+  only the separate sync job gets write permissions.
 - **Pinned actions** — the workflow uses each action at a commit SHA, not at a
   movable tag, and Dependabot bumps those pins weekly; a compromised release in
   someone else's repository cannot run code here with a write token.
