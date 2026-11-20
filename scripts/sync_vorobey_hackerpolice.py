@@ -731,8 +731,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOGGER.error("error: %s", exc)
         return 2
     except OSError as exc:
-        # Report a bounded OS-error reason without echoing an untrusted path.
-        LOGGER.error("error: %s", display_path(error_reason(exc)))
+        # Anything that reaches here escaped a handler that already names its file, so
+        # the useful half is ``strerror`` -- ``str(OSError)`` would repeat the path.
+        # It is still free-form text: redact it, flatten it, bound it before logging.
+        LOGGER.error("error: %s", _one_line_message(error_reason(exc)))
         return 2
     except KeyboardInterrupt:
         # Return 128 + SIGINT for Ctrl-C; atomic writes clean up temporary files.

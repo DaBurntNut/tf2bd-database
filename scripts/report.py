@@ -408,10 +408,40 @@ def _youtube_short_url(link: str) -> str | None:
 
 
 def _evidence_link_status(link: str) -> tuple[str, bool]:
-    """Return safe display text and whether the value is a rendered link."""
+    """Return safe display text and whether the value is a rendered link.
+
+    Both answers come from the same pass, so a caller never has to re-redact a
+    link just to learn whether it may be clicked.
+    """
     safe_link = redact_urls_in_text(link)
     clickable = len(link) <= MAX_EVIDENCE_LINK_CHARS and safe_link == link and _is_url(link)
     return safe_link, clickable
+
+
+# Per-run memo for ``_evidence_link_status``.
+#
+# Why it is worth a module global: a report is rendered up to ten times while it
+# shrinks to fit, and each render redacts every proof link shown plus every proof
+# link counted for the closing note. Redaction is the most expensive work in the
+# renderer (it parses and re-encodes URLs, decodes entities and walks nested
+# layers), and it is a pure function of the link text -- so the same handful of
+# links was being redacted over a hundred times. The cache is cleared by
+# ``render_report``; a caller that uses the renderers directly still gets correct
+# output, it just does not benefit from the memo.
+_EVIDENCE_STATUS_CACHE: dict[str, tuple[str, bool]] = {}
+# Bounds the memo: a hostile list cannot grow it without limit during one report.
+_MAX_EVIDENCE_STATUS_CACHE = 20_000
+
+
+def _evidence_link_status_cached(link: str) -> tuple[str, bool]:
+    """``_evidence_link_status`` with a bounded per-run memo."""
+    cached = _EVIDENCE_STATUS_CACHE.get(link)
+    if cached is not None:
+        return cached
+    status = _evidence_link_status(link)
+    if len(_EVIDENCE_STATUS_CACHE) < _MAX_EVIDENCE_STATUS_CACHE:
+        _EVIDENCE_STATUS_CACHE[link] = status
+    return status
 
 
 def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
@@ -432,7 +462,7 @@ def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     single = len(shown) == 1
     rendered: list[str] = []
     for position, link in enumerate(shown, start=1):
-        safe_link, clickable = _evidence_link_status(link)
+        safe_link, clickable = _evidence_link_status_cached(link)
         if clickable:
             # One uniform label scheme: "proof" for a lone link, "proof N" when
             # there are several. Keeping the SAME label shape for every target
@@ -759,6 +789,33 @@ def _header_lines(info: RunInfo) -> list[str]:
     return lines
 
 
+def _promotion_row(change: Change) -> str:
+    """Render one promotion row, escaping every untrusted value it carries."""
+    return _row(
+        (
+            _steamid_cell(change.steamid),
+            _name_cell(change),
+            _attributes_cell(change.before),
+            _attributes_cell(change.after),
+            _evidence_cell(change.evidence, change.evidence_omitted),
+            _steam_history_cell(change.steamid),
+        )
+    )
+
+
+def _demotion_row(change: Change) -> str:
+    """Render one demotion row; ``after`` is empty when the entry is removed."""
+    return _row(
+        (
+            _steamid_cell(change.steamid),
+            _name_cell(change),
+            _attributes_cell(change.before),
+            _attributes_cell(change.after) or "entry removed",
+            _steam_history_cell(change.steamid),
+        )
+    )
+
+
 def _promotion_lines(promotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS, *, database: str) -> list[str]:
     """Render the "promoted to cheater" table block.
 
@@ -767,19 +824,7 @@ def _promotion_lines(promotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE
     in the report.
     """
     count = len(promotions)
-    rows = [
-        _row(
-            (
-                _steamid_cell(change.steamid),
-                _name_cell(change),
-                _attributes_cell(change.before),
-                _attributes_cell(change.after),
-                _evidence_cell(change.evidence, change.evidence_omitted),
-                _steam_history_cell(change.steamid),
-            )
-        )
-        for change in promotions[:limit]
-    ]
+    rows = [_promotion_row(change) for change in promotions[:limit]]
     overflow = _overflow_note(count, limit, "entry", "entries")
     entries = plural(count, "entry", "entries")
     headline = f"**{_count(count)} {entries} promoted to `cheater` in the {_text(database)} database:**"
@@ -789,18 +834,7 @@ def _promotion_lines(promotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE
 def _demotion_lines(demotions: Sequence[Change], limit: int = MAX_CHANGE_TABLE_ROWS, *, database: str) -> list[str]:
     """Render the "demoted" table block."""
     count = len(demotions)
-    rows = [
-        _row(
-            (
-                _steamid_cell(change.steamid),
-                _name_cell(change),
-                _attributes_cell(change.before),
-                _attributes_cell(change.after) or "entry removed",
-                _steam_history_cell(change.steamid),
-            )
-        )
-        for change in demotions[:limit]
-    ]
+    rows = [_demotion_row(change) for change in demotions[:limit]]
     overflow = _overflow_note(count, limit, "entry", "entries")
     headline = (
         f"**{_count(count)} {plural(count, 'entry', 'entries')} demoted (present in the previous snapshot, "
@@ -913,7 +947,7 @@ def _render_body(
 
     # Count visible rows only; do not reference evidence omitted from the table.
     total_links = sum(
-        _evidence_link_status(link)[1]
+        _evidence_link_status_cached(link)[1]
         for change in promotions[:change_limit]
         for link in change.evidence[:MAX_EVIDENCE_LINKS]
     )
@@ -929,7 +963,9 @@ def _render_body(
     return "\n".join(lines)
 
 
-# Reduce change-table rows first, then removed IDs; hard-truncate only as a last resort.
+# Row caps tried in order when the body is over budget. Change-table rows shrink
+# first because they carry the review value; the removed-ID list is next, and the
+# last resort (``_fit_body``) only cuts text the tables could not give up.
 _SHRINK_STEPS: tuple[tuple[int, int], ...] = (
     (100, MAX_REMOVED_TABLE_ROWS),
     (50, MAX_REMOVED_TABLE_ROWS),
@@ -957,4 +993,7 @@ def render_report(info: RunInfo) -> str:
         if _utf8_len(text) <= MAX_REPORT_BYTES:
             break
         text = _render_body(info, change_limit, removed_limit, promotions, demotions, closing_sentence)
+    # The memo only has to live as long as this report; dropping it here keeps a
+    # long-lived caller (or the test suite) from holding onto proof text.
+    _EVIDENCE_STATUS_CACHE.clear()
     return _safe(_fit_body(text))

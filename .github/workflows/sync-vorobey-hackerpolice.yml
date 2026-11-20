@@ -109,7 +109,9 @@ jobs:
           python3 -m bandit -q -r scripts
 
       - name: Run unit tests under the coverage gate
-        # Enforce 100% statement and branch coverage from pyproject.toml.
+        # The floor is fail_under in pyproject.toml (95%), not 100%: the suite
+        # reaches 100% today, but the gate must not demand a test for a branch
+        # that cannot be reached.
         run: |
           python3 -m pip install --quiet --disable-pip-version-check "coverage==${COVERAGE_VERSION}"
           python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
