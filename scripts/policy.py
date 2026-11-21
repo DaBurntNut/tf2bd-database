@@ -8,9 +8,12 @@ snapshot, gone from the current one). A SteamID that was never on the
 hackerpolice list is never demoted: most ``cheater`` entries in this
 database were added manually and must survive every sync.
 
-No proof is ever written by this module. The evidence links the hackerpolice
-list records are carried in the ``Change`` records and published in the pull
-request only, so a promotion can never add a proof line to an entry.
+No proof text is ever authored by this module. The evidence links the
+hackerpolice list records are carried in the ``Change`` records and published
+in the pull request only, so a promotion can never add a proof line to an
+entry. Demotion is the one place the field is touched at all, and only ever to
+REMOVE lines: it keeps the trusted ``[auto] ... Racist`` records that justify
+the surviving ``racist`` tag, and deletes the key outright when none survive.
 """
 
 from __future__ import annotations
