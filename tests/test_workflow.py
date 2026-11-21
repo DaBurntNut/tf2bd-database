@@ -125,9 +125,10 @@ class WorkflowContractTests(unittest.TestCase):
     def test_a_change_to_any_file_the_suite_reads_runs_the_checks(self):
         """Every file these tests read must be able to trigger them.
 
-        README/dependabot contracts and the shipped JSON data are validated
-        here. If any of those paths fall out of the workflow filter,
-        a data- or documentation-only pull request could bypass its assertion.
+        The dependabot contract and the shipped JSON data are validated here.
+        If any of those paths fall out of the workflow filter, a data-only
+        pull request could bypass its assertion. README.md is deliberately
+        absent: no test reads it, so its wording belongs to the maintainer.
         """
         block = self.workflow.split("  pull_request:\n", 1)[1].split("\npermissions:", 1)[0]
         patterns = re.findall(r'^\s+- "([^"]+)"', block, re.M)
@@ -137,7 +138,6 @@ class WorkflowContractTests(unittest.TestCase):
             return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
         for name in (
-            "README.md",
             ".gitattributes",
             ".gitignore",
             "playerlist.garou3299.json",
@@ -292,10 +292,8 @@ class WorkflowContractTests(unittest.TestCase):
         with self.assertRaises(SyntaxError):
             ast.parse("type Alias = int\n", feature_version=(3, 10))
 
-    def test_python_310_floor_matches_the_readme_lint_target_and_ci(self):
-        readme = (self.root / "README.md").read_text(encoding="utf-8")
+    def test_python_310_floor_matches_the_lint_target_and_ci(self):
         pyproject = (self.root / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn("Python 3.10 or newer", readme)
         self.assertIn("Python 3.10+", pyproject)
         self.assertIn('target-version = "py310"', pyproject)
         self.assertIn('"3.10"', self.jobs()["checks"])
@@ -359,13 +357,10 @@ class WorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(f'"{tool}==${{{name}}}"', self.workflow)
 
-    def test_local_coverage_instructions_match_the_ci_tool_version(self):
-        readme = (self.root / "README.md").read_text(encoding="utf-8")
-        documented = re.search(r"python3 -m pip install coverage==([^\s`]+)", readme)
+    def test_ci_pins_the_coverage_tool_version(self):
+        """An unpinned coverage release could move the gate under us."""
         configured = re.search(r'^\s*COVERAGE_VERSION:\s*"([^"]+)"$', self.workflow, re.M)
-        self.assertIsNotNone(documented, "the local test instructions must install coverage")
         self.assertIsNotNone(configured, "CI must pin coverage")
-        self.assertEqual(documented.group(1), configured.group(1))
 
     def test_checks_run_for_all_events_and_only_pull_requests_run_no_sync(self):
         jobs = self.jobs()
@@ -554,6 +549,25 @@ class RepositoryDataTests(unittest.TestCase):
             )
             return result.stdout.strip()
 
+        def run_lease_script(directory: Path, branch_name: str) -> None:
+            """Execute the workflow's push block, quietly.
+
+            Without capture, git writes its push and fetch progress straight to
+            the test runner's console, so a passing suite prints remote URLs and
+            branch names. Capturing it also puts the real output in the failure
+            message, which ``check=True`` alone does not do.
+            """
+            result = subprocess.run(
+                ["bash", "-c", lease_script],
+                cwd=directory,
+                env={**os.environ, "BOT_BRANCH": branch_name},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             remote = root / "remote.git"
@@ -595,13 +609,7 @@ class RepositoryDataTests(unittest.TestCase):
             (checkout / "file.txt").write_text("bot update\n", encoding="utf-8")
             git(checkout, "add", "file.txt")
             git(checkout, "commit", "-m", "bot update")
-            subprocess.run(
-                ["bash", "-c", lease_script],
-                cwd=checkout,
-                env={**os.environ, "BOT_BRANCH": branch},
-                check=True,
-                timeout=30,
-            )
+            run_lease_script(checkout, branch)
             self.assertEqual(
                 git(root, "--git-dir", str(remote), "rev-parse", f"refs/heads/{branch}"),
                 git(checkout, "rev-parse", "HEAD"),
@@ -623,13 +631,7 @@ class RepositoryDataTests(unittest.TestCase):
             (fresh / "file.txt").write_text("first bot run\n", encoding="utf-8")
             git(fresh, "add", "file.txt")
             git(fresh, "commit", "-m", "first bot run")
-            subprocess.run(
-                ["bash", "-c", lease_script],
-                cwd=fresh,
-                env={**os.environ, "BOT_BRANCH": branch},
-                check=True,
-                timeout=30,
-            )
+            run_lease_script(fresh, branch)
             self.assertEqual(
                 git(root, "--git-dir", str(remote), "rev-parse", f"refs/heads/{branch}"),
                 git(fresh, "rev-parse", "HEAD"),
