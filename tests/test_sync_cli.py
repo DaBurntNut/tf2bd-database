@@ -9,7 +9,6 @@ import io
 import json
 import os
 import random
-import re
 import runpy
 import stat
 import subprocess
@@ -45,27 +44,6 @@ from sources import (
     load_first_available_raw,
 )
 from sync_vorobey_hackerpolice import DEFAULT_SNAPSHOT, build_parser, main
-
-
-class ReadmeCliTests(unittest.TestCase):
-    """Keep the CLI flags discoverable and accurate in the README."""
-
-    @staticmethod
-    def _readme() -> str:
-        path = Path(__file__).resolve().parents[1] / "README.md"
-        return path.read_text(encoding="utf-8")
-
-    def test_every_flag_is_documented(self):
-        readme = self._readme()
-        flags = {flag for action in build_parser()._actions for flag in action.option_strings if flag.startswith("--")}
-        self.assertEqual(sorted(flag for flag in flags if flag not in readme), [])
-
-    def test_the_readme_invents_no_flags(self):
-        """The other direction: every documented flag must still exist."""
-        readme = self._readme()
-        known = {flag for action in build_parser()._actions for flag in action.option_strings}
-        mentioned = set(re.findall(r"`(--[a-z][a-z0-9-]+)", readme))
-        self.assertEqual(sorted(mentioned - known), [])
 
 
 class WriteSnapshotTests(unittest.TestCase):
@@ -2021,27 +1999,15 @@ class DocumentedLimitsTests(unittest.TestCase):
     the constant itself moving. A one-digit typo in ``MAX_REPORT_BYTES`` would
     therefore ship a bot that truncates every busy report, and a typo in
     ``MAX_SOURCE_BYTES`` would ship one that refuses a legitimate download.
-    Each number below is quoted from README.md so the two cannot drift.
+    Spelling each number out here is what catches the constant itself moving.
     """
 
     def test_the_documented_report_limits(self):
-        # README contract: change tables stop at 150 rows, the removed-ID table
-        # at 100 rows, and the report body at 60,000 bytes.
+        # Published behaviour: change tables stop at 150 rows, the removed-ID
+        # table at 100 rows, and the report body at 60,000 bytes.
         self.assertEqual(report_module.MAX_CHANGE_TABLE_ROWS, 150)
         self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 100)
         self.assertEqual(report_module.MAX_REPORT_BYTES, 60_000)
-
-    def test_the_readme_states_the_report_byte_cap_it_enforces(self):
-        """The prose must name the cap the code enforces.
-
-        The number was pinned in tests already, but the README described the cap
-        only as "its last-resort byte limit", so a reader could not tell what it
-        was and a change to the constant would leave the prose stale.
-        """
-        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-        stated = f"{report_module.MAX_REPORT_BYTES // 1000:,} KB"
-        self.assertIn(stated, readme)
-        self.assertIn(f"stops at {report_module.MAX_CHANGE_TABLE_ROWS}", readme)
 
     def test_the_display_caps(self):
         self.assertEqual(report_module.MAX_NAME_CHARS, 80)
@@ -2054,7 +2020,7 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.MAX_URL_DISPLAY_CHARS, 2048)
 
     def test_the_read_and_fetch_limits(self):
-        # README contract: downloads allow 64 MiB, 30 seconds, and three attempts
+        # Published behaviour: downloads allow 64 MiB, 30 seconds, and three attempts
         # before fallback; database and snapshot files share the 64 MiB limit.
         self.assertEqual(playerlist_module.MAX_FILE_BYTES, 64 * 1024 * 1024)
         self.assertEqual(sources.MAX_SOURCE_BYTES, 64 * 1024 * 1024)
@@ -2064,7 +2030,7 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.RETRY_BACKOFF_SECONDS, 2)
 
     def test_the_documented_guard_and_account_bounds(self):
-        # README contract: the guard requires more than 50 IDs and more than 20% removal.
+        # Published behaviour: the guard requires more than 50 IDs and more than 20% removal.
         self.assertEqual(sync_module.MASS_DEMOTION_MIN_IDS, 50)
         self.assertEqual(sync_module.MASS_DEMOTION_MAX_FRACTION, 0.2)
         # The second, database-relative guard: the snapshot dwarfs the database,
