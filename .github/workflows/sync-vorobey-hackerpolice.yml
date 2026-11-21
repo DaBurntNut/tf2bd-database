@@ -1,39 +1,17 @@
 name: Sync Vorobey hackerpolice
 
-# Checks the Vorobey hackerpolice list (Nocrex/Tom) against this database:
-# Promotes matching entries that are not already cheaters:
-#   * "suspicious"             -> "cheater"
-#   * "racist"                 -> "cheater" + "racist"
-#   * "suspicious" + "racist"  -> "cheater" + "racist"
-# Demotes entries that carry cheater, but ONLY SteamIDs that were in the
-# previous hackerpolice snapshot (snapshot/playerlist.vorobey-hackerpolice.json)
-# and have since been removed from the hackerpolice list:
-#   * "cheater" + "racist"     -> only "cheater" is removed ("racist" kept)
-#   * "cheater" alone          -> whole entry is removed
-# Cheaters that were never on the hackerpolice list (added manually) are
-# never demoted. Everything else is never touched, and the hackerpolice proof
-# links are shown in the pull request only - they are never written into
-# playerlist.garou3299.json. The snapshot is refreshed to the current list in the SAME
-# pull request, so the baseline only advances when the PR is merged - no
-# separate snapshot bot/PR is needed (a separate weekly snapshot PR would
-# race this workflow: merging it first would erase the very removals this
-# workflow is supposed to detect).
-#
-# Creating pull requests with the default GITHUB_TOKEN requires this repository
-# setting to be enabled (Settings -> Actions -> General -> Workflow permissions):
-#   [x] Allow GitHub Actions to create and approve pull requests
-# If it is disabled, the workflow still pushes the branch and prints a one-click
-# "Compare & pull request" link in the job summary. Alternatively, store a
-# personal access token with contents + pull-requests write access in the
-# BOT_TOKEN secret and it will be used instead of GITHUB_TOKEN.
+# Promote eligible matches; demote snapshot-confirmed removals only, preserving manually added cheaters.
+# Keep upstream evidence in the report, never in the database.
+# Advance the byte-exact snapshot only when safe.
+# Read-only checks gate the write-capable sync job.
+# PR creation needs the Actions PR setting or BOT_TOKEN with contents/pull-requests write access.
+# If PR creation fails, the fallback pushes a branch and adds a compare link.
+# Pin actions to commit SHAs; Dependabot updates the pins and release annotations.
 
 on:
   schedule:
-    # DAILY at 05:23 UTC (GitHub may delay scheduled runs by a few minutes).
-    # For a WEEKLY run instead, comment the line below and uncomment the next one
-    # (Mondays at 05:23 UTC):
+    # Run daily at 05:23 UTC to avoid the busy top of the hour.
     - cron: "23 5 * * *"
-    # - cron: "23 5 * * 1"
   workflow_dispatch:
     inputs:
       mode:
@@ -44,7 +22,7 @@ on:
           - commit
         default: pull-request
       dry_run:
-        description: "Only report the changes, do not write or publish anything"
+        description: "Report the changes without updating the database or snapshot or opening a pull request"
         type: boolean
         default: false
       allow_mass_demotion:
@@ -52,60 +30,153 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: write
-  pull-requests: write
+  # Run PR checks when files used by the sync or its tests change.
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - ".gitattributes"
+      - ".gitignore"
+      - "playerlist.garou3299.json"
+      - "playerlist.scammers.json"
+      - "rules.garou3299.json"
+      - "snapshot/playerlist.vorobey-hackerpolice.json"
+      # Tests read the README, Dependabot config, and workflow; include each in this filter.
+      - "README.md"
+      - ".github/dependabot.yml"
+      - ".github/workflows/sync-vorobey-hackerpolice.yml"
 
-concurrency:
-  group: sync-vorobey-hackerpolice
-  cancel-in-progress: false
+# Least privilege by default: no job may read or write more than its own block.
+permissions: {}
+
+# Pin tool versions so both Python matrix legs use identical check tooling.
+env:
+  RUFF_VERSION: "0.17.4"
+  MYPY_VERSION: "2.4.1"
+  BANDIT_VERSION: "1.9.4"
+  # Coverage 7.17.3 requires Python 3.11; use 7.16.2 for Python 3.10.
+  COVERAGE_VERSION: "7.16.2"
+  VULTURE_VERSION: "2.16"
 
 jobs:
-  sync:
-    name: Check Vorobey hackerpolice list
+  # Read-only checks gate publishing and run without write credentials.
+  checks:
+    name: ${{ github.event_name == 'pull_request' && 'Lint and test the proposed change' || 'Lint and test before publishing' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      # Report both matrix results even if one leg fails.
+      fail-fast: false
+      matrix:
+        # Test the documented minimum (3.10) and production runtime (3.12).
+        python-version: ["3.10", "3.12"]
+    # Isolate checks from sync and cancel stale runs without cancelling sibling Python legs.
+    concurrency:
+      group: checks-${{ github.event.pull_request.number || github.ref }}-py${{ matrix.python-version }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Tests need no GitHub credentials; do not persist checkout credentials for tools.
+          persist-credentials: false
+          # The checks need the working tree only, not the whole history.
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Lint (ruff)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "ruff==${RUFF_VERSION}"
+          python3 -m ruff check scripts tests
+          python3 -m ruff format --check scripts tests
+
+      - name: Type-check (mypy, strict)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "mypy==${MYPY_VERSION}"
+          python3 -m mypy scripts
+
+      - name: Security scan (bandit)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "bandit==${BANDIT_VERSION}"
+          python3 -m bandit -q -r scripts
+
+      - name: Run unit tests under the coverage gate
+        # The floor is fail_under in pyproject.toml (95%), not 100%: the suite
+        # reaches 100% today, but the gate must not demand a test for a branch
+        # that cannot be reached.
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "coverage==${COVERAGE_VERSION}"
+          python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
+          python3 -m coverage report
+
+      - name: Dead code (vulture)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "vulture==${VULTURE_VERSION}"
+          python3 -m vulture scripts tests --min-confidence 60
+
+  sync:
+    name: Check Vorobey hackerpolice list
+    needs: checks
+    # Only the default-branch workflow may run the write-capable sync job.
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # contents:write is required to read the default branch AND push the bot branch.
+      contents: write
+      # pull-requests:write is required to open/close the bot pull request.
+      pull-requests: write
+      issues: none
+    # Serialize sync writers without blocking pull-request checks.
+    concurrency:
+      group: sync-vorobey-hackerpolice
+      cancel-in-progress: false
     env:
       DATABASE: playerlist.garou3299.json
       SNAPSHOT: snapshot/playerlist.vorobey-hackerpolice.json
       BOT_BRANCH: bot/vorobey-hackerpolice-sync
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
-      # Scheduled runs always open a pull request; manual runs choose.
+      # Scheduled runs always use pull-request mode; manual runs select the mode.
       MODE: ${{ github.event_name == 'schedule' && 'pull-request' || inputs.mode }}
+      # Empty on scheduled runs, so cleanup compares a string rather than null.
+      DRY_RUN_INPUT: ${{ inputs.dry_run }}
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Always check out the default branch; manual dispatch may start from another ref.
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
-      - name: Lint (ruff)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check ruff==0.17.4
-          ruff check scripts tests
-          ruff format --check scripts tests
-
-      - name: Run unit tests
-        run: python3 -m unittest discover -s tests -v
-
       - name: Sync database with Vorobey hackerpolice list
         id: sync
-        # No third-party dependencies at runtime: the scripts only use the
-        # Python standard library.
+        # Runtime sync uses only the Python standard library.
         env:
           DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
           ALLOW_MASS_DEMOTION: ${{ inputs.allow_mass_demotion && '--allow-mass-demotion' || '' }}
-        run: >
-          python3 scripts/sync_vorobey_hackerpolice.py
-          --database "$DATABASE"
-          --snapshot "$SNAPSHOT"
-          --report "$RUNNER_TEMP/hackerpolice-sync-report.md"
-          $DRY_RUN
-          $ALLOW_MASS_DEMOTION
-          --demote
+        run: |
+          # Expand optional flags unquoted so empty values contribute no argument.
+          # shellcheck disable=SC2086
+          python3 scripts/sync_vorobey_hackerpolice.py \
+            --database "$DATABASE" \
+            --snapshot "$SNAPSHOT" \
+            --report "$RUNNER_TEMP/hackerpolice-sync-report.md" \
+            $DRY_RUN \
+            $ALLOW_MASS_DEMOTION \
+            --demote
 
       - name: Show report in the job summary
         if: always()
@@ -116,16 +187,19 @@ jobs:
 
       - name: Open or update pull request
         id: pr
-        # A missing PR permission is handled by the fallback step below.
+        # A failed automatic PR attempt is handled by the fallback step below.
         continue-on-error: true
-        if: steps.sync.outputs.changed == 'true' && env.MODE != 'commit'
-        uses: peter-evans/create-pull-request@v8
+        # Publish only after sync succeeds and reports changes.
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE != 'commit'
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
         with:
           token: ${{ secrets.BOT_TOKEN || github.token }}
           add-paths: |
             ${{ env.DATABASE }}
             ${{ env.SNAPSHOT }}
           branch: ${{ env.BOT_BRANCH }}
+          # Always target the configured default branch.
+          base: ${{ env.BASE_BRANCH }}
           delete-branch: true
           title: "Sync the Vorobey hackerpolice matches"
           commit-message: |
@@ -135,26 +209,35 @@ jobs:
           body-path: ${{ runner.temp }}/hackerpolice-sync-report.md
 
       - name: Push branch and link a manual pull request
-        if: steps.sync.outputs.changed == 'true' && env.MODE != 'commit' && steps.pr.outcome == 'failure'
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE != 'commit' && steps.pr.outcome == 'failure'
+        env:
+          # Pass expressions through the environment instead of interpolating them into shell.
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # create-pull-request may already have committed the change locally
-          # before failing on the pull request API call.
-          if ! git rev-parse --verify --quiet "refs/heads/$BOT_BRANCH" > /dev/null; then
+          # Check the worktree, not only the branch ref; the action may already have committed changes.
+          if [ -n "$(git status --porcelain -- "$DATABASE" "$SNAPSHOT")" ]; then
             git checkout -B "$BOT_BRANCH"
             git add -- "$DATABASE" "$SNAPSHOT"
             git commit -m "Sync the Vorobey hackerpolice matches"
           fi
-          # --force-with-lease only works if the remote ref is known locally;
-          # a fresh checkout has never seen the bot branch.
-          git fetch --quiet origin "$BOT_BRANCH" || true
-          git push --force-with-lease --set-upstream origin "$BOT_BRANCH"
+          if ! git rev-parse --verify --quiet "refs/heads/$BOT_BRANCH" > /dev/null; then
+            echo "::error::Nothing was committed to $BOT_BRANCH and no such branch exists - nothing to push."
+            exit 1
+          fi
+          # Fetch the bot ref explicitly and derive its lease; checkout fetches only the default branch.
+          expected=''
+          if git fetch --quiet origin "+refs/heads/$BOT_BRANCH:refs/remotes/origin/$BOT_BRANCH" 2>/dev/null; then
+            expected=$(git rev-parse --verify "refs/remotes/origin/$BOT_BRANCH")
+          fi
+          # An empty lease requires the remote branch to be absent, so failed fetches cannot authorize overwrites.
+          git push --force-with-lease="refs/heads/$BOT_BRANCH:$expected" --set-upstream origin "$BOT_BRANCH"
 
-          compare_url="https://github.com/${{ github.repository }}/compare/$BASE_BRANCH...$BOT_BRANCH?expand=1"
+          compare_url="https://github.com/$REPOSITORY/compare/$BASE_BRANCH...$BOT_BRANCH?expand=1"
           {
             echo ""
             echo "### Pull request could not be created automatically"
@@ -173,7 +256,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit directly to the default branch
-        if: steps.sync.outputs.changed == 'true' && env.MODE == 'commit'
+        id: direct_commit
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed == 'true' && env.MODE == 'commit'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -183,5 +267,22 @@ jobs:
           git push
 
       - name: Nothing to do
-        if: steps.sync.outputs.changed != 'true'
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.changed != 'true'
         run: echo "Nothing to publish (no database or snapshot changes, or this was a dry run)."
+
+      - name: Close a stale bot pull request
+        # A later sync can stale an unmerged bot PR; merging it could undo newer upstream state or manual fixes.
+        if: steps.sync.outcome == 'success' && env.DRY_RUN_INPUT != 'true' && (steps.sync.outputs.changed != 'true' || (env.MODE == 'commit' && steps.direct_commit.outcome == 'success'))
+        # Keep cleanup best-effort; permission failures must not fail a successful sync.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN || github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          numbers=$(gh pr list --repo "$REPOSITORY" --head "$BOT_BRANCH" --state open --json number --jq '.[].number')
+          for number in $numbers; do
+            gh pr close "$number" --repo "$REPOSITORY" --delete-branch \
+              --comment "Closing: the latest successful sync superseded this pull request. A new one is opened automatically the next time the list changes."
+            echo "Closed stale bot pull request #$number." >> "$GITHUB_STEP_SUMMARY"
+          done
