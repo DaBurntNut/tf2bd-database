@@ -787,9 +787,10 @@ def validate(database: PlayerList) -> ValidationResult:
         steamid = player.get("steamid")
         canonical = normalize_steamid(steamid)
         if canonical is None:
-            # Quote and bound untrusted values before logging.
-            result.add_error(f"players[{position}] has an unusable steamid: {_shown(steamid)}")
+            # Quote and bound untrusted values before logging. Build the preview once:
+            # it redacts and escapes a value that can be as long as the file allows.
             shown = _shown(steamid)
+            result.add_error(f"players[{position}] has an unusable steamid: {shown}")
         else:
             shown = canonical
             if canonical in seen:

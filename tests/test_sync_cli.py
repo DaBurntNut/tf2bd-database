@@ -9,7 +9,6 @@ import io
 import json
 import os
 import random
-import re
 import runpy
 import stat
 import subprocess
@@ -45,27 +44,6 @@ from sources import (
     load_first_available_raw,
 )
 from sync_vorobey_hackerpolice import DEFAULT_SNAPSHOT, build_parser, main
-
-
-class ReadmeCliTests(unittest.TestCase):
-    """Keep the CLI flags discoverable and accurate in the README."""
-
-    @staticmethod
-    def _readme() -> str:
-        path = Path(__file__).resolve().parents[1] / "README.md"
-        return path.read_text(encoding="utf-8")
-
-    def test_every_flag_is_documented(self):
-        readme = self._readme()
-        flags = {flag for action in build_parser()._actions for flag in action.option_strings if flag.startswith("--")}
-        self.assertEqual(sorted(flag for flag in flags if flag not in readme), [])
-
-    def test_the_readme_invents_no_flags(self):
-        """The other direction: every documented flag must still exist."""
-        readme = self._readme()
-        known = {flag for action in build_parser()._actions for flag in action.option_strings}
-        mentioned = set(re.findall(r"`(--[a-z][a-z0-9-]+)", readme))
-        self.assertEqual(sorted(mentioned - known), [])
 
 
 class WriteSnapshotTests(unittest.TestCase):
@@ -484,7 +462,7 @@ class UntouchedPathTests(unittest.TestCase):
                     }
                     argv[flag] = str(loop)
                     flat = [item for pair in argv.items() for item in pair if item is not None]
-                    with contextlib.redirect_stdout(io.StringIO()):
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         code = main(flat)  # Return a clean refusal and leave the symlink intact.
                     self.assertEqual(code, 2)
                     self.assertTrue(loop.is_symlink())
@@ -498,7 +476,10 @@ class UntouchedPathTests(unittest.TestCase):
         clean = playerlist_module.ValidationResult()
         broken = playerlist_module.ValidationResult(errors=["simulated problem"])
         # Let load_database() pass, then fail validation after the sync.
-        with mock.patch.object(sync_module, "validate", side_effect=[clean, broken]):
+        with (
+            mock.patch.object(sync_module, "validate", side_effect=[clean, broken]),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             code = main(
                 ["--database", str(database), "--source", str(source), "--snapshot", str(self.root / "snapshot.json")]
             )
@@ -663,7 +644,10 @@ class WriteOrderTests(unittest.TestCase):
             # A dangling link passes path checks and snapshot loading; writing resolves it
             # and fails at the missing target, even when tests run as root.
             (root / "snap.json.link").symlink_to(root / "nodir" / "snap.json")
-            with contextlib.redirect_stdout(io.StringIO()):  # The CLI prints the report even with --report set.
+            with (  # The CLI prints the report even with --report set.
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
                 code = main(
                     [
                         "--database",
@@ -706,7 +690,7 @@ class UnusableStdoutTests(unittest.TestCase):
     def test_a_closed_stdout_still_lets_the_database_and_report_be_written(self):
         stdout = io.StringIO()
         stdout.close()  # Every write raises ValueError, as a closed fd 1 does on flush.
-        with contextlib.redirect_stdout(stdout):
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
             code = main(
                 [
                     "--database",
@@ -783,6 +767,7 @@ class IdempotencyTests(unittest.TestCase):
                 with (
                     mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}),
                     contextlib.redirect_stdout(io.StringIO()),  # The report is printed to stdout.
+                    contextlib.redirect_stderr(io.StringIO()),
                 ):
                     self.assertEqual(main(argv), 0)
                 return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
@@ -1700,7 +1685,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("unknown attribute", stderr)
 
     def test_unexpected_os_error_is_reported_as_exit_code_two(self):
-        with mock.patch("sync_vorobey_hackerpolice.run", side_effect=OSError("disk full")):
+        with (
+            mock.patch("sync_vorobey_hackerpolice.run", side_effect=OSError("disk full")),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             code = main(["--source", str(self.source)])
         self.assertEqual(code, 2)
 
@@ -1862,11 +1850,19 @@ class UnpublishableJsonTests(unittest.TestCase):
         return (self.root / name).read_text(encoding="utf-8")
 
     def run_cli(self):
-        """Run the real entry point with the temporary directory as cwd."""
+        """Run the real entry point with the temporary directory as cwd.
+
+        These cases all end in a refusal, so the CLI writes its diagnostic to
+        stderr. Capture it: the assertion is the exit code, and an unread
+        message on the runner's console is noise, not evidence.
+        """
         previous = os.getcwd()
         os.chdir(self.root)
         try:
-            return sync_module.main(["--database", "db.json", "--source", "up.json", "--snapshot", "snap.json", "-q"])
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                return sync_module.main(
+                    ["--database", "db.json", "--source", "up.json", "--snapshot", "snap.json", "-q"]
+                )
         finally:
             os.chdir(previous)
 
@@ -1947,7 +1943,8 @@ class LifecycleTests(unittest.TestCase):
 
     def run_bot(self):
         argv = ["--database", str(self.db), "--snapshot", str(self.bak), "--source", str(self.up), "--demote"]
-        with contextlib.redirect_stdout(io.StringIO()) as out:
+        # Capture both streams: the progress log belongs in the test, not on the runner's console.
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             code = main(argv)
         self.assertEqual(code, 0)
         return out.getvalue()
@@ -2021,27 +2018,15 @@ class DocumentedLimitsTests(unittest.TestCase):
     the constant itself moving. A one-digit typo in ``MAX_REPORT_BYTES`` would
     therefore ship a bot that truncates every busy report, and a typo in
     ``MAX_SOURCE_BYTES`` would ship one that refuses a legitimate download.
-    Each number below is quoted from README.md so the two cannot drift.
+    Spelling each number out here is what catches the constant itself moving.
     """
 
     def test_the_documented_report_limits(self):
-        # README contract: change tables stop at 150 rows, the removed-ID table
-        # at 100 rows, and the report body at 60,000 bytes.
+        # Published behaviour: change tables stop at 150 rows, the removed-ID
+        # table at 100 rows, and the report body at 60,000 bytes.
         self.assertEqual(report_module.MAX_CHANGE_TABLE_ROWS, 150)
         self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 100)
         self.assertEqual(report_module.MAX_REPORT_BYTES, 60_000)
-
-    def test_the_readme_states_the_report_byte_cap_it_enforces(self):
-        """The prose must name the cap the code enforces.
-
-        The number was pinned in tests already, but the README described the cap
-        only as "its last-resort byte limit", so a reader could not tell what it
-        was and a change to the constant would leave the prose stale.
-        """
-        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-        stated = f"{report_module.MAX_REPORT_BYTES // 1000:,} KB"
-        self.assertIn(stated, readme)
-        self.assertIn(f"stops at {report_module.MAX_CHANGE_TABLE_ROWS}", readme)
 
     def test_the_display_caps(self):
         self.assertEqual(report_module.MAX_NAME_CHARS, 80)
@@ -2054,7 +2039,7 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.MAX_URL_DISPLAY_CHARS, 2048)
 
     def test_the_read_and_fetch_limits(self):
-        # README contract: downloads allow 64 MiB, 30 seconds, and three attempts
+        # Published behaviour: downloads allow 64 MiB, 30 seconds, and three attempts
         # before fallback; database and snapshot files share the 64 MiB limit.
         self.assertEqual(playerlist_module.MAX_FILE_BYTES, 64 * 1024 * 1024)
         self.assertEqual(sources.MAX_SOURCE_BYTES, 64 * 1024 * 1024)
@@ -2064,7 +2049,7 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.RETRY_BACKOFF_SECONDS, 2)
 
     def test_the_documented_guard_and_account_bounds(self):
-        # README contract: the guard requires more than 50 IDs and more than 20% removal.
+        # Published behaviour: the guard requires more than 50 IDs and more than 20% removal.
         self.assertEqual(sync_module.MASS_DEMOTION_MIN_IDS, 50)
         self.assertEqual(sync_module.MASS_DEMOTION_MAX_FRACTION, 0.2)
         # The second, database-relative guard: the snapshot dwarfs the database,

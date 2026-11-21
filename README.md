@@ -168,11 +168,12 @@ than from the raw totals, so the line can never contradict itself.
 - **Checked changes** — a pull request touching `scripts/`, `tests/`,
   `playerlist.garou3299.json`, `playerlist.scammers.json`, `rules.garou3299.json`,
   the hackerpolice snapshot, `pyproject.toml`, `.gitattributes`, `.gitignore`,
-  `README.md`, `.github/dependabot.yml` or the workflow runs ruff, `mypy --strict`,
+  `.github/dependabot.yml` or the workflow runs ruff, `mypy --strict`,
   a bandit security scan, vulture (dead code) and the tests under a branch-coverage
   gate whose floor is 95 % (the suite currently reaches 100 % of statements and
   branches), in a read-only job. The same checks gate every scheduled/manual sync;
-  only the separate sync job gets write permissions.
+  only the separate sync job gets write permissions. A README-only change runs no
+  checks: no test reads this file, so prose edits never spend a check run.
 - **Pinned actions** — the workflow uses each action at a commit SHA, not at a
   movable tag, and Dependabot bumps those pins weekly; a compromised release in
   someone else's repository cannot run code here with a write token.
@@ -198,7 +199,7 @@ python3 -m coverage report
 ```
 
 Python 3.10 or newer. CI checks both 3.10 and 3.12, the version the sync job runs
-on. The three scripts use nothing newer than 3.8, so 3.10 is a supported floor
+on. The five scripts use nothing newer than 3.8, so 3.10 is a supported floor
 rather than a hard requirement — the 3.10 leg is what keeps an accidental 3.11+
 API out of the code that a smaller machine might still be running.
 

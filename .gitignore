@@ -3,6 +3,9 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .coverage
+# `coverage html`/`xml` write these next to .coverage when a run is inspected locally.
+htmlcov/
+coverage.xml
 .pyright_cache/
 
 # Prevent abandoned atomic-write temporaries from being staged.
