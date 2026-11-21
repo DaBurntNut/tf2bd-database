@@ -549,6 +549,25 @@ class RepositoryDataTests(unittest.TestCase):
             )
             return result.stdout.strip()
 
+        def run_lease_script(directory: Path, branch_name: str) -> None:
+            """Execute the workflow's push block, quietly.
+
+            Without capture, git writes its push and fetch progress straight to
+            the test runner's console, so a passing suite prints remote URLs and
+            branch names. Capturing it also puts the real output in the failure
+            message, which ``check=True`` alone does not do.
+            """
+            result = subprocess.run(
+                ["bash", "-c", lease_script],
+                cwd=directory,
+                env={**os.environ, "BOT_BRANCH": branch_name},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             remote = root / "remote.git"
@@ -590,13 +609,7 @@ class RepositoryDataTests(unittest.TestCase):
             (checkout / "file.txt").write_text("bot update\n", encoding="utf-8")
             git(checkout, "add", "file.txt")
             git(checkout, "commit", "-m", "bot update")
-            subprocess.run(
-                ["bash", "-c", lease_script],
-                cwd=checkout,
-                env={**os.environ, "BOT_BRANCH": branch},
-                check=True,
-                timeout=30,
-            )
+            run_lease_script(checkout, branch)
             self.assertEqual(
                 git(root, "--git-dir", str(remote), "rev-parse", f"refs/heads/{branch}"),
                 git(checkout, "rev-parse", "HEAD"),
@@ -618,13 +631,7 @@ class RepositoryDataTests(unittest.TestCase):
             (fresh / "file.txt").write_text("first bot run\n", encoding="utf-8")
             git(fresh, "add", "file.txt")
             git(fresh, "commit", "-m", "first bot run")
-            subprocess.run(
-                ["bash", "-c", lease_script],
-                cwd=fresh,
-                env={**os.environ, "BOT_BRANCH": branch},
-                check=True,
-                timeout=30,
-            )
+            run_lease_script(fresh, branch)
             self.assertEqual(
                 git(root, "--git-dir", str(remote), "rev-parse", f"refs/heads/{branch}"),
                 git(fresh, "rev-parse", "HEAD"),

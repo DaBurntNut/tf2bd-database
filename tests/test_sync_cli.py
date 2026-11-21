@@ -462,7 +462,7 @@ class UntouchedPathTests(unittest.TestCase):
                     }
                     argv[flag] = str(loop)
                     flat = [item for pair in argv.items() for item in pair if item is not None]
-                    with contextlib.redirect_stdout(io.StringIO()):
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         code = main(flat)  # Return a clean refusal and leave the symlink intact.
                     self.assertEqual(code, 2)
                     self.assertTrue(loop.is_symlink())
@@ -476,7 +476,10 @@ class UntouchedPathTests(unittest.TestCase):
         clean = playerlist_module.ValidationResult()
         broken = playerlist_module.ValidationResult(errors=["simulated problem"])
         # Let load_database() pass, then fail validation after the sync.
-        with mock.patch.object(sync_module, "validate", side_effect=[clean, broken]):
+        with (
+            mock.patch.object(sync_module, "validate", side_effect=[clean, broken]),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             code = main(
                 ["--database", str(database), "--source", str(source), "--snapshot", str(self.root / "snapshot.json")]
             )
@@ -641,7 +644,10 @@ class WriteOrderTests(unittest.TestCase):
             # A dangling link passes path checks and snapshot loading; writing resolves it
             # and fails at the missing target, even when tests run as root.
             (root / "snap.json.link").symlink_to(root / "nodir" / "snap.json")
-            with contextlib.redirect_stdout(io.StringIO()):  # The CLI prints the report even with --report set.
+            with (  # The CLI prints the report even with --report set.
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
                 code = main(
                     [
                         "--database",
@@ -684,7 +690,7 @@ class UnusableStdoutTests(unittest.TestCase):
     def test_a_closed_stdout_still_lets_the_database_and_report_be_written(self):
         stdout = io.StringIO()
         stdout.close()  # Every write raises ValueError, as a closed fd 1 does on flush.
-        with contextlib.redirect_stdout(stdout):
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
             code = main(
                 [
                     "--database",
@@ -761,6 +767,7 @@ class IdempotencyTests(unittest.TestCase):
                 with (
                     mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}),
                     contextlib.redirect_stdout(io.StringIO()),  # The report is printed to stdout.
+                    contextlib.redirect_stderr(io.StringIO()),
                 ):
                     self.assertEqual(main(argv), 0)
                 return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
@@ -1678,7 +1685,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("unknown attribute", stderr)
 
     def test_unexpected_os_error_is_reported_as_exit_code_two(self):
-        with mock.patch("sync_vorobey_hackerpolice.run", side_effect=OSError("disk full")):
+        with (
+            mock.patch("sync_vorobey_hackerpolice.run", side_effect=OSError("disk full")),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             code = main(["--source", str(self.source)])
         self.assertEqual(code, 2)
 
@@ -1840,11 +1850,19 @@ class UnpublishableJsonTests(unittest.TestCase):
         return (self.root / name).read_text(encoding="utf-8")
 
     def run_cli(self):
-        """Run the real entry point with the temporary directory as cwd."""
+        """Run the real entry point with the temporary directory as cwd.
+
+        These cases all end in a refusal, so the CLI writes its diagnostic to
+        stderr. Capture it: the assertion is the exit code, and an unread
+        message on the runner's console is noise, not evidence.
+        """
         previous = os.getcwd()
         os.chdir(self.root)
         try:
-            return sync_module.main(["--database", "db.json", "--source", "up.json", "--snapshot", "snap.json", "-q"])
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                return sync_module.main(
+                    ["--database", "db.json", "--source", "up.json", "--snapshot", "snap.json", "-q"]
+                )
         finally:
             os.chdir(previous)
 
@@ -1925,7 +1943,8 @@ class LifecycleTests(unittest.TestCase):
 
     def run_bot(self):
         argv = ["--database", str(self.db), "--snapshot", str(self.bak), "--source", str(self.up), "--demote"]
-        with contextlib.redirect_stdout(io.StringIO()) as out:
+        # Capture both streams: the progress log belongs in the test, not on the runner's console.
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             code = main(argv)
         self.assertEqual(code, 0)
         return out.getvalue()
