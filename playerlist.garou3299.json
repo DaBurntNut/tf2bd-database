@@ -3373,6 +3373,16 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "Volta",
+				"time": 1795366886
+			},
+			"steamid": "[U:1:1035397417]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -3912,7 +3922,7 @@
 			],
 			"last_seen": {
 				"player_name": "76561199111784086",
-				"time": 1792261385
+				"time": 1795366899
 			},
 			"proof": [
 				"[auto] automatically marked: Racist | reason: \"gay nigger\"",
@@ -3922,7 +3932,8 @@
 				"[auto] automatically marked: Racist | reason: \"nigger\"",
 				"[auto] automatically marked: Racist | reason: \"I rape niggas but i a niga always kill me\"",
 				"[auto] automatically marked: Racist | reason: \"rodey gay nigger wtf you want\"",
-				"[auto] automatically marked: Racist | reason: \"gay niggers\""
+				"[auto] automatically marked: Racist | reason: \"gay niggers\"",
+				"[auto] automatically marked: Racist | reason: \"any chinese nigger here\""
 			],
 			"steamid": "[U:1:1151518358]"
 		},
@@ -4824,6 +4835,19 @@
 				"Silent Aim, ESP & Bhop"
 			],
 			"steamid": "[U:1:1508748809]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "BROSteDd",
+				"time": 1795371249
+			},
+			"proof": [
+				"Top scoring as Sniper with ~200 ping, fake lag?"
+			],
+			"steamid": "[U:1:1510052831]"
 		},
 		{
 			"attributes": [
