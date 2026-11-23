@@ -408,7 +408,7 @@ class ReportTests(unittest.TestCase):
             )
         )
         self.assertIn(
-            "- Snapshot diff: **12 new SteamIDs added**, **3 SteamIDs removed** (100 → 109 entries; net +9)",
+            "- Snapshot diff: **12 new SteamIDs added**, **3 SteamIDs removed** (100 → 109 entries; net +9 distinct SteamIDs)",
             report,
         )
 
@@ -416,7 +416,9 @@ class ReportTests(unittest.TestCase):
         report = render_report(
             self.info(source_total=99, previous_source_total=100, added_to_source=1, removed_from_source=2)
         )
-        self.assertIn("**1 new SteamID added**, **2 SteamIDs removed** (100 → 99 entries; net -1)", report)
+        self.assertIn(
+            "**1 new SteamID added**, **2 SteamIDs removed** (100 → 99 entries; net -1 distinct SteamIDs)", report
+        )
 
     def test_the_net_change_agrees_with_the_distinct_ids_beside_it(self):
         """Raw row totals are provenance; the net must follow the ID counts.
@@ -449,7 +451,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Vorobey hackerpolice list (13,542 entries)", report)  # Raw row totals remain exact.
         self.assertIn("- Previous snapshot: 12,345 entries", report)
         self.assertIn("**1,200 new SteamIDs added**", report)
-        self.assertIn("(12,345 → 13,542 entries; net +1,197)", report)  # 1,200 added - 3 removed
+        self.assertIn("(12,345 → 13,542 entries; net +1,197 distinct SteamIDs)", report)  # 1,200 added - 3 removed
         self.assertIn("**1 SteamID removed from the Vorobey hackerpolice list", report)
 
     def test_fetch_url_cannot_smuggle_html_into_the_report(self):
