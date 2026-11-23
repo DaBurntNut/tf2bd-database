@@ -689,6 +689,10 @@ class RunInfo:
     changes: tuple[Change, ...] = ()
     # Snapshot provenance and reasons a requested demotion was skipped.
     previous_source_total: int | None = None  # Raw entries in the previous snapshot.
+    # Distinct usable IDs either side of the diff. The snapshot-diff arrow counts
+    # these, not the raw entry totals, so its subtraction always matches the net.
+    source_ids: int = 0
+    previous_source_ids: int = 0
     added_to_source: int = 0  # Distinct usable IDs added upstream.
     removed_from_source: int = 0  # Distinct usable IDs removed upstream.
     # IDs missing upstream since the previous snapshot, even when demotion is skipped.
@@ -721,18 +725,17 @@ class RunInfo:
 
 
 def _net_change_text(added: int, removed: int) -> str:
-    """Describe the net change in DISTINCT SteamIDs.
+    """Describe the net change in distinct SteamIDs.
 
-    The entry totals either side of it count raw rows (including duplicates),
-    while added/removed count distinct usable IDs -- so deriving the net from
-    the two raw totals made the line contradict itself whenever the upstream
-    file contained a duplicate row or an unusable one.
+    The totals printed beside this count distinct usable SteamIDs on both sides,
+    so the subtraction a reader performs always matches this net: for sets,
+    ``len(current) - len(previous)`` is exactly ``added - removed``.
     """
     delta = added - removed
-    # Name the unit. The entry totals printed beside this are raw rows, so a bare
-    # "net +13" next to "6,223 -> 6,237 entries" reads like arithmetic that does
-    # not add up whenever a row is a duplicate or unusable.
-    return "no net change" if delta == 0 else f"net {delta:+,d} distinct SteamIDs"
+    if delta == 0:
+        return "no net change"
+    # Agree with the singular/plural of the counts beside it: "net +1 distinct SteamID".
+    return f"net {delta:+,d} distinct {plural(abs(delta), 'SteamID', 'SteamIDs')}"
 
 
 def _header_lines(info: RunInfo) -> list[str]:
@@ -765,7 +768,7 @@ def _header_lines(info: RunInfo) -> list[str]:
             f"- Snapshot diff: **{_count(info.added_to_source)} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
             f"**{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} removed** "
-            f"({_count(info.previous_source_total)} → {_count(info.source_total)} entries; "
+            f"({_count(info.previous_source_ids)} → {_count(info.source_ids)} SteamIDs; "
             f"{_net_change_text(info.added_to_source, info.removed_from_source)})"
         )
     elif info.snapshot_changed:

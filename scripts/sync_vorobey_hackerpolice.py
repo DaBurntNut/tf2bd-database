@@ -654,6 +654,8 @@ def run(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             changes=tuple(changes),
             previous_source_total=previous_index.total if previous_index is not None else None,
+            source_ids=len(index.by_steamid),
+            previous_source_ids=len(previous_index.by_steamid) if previous_index is not None else 0,
             added_to_source=added_count,
             removed_from_source=removed_count,
             removed_upstream=tuple(removed_upstream),

@@ -1168,11 +1168,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(players["[U:1:500]"]["attributes"], ["cheater"])
         self.assertIn("Previous snapshot: 2 entries; 2 SteamIDs removed upstream", stdout)
         self.assertIn(
-            "- Snapshot diff: **2 new SteamIDs added**, **2 SteamIDs removed** (2 → 2 entries; no net change)",
+            "- Snapshot diff: **2 new SteamIDs added**, **2 SteamIDs removed** (2 → 2 SteamIDs; no net change)",
             stdout,
         )
 
-    def test_entry_totals_use_raw_rows_when_snapshot_contains_duplicate_ids(self):
+    def test_raw_rows_stay_in_provenance_and_the_diff_arrow_counts_distinct_ids(self):
         self.write_snapshot_fixture(
             hackerpolice_entry("[U:1:100]"),
             hackerpolice_entry("[U:1:100]"),
@@ -1181,9 +1181,10 @@ class CliTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli("--source", str(self.source))
         self.assertEqual(code, 0, stderr)
         self.assertIn("Previous snapshot: 3 entries; 0 SteamIDs removed upstream", stdout)
-        # The net is derived from distinct-ID additions/removals, so it cannot
-        # contradict the counts printed next to it when a duplicate row exists.
-        self.assertIn("(3 → 2 entries; no net change)", stdout)
+        # The arrow counts distinct SteamIDs, so it cannot contradict the
+        # added/removed counts beside it when a duplicate row exists: the two
+        # rows for [U:1:100] are one SteamID, so nothing changed at all.
+        self.assertIn("(2 → 2 SteamIDs; no net change)", stdout)
 
     def test_report_lists_every_removed_steamid_with_its_permalink(self):
         """Every ID gone from the list since the snapshot appears in the

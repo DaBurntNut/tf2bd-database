@@ -402,36 +402,69 @@ class ReportTests(unittest.TestCase):
             self.info(
                 source_total=109,
                 previous_source_total=100,
+                source_ids=109,
+                previous_source_ids=100,
                 added_to_source=12,
                 removed_from_source=3,
                 snapshot_changed=True,
             )
         )
         self.assertIn(
-            "- Snapshot diff: **12 new SteamIDs added**, **3 SteamIDs removed** (100 → 109 entries; net +9 distinct SteamIDs)",
+            "- Snapshot diff: **12 new SteamIDs added**, **3 SteamIDs removed** (100 → 109 SteamIDs; net +9 distinct SteamIDs)",
             report,
         )
 
     def test_snapshot_diff_singular_and_negative_net(self):
         report = render_report(
-            self.info(source_total=99, previous_source_total=100, added_to_source=1, removed_from_source=2)
+            self.info(
+                source_total=99,
+                previous_source_total=100,
+                source_ids=99,
+                previous_source_ids=100,
+                added_to_source=1,
+                removed_from_source=2,
+            )
         )
         self.assertIn(
-            "**1 new SteamID added**, **2 SteamIDs removed** (100 → 99 entries; net -1 distinct SteamIDs)", report
+            "**1 new SteamID added**, **2 SteamIDs removed** (100 → 99 SteamIDs; net -1 distinct SteamID)", report
         )
 
     def test_the_net_change_agrees_with_the_distinct_ids_beside_it(self):
-        """Raw row totals are provenance; the net must follow the ID counts.
+        """The diff arrow counts distinct SteamIDs, so its subtraction holds.
 
-        Deriving the net from raw totals printed "1 added, 1 removed ... net -1"
-        when a duplicate row disappeared upstream: the counts and the total on
-        the same line contradicted each other.
+        Raw row totals stay in the provenance lines. Printing them inside the
+        diff made the line contradict itself whenever a row was a duplicate or
+        unusable: "1 added, 1 removed" beside "3 -> 2 entries" reads as net -1.
         """
         report = render_report(
-            self.info(source_total=2, previous_source_total=3, added_to_source=1, removed_from_source=1)
+            self.info(
+                source_total=2,
+                previous_source_total=3,
+                source_ids=2,
+                previous_source_ids=2,
+                added_to_source=1,
+                removed_from_source=1,
+            )
         )
         self.assertIn("**1 new SteamID added**, **1 SteamID removed**", report)
-        self.assertIn("(3 → 2 entries; no net change)", report)
+        self.assertIn("(2 → 2 SteamIDs; no net change)", report)
+        # The raw row total is still reported, just not inside the subtraction.
+        self.assertIn("- Previous snapshot: 3 entries", report)
+
+    def test_a_net_of_one_reads_as_a_singular_steamid(self):
+        """The net agrees with the singular/plural of the counts beside it."""
+        report = render_report(
+            self.info(
+                source_total=101,
+                previous_source_total=100,
+                source_ids=101,
+                previous_source_ids=100,
+                added_to_source=1,
+                removed_from_source=0,
+            )
+        )
+        self.assertIn("(100 → 101 SteamIDs; net +1 distinct SteamID)", report)
+        self.assertNotIn("net +1 distinct SteamIDs", report)
 
     def test_snapshot_diff_initial_snapshot_without_previous(self):
         report = render_report(self.info(added_to_source=10, snapshot_changed=True))
@@ -442,6 +475,8 @@ class ReportTests(unittest.TestCase):
             self.info(
                 source_total=13542,
                 previous_source_total=12345,
+                source_ids=13542,
+                previous_source_ids=12345,
                 added_to_source=1200,
                 removed_from_source=3,
                 removed_upstream=("[U:1:1]",),
@@ -451,7 +486,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Vorobey hackerpolice list (13,542 entries)", report)  # Raw row totals remain exact.
         self.assertIn("- Previous snapshot: 12,345 entries", report)
         self.assertIn("**1,200 new SteamIDs added**", report)
-        self.assertIn("(12,345 → 13,542 entries; net +1,197 distinct SteamIDs)", report)  # 1,200 added - 3 removed
+        self.assertIn("(12,345 → 13,542 SteamIDs; net +1,197 distinct SteamIDs)", report)  # 1,200 added - 3 removed
         self.assertIn("**1 SteamID removed from the Vorobey hackerpolice list", report)
 
     def test_fetch_url_cannot_smuggle_html_into_the_report(self):
