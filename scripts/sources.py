@@ -358,8 +358,14 @@ _QUERY_PARAM_IN_TEXT = re.compile(
     r"(?P<value>[^&;#]*)"
 )
 # Catch userinfo split by line breaks; urlsplit ignores raw newlines.
+# The run before the whitespace must exclude whitespace itself. Spelling it
+# ``[^/@?#<>"'`]*\s+[^/@?#<>"'`]*@`` instead lets whitespace match either the
+# class or the ``\s+``, so a run of blanks with no closing ``@`` costs cubic
+# time -- 2,000 characters took 42 seconds, and ``proof`` strings arrive from
+# the upstream list. Anchoring on the first whitespace keeps the matched span
+# identical while leaving only one way to divide the text.
 _MULTILINE_USERINFO_IN_TEXT = re.compile(
-    r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//)[^/@?#<>\"'`]*\s+[^/@?#<>\"'`]*@",
+    r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//)[^/@?#<>\"'`\s]*\s[^/@?#<>\"'`]*@",
     re.IGNORECASE | re.ASCII,
 )
 
@@ -570,17 +576,29 @@ def redact_url(url: str) -> str:
     return _redact_url(url, 0)
 
 
-def _redact_url_occurrence(match: re.Match[str], depth: int) -> str:
-    """Redact one URL embedded in prose, preserving sentence punctuation."""
-    value = match.group()
+def _prose_tail_start(value: str, punctuation: str) -> int:
+    """Return where the trailing prose begins, so a URL is not redacted with it.
+
+    Trailing sentence punctuation, and closing brackets that were never opened
+    inside the match, belong to the surrounding sentence rather than the URL.
+    ``punctuation`` differs by caller: a semicolon ends a sentence in prose but
+    separates parameters inside a query string, so only the prose caller trims it.
+    """
     end = len(value)
-    while end and value[end - 1] in ".,;:!?":
+    while end and value[end - 1] in punctuation:
         end -= 1
     for closer, opener in ((")", "("), ("]", "["), ("}", "{")):
         balance = value[:end].count(closer) - value[:end].count(opener)
         while end and value[end - 1] == closer and balance > 0:
             end -= 1
             balance -= 1
+    return end
+
+
+def _redact_url_occurrence(match: re.Match[str], depth: int) -> str:
+    """Redact one URL embedded in prose, preserving sentence punctuation."""
+    value = match.group()
+    end = _prose_tail_start(value, ".,;:!?")
     return _redact_url(value[:end], depth) + value[end:]
 
 
@@ -600,14 +618,8 @@ def _redact_text_query_parameter(match: re.Match[str], depth: int) -> str:
 
     # Redact parameter names that contain an encoded delimiter or secret.
     safe_name = raw_name if _SAFE_QUERY_NAME.fullmatch(raw_name) else "REDACTED"
-    end = len(value)
-    while end and value[end - 1] in ".,:!?":
-        end -= 1
-    for closer, opener in ((")", "("), ("]", "["), ("}", "{")):
-        balance = value[:end].count(closer) - value[:end].count(opener)
-        while end and value[end - 1] == closer and balance > 0:
-            end -= 1
-            balance -= 1
+    # A semicolon separates parameters here, so it stays with the value.
+    end = _prose_tail_start(value, ".,:!?")
     return f"{match.group('separator')}{safe_name}=REDACTED{value[end:]}"
 
 

@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -752,6 +753,41 @@ class SourceFetchTests(unittest.TestCase):
         shown = sources.redact_urls_in_text(split_username)
         self.assertNotIn("USERNAME_PASSWORD", shown)
         self.assertIn("https://example.invalid/watch", shown)
+
+    def test_redacting_prose_stays_fast_on_blanks_that_never_close(self):
+        """A run of blanks with no closing ``@`` must not cost super-linear time.
+
+        The multiline-userinfo pattern looks for whitespace between ``//`` and
+        ``@``. If the runs on either side of that whitespace can match
+        whitespace themselves, every way of dividing a blank run is a separate
+        attempt, and text that never supplies the ``@`` makes the engine try
+        all of them: 2,000 characters took 42 seconds and the 4,096-character
+        inspection limit allowed roughly six minutes, per call.
+
+        ``proof`` strings come from the upstream list, are redacted one by one,
+        and are capped individually rather than in total, so a vandalised entry
+        could stall the scheduled run until the job timed out. The budget here
+        is thousands of times the fixed cost and hundreds of times smaller than
+        the old one, so it distinguishes the two without depending on the speed
+        of the machine.
+        """
+        longest = "http://" + " " * (sources._MAX_URL_PARSE_CHARS - 8)
+        self.assertLessEqual(len(longest), sources._MAX_URL_PARSE_CHARS)
+        started = time.monotonic()
+        # The full evidence budget: every row of the table, every link in a row.
+        for index in range(report_module.MAX_CHANGE_TABLE_ROWS * report_module.MAX_EVIDENCE_LINKS):
+            sources.redact_urls_in_text("http://" + " " * (report_module.MAX_EVIDENCE_LINK_CHARS - 13) + f"{index:06d}")
+        sources.redact_urls_in_text(longest)
+        self.assertLess(time.monotonic() - started, 30.0)
+
+    def test_blanks_before_userinfo_are_still_redacted(self):
+        """The faster pattern must still catch what the slower one caught."""
+        for blanks in (" ", "\n", "\t", "   ", " \n\t "):
+            with self.subTest(blanks=blanks):
+                shown = sources.redact_urls_in_text(f"Proof: https://user{blanks}name:BLANKS_SECRET@host.invalid/x")
+                self.assertNotIn("BLANKS_SECRET", shown)
+                self.assertNotIn("username", shown)
+                self.assertEqual("Proof: https://host.invalid/x", shown)
 
     def test_percent_encoded_controls_cannot_split_a_credential_in_prose(self):
         for separator in ("%0A", "%0D", "%09", "%20", "%E2%80%8B", "%250A"):
