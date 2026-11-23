@@ -757,8 +757,11 @@ def _header_lines(info: RunInfo) -> list[str]:
     if info.dry_run:
         lines.append("- Mode: **dry run** (no database or snapshot written)")
     if info.previous_source_total is not None:
-        # Entry totals are raw rows (duplicates included) for provenance only;
-        # added/removed, and the net derived from them, count DISTINCT IDs.
+        # The entry total below is raw rows (duplicates included) and is
+        # provenance only: a duplicated upstream row stays visible there.
+        # Everything in the diff line after it -- added, removed, BOTH sides
+        # of the arrow, and the net -- counts distinct usable SteamIDs, so the
+        # subtraction a reader performs on the arrow always matches the net.
         lines.append(
             f"- Previous snapshot: {_count(info.previous_source_total)} entries; "
             f"{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} "
