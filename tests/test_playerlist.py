@@ -252,7 +252,7 @@ class SortPlayersTests(unittest.TestCase):
         self.assertEqual([player["steamid"] for player in sort_players(players)], ["[U:1:7]", "bad", "worse"])
 
 
-class SerialisationTests(unittest.TestCase):
+class SerializationTests(unittest.TestCase):
     def test_round_trip_is_byte_identical(self):
         database = {
             "$schema": "https://example.invalid/schema.json",
@@ -350,7 +350,7 @@ class StrictJsonTests(unittest.TestCase):
         # Byte input is also accepted.
         self.assertEqual(strict_json_loads(b'{"players": []}'), {"players": []})
 
-    def test_serialising_a_non_finite_number_is_refused(self):
+    def test_serializing_a_non_finite_number_is_refused(self):
         """Belt and braces: even a future code path cannot write NaN to disk."""
         with self.assertRaises(ValueError):
             dumps({"players": [{"time": float("nan")}]})
@@ -506,13 +506,13 @@ class DisplayPathTests(unittest.TestCase):
         # Nested escapes deeper than the decode budget: no guess, but no plain
         # name either, so the value is left alone rather than mis-parsed.
         deep = "%" + "25" * (playerlist_module._MAX_DIAGNOSTIC_DECODE_DEPTH + 4) + "74oken"
-        self.assertIsNone(playerlist_module._normalised_field_name(deep))
+        self.assertIsNone(playerlist_module._normalized_field_name(deep))
         # And a name that decodes to something that is not a field name at all.
-        self.assertIsNone(playerlist_module._normalised_field_name("tok%3Aen"))
-        self.assertIsNone(playerlist_module._normalised_field_name("a/b"))
+        self.assertIsNone(playerlist_module._normalized_field_name("tok%3Aen"))
+        self.assertIsNone(playerlist_module._normalized_field_name("a/b"))
         # Plain names still decode to themselves.
-        self.assertEqual(playerlist_module._normalised_field_name("access_token"), "access_token")
-        self.assertEqual(playerlist_module._normalised_field_name("to%0Aken"), "token")
+        self.assertEqual(playerlist_module._normalized_field_name("access_token"), "access_token")
+        self.assertEqual(playerlist_module._normalized_field_name("to%0Aken"), "token")
 
     def test_an_encoded_benign_key_is_left_alone(self):
         for value in ("?q=hello", "?ref=ma%69n", "/a%20b/list.json"):

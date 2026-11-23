@@ -295,7 +295,7 @@ _PERCENT_ESCAPE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
 _SAFE_QUERY_NAME = re.compile(r"[A-Za-z0-9_.-]+", re.ASCII)
 
 
-def _normalised_query_name(name: str) -> str | None:
+def _normalized_query_name(name: str) -> str | None:
     """Remove invisible/control/separator characters before checking a key name.
 
     URL-decoding can reveal a tab, newline, zero-width character or other
@@ -320,7 +320,7 @@ def _normalised_query_name(name: str) -> str | None:
 
 def _has_sensitive_query_name(name: str) -> bool:
     """Fail closed if a parameter name is secret-looking or too encoded to inspect."""
-    normalized = _normalised_query_name(name)
+    normalized = _normalized_query_name(name)
     return normalized is None or _SECRET_QUERY_PARAM.search(normalized) is not None
 
 
@@ -343,7 +343,7 @@ def _html_unescape_bounded(value: str) -> str | None:
     return None if html.unescape(value) != value else value
 
 
-# Neutralise control and format characters in URLs before logging or publishing.
+# Neutralize control and format characters in URLs before logging or publishing.
 _URL_IN_TEXT = re.compile(r"(?:(?:[a-z][a-z0-9+.-]*:)?//)[^\s<>\"'`]+", re.IGNORECASE | re.ASCII)
 # A malformed HTTP URL can leave userinfo in its path instead of its authority.
 _HTTP_URL_WITH_AT_IN_TEXT = re.compile(r"https?:[^\s<>\"'`]*@[^\s<>\"'`]+", re.IGNORECASE | re.ASCII)
@@ -442,11 +442,11 @@ def _redact_nested_url(value: str, depth: int) -> str:
     return value if safe == candidate else safe
 
 
-def _sanitised_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tuple[str, str]], bool]:
+def _sanitized_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tuple[str, str]], bool]:
     """Replace secret values and redact nested URLs, reporting whether anything changed.
 
     Shared by the query string and the fragment, which carry the same kind of
-    parameter. Sanitised before ``urlencode``: one lone surrogate in a name or a
+    parameter. Sanitized before ``urlencode``: one lone surrogate in a name or a
     value would raise instead of redacting. The change flag lets ordinary URLs
     keep their original spelling and encoding untouched. ``depth`` bounds
     recursive URL nesting.
@@ -549,14 +549,14 @@ def _redact_url(url: str, depth: int) -> str:
 
     query = parts.query
     if query:
-        safe_items, changed = _sanitised_pairs(_query_pairs(query), depth)
+        safe_items, changed = _sanitized_pairs(_query_pairs(query), depth)
         if changed:
             query = urllib.parse.urlencode(safe_items)
 
     # Redact query-shaped fragments (for example, OAuth tokens) and nested URLs in ordinary anchors.
     fragment = parts.fragment
     if fragment and "=" in fragment:
-        safe_items, changed = _sanitised_pairs(_query_pairs(fragment), depth)
+        safe_items, changed = _sanitized_pairs(_query_pairs(fragment), depth)
         if changed:
             fragment = urllib.parse.urlencode(safe_items)
     if fragment:
@@ -705,7 +705,7 @@ def _redact_source(value: str) -> str:
     surrounding text.
     """
     if http_scheme(value):
-        # ``http_scheme`` recognises the http/https prefixes itself, including for a
+        # ``http_scheme`` recognizes the http/https prefixes itself, including for a
         # URL too long to parse, so no separate prefix test is needed here.
         return redact_url(value)
     return _one_line(_no_surrogates(redact_urls_in_text(value)))
@@ -1007,7 +1007,7 @@ def _resolve_indirect_document(document: dict[str, Any], source: str) -> tuple[d
 
 
 def _has_usable_steamids(document: dict[str, Any]) -> bool:
-    """True when at least one entry carries a SteamID this tool can normalise."""
+    """True when at least one entry carries a SteamID this tool can normalize."""
     players = document.get("players")
     if not isinstance(players, list):
         return False
@@ -1020,7 +1020,7 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
     The raw bytes are what gets written to the snapshot file, so the
     snapshot is an exact replica of the original upstream file -- same
     bytes, guaranteed by construction: nothing is ever decoded, parsed and
-    re-serialised on the way to the snapshot.
+    re-serialized on the way to the snapshot.
     """
     failures: list[str] = []
     for source in sources:

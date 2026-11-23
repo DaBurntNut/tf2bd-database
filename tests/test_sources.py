@@ -820,7 +820,7 @@ class SourceFetchTests(unittest.TestCase):
         inspection limit allowed roughly six minutes, per call.
 
         ``proof`` strings come from the upstream list, are redacted one by one,
-        and are capped individually rather than in total, so a vandalised entry
+        and are capped individually rather than in total, so a vandalized entry
         could stall the scheduled run until the job timed out. The budget here
         is thousands of times the fixed cost and hundreds of times smaller than
         the old one, so it distinguishes the two without depending on the speed
@@ -1160,7 +1160,7 @@ class SourceFetchTests(unittest.TestCase):
         self.assertIn("use https:// or a local path", str(caught.exception))
 
     def test_has_usable_steamids(self):
-        """The chain's accept test: one normalisable SteamID is enough."""
+        """The chain's accept test: one normalizable SteamID is enough."""
         self.assertFalse(sources._has_usable_steamids({}))
         self.assertFalse(sources._has_usable_steamids({"players": "nope"}))
         self.assertFalse(sources._has_usable_steamids({"players": []}))

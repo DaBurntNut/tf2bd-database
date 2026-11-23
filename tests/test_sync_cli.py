@@ -548,7 +548,7 @@ class ValidationLoggingTests(unittest.TestCase):
         self.assertIn("example.invalid", output)
         self.assertIn("REDACTED", output)
 
-    def test_omitted_validation_messages_are_summarised(self):
+    def test_omitted_validation_messages_are_summarized(self):
         result = playerlist_module.ValidationResult(
             errors=["invalid entry"],
             warnings=["unknown attribute"],
@@ -1380,7 +1380,7 @@ class CliTests(unittest.TestCase):
 
     def test_snapshot_is_an_exact_byte_for_byte_copy_of_the_source(self):
         """The snapshot must be the original file verbatim, not a
-        re-serialisation: this source deliberately uses odd key order,
+        re-serialization: this source deliberately uses odd key order,
         spacing, unescaped Unicode and no trailing newline, and the snapshot
         must come out identical byte for byte."""
         raw = (
@@ -1519,7 +1519,7 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("Traceback", stderr)
 
     def test_hand_appended_entry_is_resorted_and_reported(self):
-        """A file out of SteamID order is normalised without any tag changing.
+        """A file out of SteamID order is normalized without any tag changing.
 
         The old behaviour said "No database changes" while rewriting the file,
         so a reviewer saw a diff with a body denying it.
@@ -1544,8 +1544,8 @@ class CliTests(unittest.TestCase):
             [entry["steamid"] for entry in json.loads(self.database.read_text(encoding="utf-8"))["players"]],
             ["[U:1:100]", "[U:1:900]"],
         )
-        self.assertIn("**No player changes** (the database file was normalised", stdout)
-        self.assertIn("no tag changes: the file was normalised", stderr)
+        self.assertIn("**No player changes** (the database file was normalized", stdout)
+        self.assertIn("no tag changes: the file was normalized", stderr)
         self.assertNotIn("No changes.", stderr)
 
     def test_dry_run_never_writes_the_snapshot(self):

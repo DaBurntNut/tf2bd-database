@@ -126,7 +126,7 @@ REMOVED_HEADER = ("SteamID", "Profile Link", "SteamHistory")
 DEFAULT_SNAPSHOT_LABEL = "snapshot/playerlist.vorobey-hackerpolice.json"
 
 
-# Neutralise controls and line separators before displaying untrusted text.
+# Neutralize controls and line separators before displaying untrusted text.
 _TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 # Replace bidi controls so displayed text cannot reorder adjacent content.
@@ -136,7 +136,7 @@ _BIDI_CONTROLS = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 _MEANINGFUL_JOINERS = frozenset(("\u200c", "\u200d"))
 
 
-def _neutralise(value: str) -> str:
+def _neutralize(value: str) -> str:
     """Make a value safe to put in front of a human or a terminal."""
     value = redact_urls_in_text(value)
     value = _TEXT_CONTROLS.sub(" ", value)
@@ -189,7 +189,7 @@ def _text(value: str, *, allow_autolinks: bool = False) -> str:
     clickable URI.
     """
     if allow_autolinks:
-        return _neutralise(value).translate(_TEXT_ESCAPES)
+        return _neutralize(value).translate(_TEXT_ESCAPES)
     return _data_text(value, in_table=False)
 
 
@@ -207,7 +207,7 @@ def _code(value: str, *, in_table: bool = False) -> str:
     about (see ``_TABLE_CODE_ESCAPES``); running text does not need that, and
     escaping it there would display a Windows path as ``C:\\x``.
     """
-    text = _neutralise(value)
+    text = _neutralize(value)
     if in_table:
         text = text.translate(_TABLE_CODE_ESCAPES)
     longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
@@ -272,7 +272,7 @@ def _data_text(value: str, *, in_table: bool) -> str:
     ``_text(..., allow_autolinks=True)`` instead.
     """
     escaped = _CELL_ESCAPES if in_table else _TEXT_ESCAPES
-    value = _neutralise(value)
+    value = _neutralize(value)
     parts: list[str] = []
     position = 0
     for match in _AUTOLINK_IN_TEXT.finditer(value):
@@ -702,7 +702,7 @@ class RunInfo:
     snapshot_note: str | None = None
     # Include snapshot-only changes in the report status.
     snapshot_changed: bool = False
-    # Distinguish file-only normalisation from no database changes.
+    # Distinguish file-only normalization from no database changes.
     database_changed: bool = False
     # Report the snapshot path actually used.
     snapshot_path: Path | None = None
@@ -712,7 +712,7 @@ class RunInfo:
         """Friendly name of the database, derived from its file name.
 
         ``playerlist.garou3299.json`` becomes ``Garou3299``: the owner part of
-        the usual ``playerlist.<owner>.json`` shape, capitalised. Any other
+        the usual ``playerlist.<owner>.json`` shape, capitalized. Any other
         file name is used as it is (``mylist.json`` becomes ``Mylist``), so
         the headline always names the file the run actually writes and no
         repository name is hardcoded here.
@@ -928,8 +928,8 @@ def _render_body(
 
     if not promotions and not demotions:
         if info.database_changed:
-            # Describe file-only normalisation accurately instead of claiming no changes.
-            verb = "would be normalised" if info.dry_run else "was normalised"
+            # Describe file-only normalization accurately instead of claiming no changes.
+            verb = "would be normalized" if info.dry_run else "was normalized"
             detail = "entries re-sorted, formatting restored"
             if info.snapshot_changed:
                 refreshed = "would be refreshed" if info.dry_run else "was refreshed"

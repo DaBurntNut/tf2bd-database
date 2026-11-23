@@ -1,6 +1,6 @@
 """TF2BD playerlist file format helpers.
 
-Handles SteamID normalisation, reading/writing playerlist JSON, validation,
+Handles SteamID normalization, reading/writing playerlist JSON, validation,
 sorting and attribute ordering. Nothing here knows about the Vorobey
 hackerpolice list.
 """
@@ -97,13 +97,13 @@ _MAX_DIAGNOSTIC_DECODE_DEPTH = 8
 SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
 
-def _normalised_field_name(name: str) -> str | None:
+def _normalized_field_name(name: str) -> str | None:
     """Decode an obfuscated field name, or ``None`` if it is not a plain name.
 
     A query key can percent-encode its separator (``to%0Aken``), use HTML
     character references, or carry invisible characters a server strips before
     looking the credential up. Redaction has to be at least as permissive as
-    that normalisation, or the encoded spelling quietly walks past it.
+    that normalization, or the encoded spelling quietly walks past it.
     """
     decoded = name
     for _ in range(_MAX_DIAGNOSTIC_DECODE_DEPTH):
@@ -129,8 +129,8 @@ def _is_secret_field_name(name: str) -> bool:
         return False
     if _DIAGNOSTIC_SECRET_MARKER.search(name) is not None:
         return True
-    normalised = _normalised_field_name(name)
-    return normalised is not None and _DIAGNOSTIC_SECRET_MARKER.search(normalised) is not None
+    normalized = _normalized_field_name(name)
+    return normalized is not None and _DIAGNOSTIC_SECRET_MARKER.search(normalized) is not None
 
 
 def _redact_diagnostic_secret_pairs(value: str) -> str:
@@ -233,7 +233,7 @@ def _looks_like_credential(token: str, separator: str) -> bool:
     Both words are ordinary English (``Bearer of bad news``, ``Basic
     Instinct``), and this redactor runs over player names on their way into the
     published report, so redacting unconditionally would rename innocent
-    players in the output. A credential is recognised by its shape instead:
+    players in the output. A credential is recognized by its shape instead:
 
     - an explicit separator (``Bearer = ...``, ``Bearer: ...``) always wins,
       because prose does not write one there;
@@ -620,10 +620,10 @@ def order_attributes(attributes: Iterable[str]) -> list[str]:
 
 
 def dumps(database: PlayerList) -> str:
-    """Serialise a playerlist exactly like the committed file.
+    """Serialize a playerlist exactly like the committed file.
 
     Tab indentation, alphabetically sorted keys, ASCII escapes and a trailing
-    newline: re-serialising an untouched file produces byte-identical output.
+    newline: re-serializing an untouched file produces byte-identical output.
     """
     return json.dumps(database, indent="\t", sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
 

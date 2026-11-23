@@ -142,7 +142,7 @@ class ReportTests(unittest.TestCase):
 
         Two different names would then render identically in the review table,
         and Unicode tag characters are a known way to hide text outright. Only
-        the bidi set was neutralised, so these sailed into the pull request body.
+        the bidi set was neutralized, so these sailed into the pull request body.
         """
         for character in (
             "\u200b",  # Zero-width space.
@@ -175,7 +175,7 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("\x07", report)
         self.assertNotIn("\x08", report)
 
-    def test_c1_controls_in_names_are_neutralised(self):
+    def test_c1_controls_in_names_are_neutralized(self):
         """U+009B is the 8-bit CSI control, not a printable name character."""
         change = Change("[U:1:100]", "Good\u009b31mBAD", ("suspicious",), ("cheater",))
         report = render_report(self.info([change]))
@@ -373,14 +373,14 @@ class ReportTests(unittest.TestCase):
             "Proof link comes from the Vorobey hackerpolice list and is shown for review only.",
         )
 
-    def test_normalised_file_is_reported_instead_of_no_changes(self):
+    def test_normalized_file_is_reported_instead_of_no_changes(self):
         """The sync always writes entries in canonical form.
 
         A hand-appended entry is re-sorted without any tag changing: the file
         in the pull request differs, so the body must not claim "No changes".
         """
         report = render_report(self.info(database_changed=True))
-        self.assertIn("**No player changes** (the database file was normalised:", report)
+        self.assertIn("**No player changes** (the database file was normalized:", report)
         self.assertNotIn("**No changes.**", report)
         self.assertNotIn("**No database changes**", report)
 
@@ -389,9 +389,9 @@ class ReportTests(unittest.TestCase):
 
         # Dry-run wording must be conditional.
         dry = render_report(self.info(database_changed=True, snapshot_changed=True, dry_run=True))
-        self.assertIn("would be normalised", dry)
+        self.assertIn("would be normalized", dry)
         self.assertIn("the snapshot would be refreshed too", dry)
-        self.assertNotIn("was normalised", dry)
+        self.assertNotIn("was normalized", dry)
 
         # Snapshot-only runs retain their existing wording.
         snapshot_only = render_report(self.info(snapshot_changed=True))
@@ -467,7 +467,7 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("net +1 distinct SteamIDs", report)
 
     def test_every_count_in_the_header_agrees_with_its_own_noun(self):
-        """Randomised invariant testing found four counts bolted to a fixed noun.
+        """Randomized invariant testing found four counts bolted to a fixed noun.
 
         Each one is a number the upstream file decides, so each one can be 1 on
         a real day: a list that still holds a single row, a baseline captured
@@ -679,19 +679,19 @@ class ReportTests(unittest.TestCase):
 
         A player name is attacker-controlled, so one containing a line
         terminator must not be able to end a table row early and start a new
-        one. Everything that ends a line is neutralised, not just \n and \r.
+        one. Everything that ends a line is neutralized, not just \n and \r.
         """
         name = "evil\u2028name\u2029other\x85nel\nlf\rcr\x0bvt\x0cff"
         change = Change("[U:1:1]", name, ("suspicious",), ("cheater",))
         report = render_report(self.info([change]))
         for terminator in ("\u2028", "\u2029", "\x85", "\x0b", "\x0c"):
             self.assertNotIn(terminator, report)
-        # No unneutralised line terminator may add a split line.
+        # No unneutralized line terminator may add a split line.
         self.assertEqual(len(report.rstrip("\n").split("\n")), len(report.splitlines()))
         row = next(line for line in report.split("\n") if line.startswith("| `[U:1:1]`"))
         self.assertIn("evil name other nel lf cr vt ff", row)
 
-    def test_a_backslash_cannot_neutralise_the_escape_that_follows_it(self):
+    def test_a_backslash_cannot_neutralize_the_escape_that_follows_it(self):
         """``_text`` must escape the backslash before anything else.
 
         "a\\`b" used to become "a\\\\`b": the doubled backslash is a literal

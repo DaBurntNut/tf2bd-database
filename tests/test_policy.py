@@ -314,7 +314,7 @@ class PromoteTests(unittest.TestCase):
                 self.assertEqual(len(changes), 1)
                 self.assertNotIn("proof", database["players"][0])
 
-    def test_attribute_order_is_normalised(self):
+    def test_attribute_order_is_normalized(self):
         database, _ = self.promote([player("[U:1:300]", ["racist", "suspicious"])])
         self.assertEqual(database["players"][0]["attributes"], ["cheater", "racist"])
 

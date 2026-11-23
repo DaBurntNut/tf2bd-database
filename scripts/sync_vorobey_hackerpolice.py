@@ -10,7 +10,7 @@ only demoted if it is in the previous snapshot (``--snapshot``, default
 current list. Cheaters this database added manually -- never listed by
 Vorobey at all -- are therefore never touched. When it is safe and the
 upstream bytes differ, the snapshot is refreshed with the RAW BYTES of the
-current file (an exact replica, never decoded/re-serialised) alongside the
+current file (an exact replica, never decoded/re-serialized) alongside the
 database. Pull-request mode proposes both together; manual direct-commit mode
 publishes both together on the default branch.
 
@@ -322,10 +322,10 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
 
 
 def write_database(path: Path, rendered: str, original: str, *, dry_run: bool) -> bool:
-    """Write the serialised playerlist if it changed; returns whether it changed.
+    """Write the serialized playerlist if it changed; returns whether it changed.
 
     ``rendered`` is the text the caller already produced to decide what
-    changed, so the database is never serialised twice and what was compared
+    changed, so the database is never serialized twice and what was compared
     is exactly what is written.
     """
     modified = rendered != original
@@ -342,7 +342,7 @@ def write_snapshot(path: Path, raw: bytes, original: bytes | None, *, dry_run: b
     """Overwrite the snapshot with the source's RAW bytes; returns whether it changed.
 
     The bytes are written verbatim -- never decoded, parsed or
-    re-serialised -- so after an update the snapshot is an exact replica of
+    re-serialized -- so after an update the snapshot is an exact replica of
     the original upstream file, byte for byte.
     """
     changed = raw != original
@@ -361,9 +361,9 @@ def _log_outcome(modified: bool, changes: list[Change], path: Path, *, dry_run: 
         # Scope the no-change message to the database; the snapshot may still change.
         LOGGER.info("No database changes: nothing to update.")
     elif not changes:
-        # Report file-only normalisation separately from tag changes.
+        # Report file-only normalization separately from tag changes.
         LOGGER.info(
-            "%s %s (no tag changes: the file was normalised).",
+            "%s %s (no tag changes: the file was normalized).",
             "Dry run: would rewrite" if dry_run else "Rewrote",
             display_path(path),
         )
