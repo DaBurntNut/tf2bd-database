@@ -729,7 +729,10 @@ def _net_change_text(added: int, removed: int) -> str:
     file contained a duplicate row or an unusable one.
     """
     delta = added - removed
-    return "no net change" if delta == 0 else f"net {delta:+,d}"
+    # Name the unit. The entry totals printed beside this are raw rows, so a bare
+    # "net +13" next to "6,223 -> 6,237 entries" reads like arithmetic that does
+    # not add up whenever a row is a duplicate or unusable.
+    return "no net change" if delta == 0 else f"net {delta:+,d} distinct SteamIDs"
 
 
 def _header_lines(info: RunInfo) -> list[str]:

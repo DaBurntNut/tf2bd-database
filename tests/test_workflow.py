@@ -692,7 +692,12 @@ class RepositoryDataTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         index = snapshot[0] if snapshot is not None else None
         self.assertGreater(len(index.by_steamid), 1000)  # type: ignore[union-attr]
-        self.assertEqual(index.skipped, 0)  # type: ignore[union-attr]
+        # The snapshot is a byte-exact copy of the upstream file, so it inherits
+        # whatever upstream published -- including the occasional malformed row
+        # (a negative account id, say). Those are skipped and reported, and one
+        # of them must not fail the build. Still catch a wholesale format change
+        # by requiring unusable rows to stay under 1% of the file.
+        self.assertLess(index.skipped * 100, index.total)  # type: ignore[union-attr]
 
 
 if __name__ == "__main__":
