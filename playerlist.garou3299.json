@@ -211,7 +211,7 @@
 		},
 		{
 			"attributes": [
-				"suspicious"
+				"cheater"
 			],
 			"last_seen": {
 				"player_name": "oozn",
@@ -604,7 +604,7 @@
 		},
 		{
 			"attributes": [
-				"suspicious"
+				"cheater"
 			],
 			"last_seen": {
 				"player_name": "Nullus.",
@@ -966,7 +966,7 @@
 		},
 		{
 			"attributes": [
-				"suspicious"
+				"cheater"
 			],
 			"last_seen": {
 				"player_name": "\u3001",
@@ -1726,7 +1726,7 @@
 		},
 		{
 			"attributes": [
-				"suspicious"
+				"cheater"
 			],
 			"last_seen": {
 				"player_name": "GGSSUT",
@@ -2160,6 +2160,19 @@
 				"https://youtu.be/LjUpgYkxHfU?t=370"
 			],
 			"steamid": "[U:1:716635806]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "Justice Served Cold",
+				"time": 1795351712
+			},
+			"proof": [
+				"https://youtu.be/yWuX8HHreM4?t=71"
+			],
+			"steamid": "[U:1:717003124]"
 		},
 		{
 			"attributes": [
@@ -2912,15 +2925,12 @@
 		},
 		{
 			"attributes": [
-				"suspicious"
+				"cheater"
 			],
 			"last_seen": {
 				"player_name": "adaws1",
 				"time": 1787508676
 			},
-			"proof": [
-				"Very sus player. While spectating him, regardless of whether I was in third-person or first-person mode, he was always looking down while shooting or even just walking, like people do in CS2 HvH. This makes it very hard to determine whether he was using silent aim or ESP. He was also getting a lot of random crits. Need more evidence!"
-			],
 			"steamid": "[U:1:885680859]"
 		},
 		{
@@ -3363,6 +3373,16 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "Volta",
+				"time": 1795366886
+			},
+			"steamid": "[U:1:1035397417]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -3613,6 +3633,16 @@
 				"time": 1790687936
 			},
 			"steamid": "[U:1:1086210706]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "Kips",
+				"time": 1795283146
+			},
+			"steamid": "[U:1:1089898688]"
 		},
 		{
 			"attributes": [
@@ -3892,7 +3922,7 @@
 			],
 			"last_seen": {
 				"player_name": "76561199111784086",
-				"time": 1792261385
+				"time": 1795366899
 			},
 			"proof": [
 				"[auto] automatically marked: Racist | reason: \"gay nigger\"",
@@ -3902,7 +3932,8 @@
 				"[auto] automatically marked: Racist | reason: \"nigger\"",
 				"[auto] automatically marked: Racist | reason: \"I rape niggas but i a niga always kill me\"",
 				"[auto] automatically marked: Racist | reason: \"rodey gay nigger wtf you want\"",
-				"[auto] automatically marked: Racist | reason: \"gay niggers\""
+				"[auto] automatically marked: Racist | reason: \"gay niggers\"",
+				"[auto] automatically marked: Racist | reason: \"any chinese nigger here\""
 			],
 			"steamid": "[U:1:1151518358]"
 		},
@@ -4678,6 +4709,19 @@
 		},
 		{
 			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "Cypher",
+				"time": 1795282973
+			},
+			"proof": [
+				"Silent Aim & ESP"
+			],
+			"steamid": "[U:1:1441325784]"
+		},
+		{
+			"attributes": [
 				"suspicious"
 			],
 			"last_seen": {
@@ -4794,6 +4838,19 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "BROSteDd",
+				"time": 1795371249
+			},
+			"proof": [
+				"Top scoring as Sniper with ~200 ping, fake lag?"
+			],
+			"steamid": "[U:1:1510052831]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -4900,7 +4957,7 @@
 		},
 		{
 			"attributes": [
-				"suspicious"
+				"cheater"
 			],
 			"last_seen": {
 				"player_name": "theosevis       \u2766",
@@ -5038,7 +5095,7 @@
 		},
 		{
 			"attributes": [
-				"suspicious"
+				"cheater"
 			],
 			"last_seen": {
 				"player_name": "Rat-o",
@@ -5355,6 +5412,16 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "AXG_Bun3y",
+				"time": 1795285705
+			},
+			"steamid": "[U:1:1700004701]"
+		},
+		{
+			"attributes": [
 				"cheater"
 			],
 			"last_seen": {
@@ -5365,6 +5432,19 @@
 				"Crit Bucket"
 			],
 			"steamid": "[U:1:1700241737]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "4z5f",
+				"time": 1795280006
+			},
+			"proof": [
+				"Silent Aim & ESP"
+			],
+			"steamid": "[U:1:1700282689]"
 		},
 		{
 			"attributes": [
@@ -5572,6 +5652,16 @@
 				"time": 1779991955
 			},
 			"steamid": "[U:1:1815439533]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "elizabeta",
+				"time": 1795279929
+			},
+			"steamid": "[U:1:1820137305]"
 		},
 		{
 			"attributes": [
@@ -5886,7 +5976,7 @@
 		},
 		{
 			"attributes": [
-				"suspicious"
+				"cheater"
 			],
 			"last_seen": {
 				"player_name": "there's moonlight on the river",
