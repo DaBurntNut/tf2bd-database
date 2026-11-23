@@ -44,6 +44,7 @@ class WorkflowContractTests(unittest.TestCase):
     root = Path(__file__).resolve().parent.parent
     workflow_path = root / ".github" / "workflows" / "sync-vorobey-hackerpolice.yml"
     dependabot_path = root / ".github" / "dependabot.yml"
+    requirements_path = root / ".github" / "requirements-ci.txt"
 
     @classmethod
     def setUpClass(cls):
@@ -145,6 +146,7 @@ class WorkflowContractTests(unittest.TestCase):
             "rules.garou3299.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
             ".github/dependabot.yml",
+            ".github/requirements-ci.txt",
             ".github/workflows/sync-vorobey-hackerpolice.yml",
             "pyproject.toml",
             "scripts/playerlist.py",
@@ -345,22 +347,32 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("contents: write", jobs["checks"])
         self.assertNotIn("pull-requests: write", jobs["checks"])
 
-    def test_the_tool_versions_are_defined_once_and_interpolated(self):
-        for name in ("RUFF_VERSION", "MYPY_VERSION", "BANDIT_VERSION", "COVERAGE_VERSION", "VULTURE_VERSION"):
-            self.assertEqual(len(re.findall(rf'^\s*{name}:\s*"[^"]+"$', self.workflow, re.M)), 1, name)
-        for name, tool in (
-            ("RUFF_VERSION", "ruff"),
-            ("MYPY_VERSION", "mypy"),
-            ("BANDIT_VERSION", "bandit"),
-            ("COVERAGE_VERSION", "coverage"),
-            ("VULTURE_VERSION", "vulture"),
-        ):
-            self.assertIn(f'"{tool}==${{{name}}}"', self.workflow)
+    def pinned_tools(self) -> dict[str, str]:
+        """The ``name == version`` pins in the CI requirements file."""
+        pins = {}
+        for line in self.requirements_path.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                name, separator, version = line.partition("==")
+                self.assertTrue(separator, f"{line} is not pinned with ==")
+                pins[name] = version
+        return pins
 
-    def test_ci_pins_the_coverage_tool_version(self):
-        """An unpinned coverage release could move the gate under us."""
-        configured = re.search(r'^\s*COVERAGE_VERSION:\s*"([^"]+)"$', self.workflow, re.M)
-        self.assertIsNotNone(configured, "CI must pin coverage")
+    def test_every_tool_the_workflow_runs_is_pinned_exactly_once(self):
+        """An unpinned release could move a gate under us without a commit."""
+        pins = self.pinned_tools()
+        text = self.requirements_path.read_text(encoding="utf-8")
+        for tool in ("ruff", "mypy", "bandit", "coverage", "vulture"):
+            self.assertIn(tool, pins, f"{tool} runs in CI but is not pinned")
+            self.assertRegex(pins[tool], r"^\d+(\.\d+)*$", f"{tool} needs an exact version")
+            self.assertEqual(len(re.findall(rf"^{tool}==", text, re.M)), 1, f"{tool} is pinned twice")
+            self.assertIn(f"python3 -m {tool} ", self.workflow, f"{tool} is pinned but never run")
+
+    def test_the_workflow_installs_the_pinned_tools_and_pins_nothing_inline(self):
+        """One source of truth: a second inline pin could silently disagree."""
+        self.assertIn("-r .github/requirements-ci.txt", self.workflow)
+        for tool in ("ruff", "mypy", "bandit", "coverage", "vulture"):
+            self.assertNotRegex(self.workflow, rf'"{tool}==[^"]*"', f"{tool} is also pinned inline")
 
     def test_checks_run_for_all_events_and_only_pull_requests_run_no_sync(self):
         jobs = self.jobs()
@@ -370,12 +382,37 @@ class WorkflowContractTests(unittest.TestCase):
         for watched in ("scripts/**", "tests/**", ".github/workflows/sync-vorobey-hackerpolice.yml"):
             self.assertIn(watched, self.workflow)
 
-    def test_dependabot_only_bumps_the_pinned_actions(self):
+    def test_dependabot_owns_the_actions_and_the_check_tooling(self):
         text = self.dependabot_path.read_text(encoding="utf-8")
         self.assertIn('package-ecosystem: "github-actions"', text)
-        self.assertNotIn("pip", text)  # Runtime scripts have no third-party dependencies to update.
+        self.assertIn('package-ecosystem: "pip"', text)
         self.assertNotIn("package-ecosystem: npm", text)
         self.assertIn('interval: "weekly"', text)
+
+    def test_the_pip_entry_points_at_a_file_dependabot_can_actually_find(self):
+        """A directory with no detectable manifest updates nothing, silently.
+
+        Dependabot's pip fetcher picks up ``.txt`` files with "requirements" in
+        the name under the configured directory. Point the entry somewhere else,
+        or rename the file, and the pins quietly stop being maintained with no
+        error anywhere -- the exact rot this entry exists to prevent.
+        """
+        text = self.dependabot_path.read_text(encoding="utf-8")
+        block = text.split('package-ecosystem: "pip"', 1)[1]
+        directory = re.search(r'directory:\s*"([^"]+)"', block)
+        self.assertIsNotNone(directory, "the pip entry needs a directory")
+        target = self.root / directory.group(1).lstrip("/")
+        self.assertTrue(target.is_dir(), f"{directory.group(1)} is not a directory")
+        found = [p.name for p in target.glob("*.txt") if "requirements" in p.name]
+        self.assertIn(self.requirements_path.name, found)
+
+    def test_dependabot_does_not_propose_a_coverage_that_cannot_install(self):
+        """The 3.10 leg cannot take coverage >=7.17.0; an ignore keeps CI green."""
+        text = self.dependabot_path.read_text(encoding="utf-8")
+        floors = re.findall(r'python-version:.*?"3\.(\d+)"', self.workflow)
+        if floors and min(int(minor) for minor in floors) < 11:
+            self.assertIn('dependency-name: "coverage"', text)
+            self.assertIn('">=7.17.0"', text)
 
 
 class RepositoryDataTests(unittest.TestCase):

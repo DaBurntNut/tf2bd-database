@@ -42,24 +42,15 @@ on:
       - "playerlist.scammers.json"
       - "rules.garou3299.json"
       - "snapshot/playerlist.vorobey-hackerpolice.json"
-      # Tests read the Dependabot config and this workflow; include each in this filter.
+      # Tests read the Dependabot config, the CI pin file and this workflow;
+      # include each in this filter.
       # README.md is not listed: no test reads it, so prose edits need no checks.
       - ".github/dependabot.yml"
+      - ".github/requirements-ci.txt"
       - ".github/workflows/sync-vorobey-hackerpolice.yml"
 
 # Least privilege by default: no job may read or write more than its own block.
 permissions: {}
-
-# Pin tool versions so both Python matrix legs use identical check tooling.
-env:
-  RUFF_VERSION: "0.17.6"
-  MYPY_VERSION: "2.4.1"
-  BANDIT_VERSION: "1.9.4"
-  # 7.16.2 is the last release that installs on Python 3.10: 7.17.0 raised the
-  # floor to 3.11 and there is no 7.16.3. This pin is held down by the 3.10
-  # matrix leg, so retiring that leg is what unblocks a newer coverage.
-  COVERAGE_VERSION: "7.16.2"
-  VULTURE_VERSION: "2.16"
 
 jobs:
   # Read-only checks gate publishing and run without write credentials.
@@ -94,35 +85,32 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install the pinned check tooling
+        # Versions live in .github/requirements-ci.txt so Dependabot can track
+        # them; installing once gives every step below identical tooling.
+        run: python3 -m pip install --quiet --disable-pip-version-check -r .github/requirements-ci.txt
+
       - name: Lint (ruff)
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check "ruff==${RUFF_VERSION}"
           python3 -m ruff check scripts tests
           python3 -m ruff format --check scripts tests
 
       - name: Type-check (mypy, strict)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "mypy==${MYPY_VERSION}"
-          python3 -m mypy scripts
+        run: python3 -m mypy scripts
 
       - name: Security scan (bandit)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "bandit==${BANDIT_VERSION}"
-          python3 -m bandit -q -r scripts
+        run: python3 -m bandit -q -r scripts
 
       - name: Run unit tests under the coverage gate
         # The floor is fail_under in pyproject.toml (95%), not 100%: the suite
         # reaches 100% today, but the gate must not demand a test for a branch
         # that cannot be reached.
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check "coverage==${COVERAGE_VERSION}"
           python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
           python3 -m coverage report
 
       - name: Dead code (vulture)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "vulture==${VULTURE_VERSION}"
-          python3 -m vulture scripts tests --min-confidence 60
+        run: python3 -m vulture scripts tests --min-confidence 60
 
   sync:
     name: Check Vorobey hackerpolice list

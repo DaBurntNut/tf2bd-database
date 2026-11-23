@@ -1,5 +1,6 @@
-# Dependabot updates SHA-pinned actions and their release annotations.
-# Runtime scripts use only the standard library; CI tools are pinned in the workflow.
+# Dependabot updates SHA-pinned actions and their release annotations, and the
+# CI check tooling pinned in .github/requirements-ci.txt.
+# Runtime scripts use only the standard library, so nothing here ships to users.
 version: 2
 
 updates:
@@ -15,3 +16,25 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # Without this entry the five tool pins have no owner and rot silently: the
+  # workflow installs exact versions, so nothing would ever propose a newer one.
+  - package-ecosystem: "pip"
+    directory: "/.github"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    # One pull request per week for the whole toolchain, not five.
+    groups:
+      check-tools:
+        patterns:
+          - "*"
+    ignore:
+      # coverage 7.17.0 raised its floor to Python 3.11 while the matrix still
+      # tests 3.10, so a newer release cannot install on that leg. Without this
+      # the weekly run would open a pull request that always fails. Remove it
+      # together with the 3.10 matrix leg.
+      - dependency-name: "coverage"
+        versions: [">=7.17.0"]
