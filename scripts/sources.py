@@ -159,7 +159,7 @@ def _declared_length(response: object) -> int | None:
     if isinstance(declared, str) and declared.isascii() and declared.isdigit():
         # Bound the digits before int(): a hostile header with thousands of
         # digits would otherwise trip Python's int-conversion limit and turn a
-        # malformed header into a ValueError traceback. Ten digits is ~10 GiB,
+        # malformed header into a ValueError traceback. Ten digits is ~10 GB,
         # far beyond the byte cap, so a longer value is simply "too large".
         significant = declared.lstrip("0") or "0"
         return int(significant) if len(significant) <= 10 else MAX_SOURCE_BYTES + 1
@@ -705,8 +705,8 @@ def _redact_source(value: str) -> str:
     surrounding text.
     """
     if http_scheme(value):
-        # ``http_scheme`` already recognises the http/https prefixes itself, including
-        # for a URL too long to parse, so repeating the prefix test here added nothing.
+        # ``http_scheme`` recognises the http/https prefixes itself, including for a
+        # URL too long to parse, so no separate prefix test is needed here.
         return redact_url(value)
     return _one_line(_no_surrogates(redact_urls_in_text(value)))
 
