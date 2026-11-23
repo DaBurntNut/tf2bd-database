@@ -1521,7 +1521,7 @@ class CliTests(unittest.TestCase):
     def test_hand_appended_entry_is_resorted_and_reported(self):
         """A file out of SteamID order is normalized without any tag changing.
 
-        The old behaviour said "No database changes" while rewriting the file,
+        The old behavior said "No database changes" while rewriting the file,
         so a reviewer saw a diff with a body denying it.
         """
         self.database.write_text(
@@ -2013,7 +2013,7 @@ class LifecycleTests(unittest.TestCase):
 class DocumentedLimitsTests(unittest.TestCase):
     """The caps are contract, not tuning knobs -- so pin the numbers.
 
-    Mutation testing found every one of these replaceable with a neighbouring
+    Mutation testing found every one of these replaceable with a neighboring
     value while the suite stayed green: ``CapBoundaryTests`` derives its sizes
     FROM the constant, so it proves the comparison is exact but cannot notice
     the constant itself moving. A one-digit typo in ``MAX_REPORT_BYTES`` would
@@ -2023,7 +2023,7 @@ class DocumentedLimitsTests(unittest.TestCase):
     """
 
     def test_the_documented_report_limits(self):
-        # Published behaviour: change tables stop at 150 rows, the removed-ID
+        # Published behavior: change tables stop at 150 rows, the removed-ID
         # table at 100 rows, and the report body at 60,000 bytes.
         self.assertEqual(report_module.MAX_CHANGE_TABLE_ROWS, 150)
         self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 100)
@@ -2040,7 +2040,7 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.MAX_URL_DISPLAY_CHARS, 2048)
 
     def test_the_read_and_fetch_limits(self):
-        # Published behaviour: downloads allow 64 MiB, 30 seconds, and three attempts
+        # Published behavior: downloads allow 64 MiB, 30 seconds, and three attempts
         # before fallback; database and snapshot files share the 64 MiB limit.
         self.assertEqual(playerlist_module.MAX_FILE_BYTES, 64 * 1024 * 1024)
         self.assertEqual(sources.MAX_SOURCE_BYTES, 64 * 1024 * 1024)
@@ -2050,7 +2050,7 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.RETRY_BACKOFF_SECONDS, 2)
 
     def test_the_documented_guard_and_account_bounds(self):
-        # Published behaviour: the guard requires more than 50 IDs and more than 20% removal.
+        # Published behavior: the guard requires more than 50 IDs and more than 20% removal.
         self.assertEqual(sync_module.MASS_DEMOTION_MIN_IDS, 50)
         self.assertEqual(sync_module.MASS_DEMOTION_MAX_FRACTION, 0.2)
         # The second, database-relative guard: the snapshot dwarfs the database,

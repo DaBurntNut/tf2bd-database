@@ -691,7 +691,14 @@ def _redact_urls_in_text(
 
 
 def redact_urls_in_text(text: str) -> str:
-    """Redact URL credentials and common bare secrets in untrusted prose."""
+    """Redact URL credentials and common bare secrets in untrusted prose.
+
+    Apply this once per value. It rewrites rather than deletes -- a bare
+    ``?token`` becomes ``?token=REDACTED`` -- so its output is a different
+    document that a second pass may legitimately parse differently, and the
+    function is not a fixed point. One pass is what every caller does and is
+    what the guarantee covers: no secret value survives it.
+    """
     return redact_diagnostic_text(_redact_urls_in_text(text, 0))
 
 

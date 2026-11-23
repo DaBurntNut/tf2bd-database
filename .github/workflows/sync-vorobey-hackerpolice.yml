@@ -75,7 +75,7 @@ jobs:
       matrix:
         # Test the documented minimum (3.10) and production runtime (3.12).
         python-version: ["3.10", "3.12"]
-    # Isolate checks from sync and cancel stale runs without cancelling sibling Python legs.
+    # Isolate checks from sync and cancel stale runs without canceling sibling Python legs.
     concurrency:
       group: checks-${{ github.event.pull_request.number || github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true

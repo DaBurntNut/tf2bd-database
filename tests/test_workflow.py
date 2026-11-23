@@ -306,7 +306,7 @@ class WorkflowContractTests(unittest.TestCase):
         reading its own outputs would be reading values produced by the tests.
 
         Checked in a CHILD interpreter, because that is the only place the
-        import-time behaviour can be observed -- and because asserting on this
+        import-time behavior can be observed -- and because asserting on this
         file's own text would match this test's own source and never fail.
         """
         code = (

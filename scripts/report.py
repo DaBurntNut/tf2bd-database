@@ -447,7 +447,7 @@ def _evidence_link_status_cached(link: str) -> tuple[str, bool]:
 def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     """Proof column: real links where possible, escaped text otherwise.
 
-    Each link is labelled "proof" (or "proof 1", "proof 2" when there are
+    Each link is labeled "proof" (or "proof 1", "proof 2" when there are
     several) so it is obvious what clicking it opens; several are listed side
     by side rather than separated by an HTML ``<br>``, because the report never
     emits raw HTML -- a cell then renders the same in a pull request, in a job

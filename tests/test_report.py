@@ -1051,7 +1051,7 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(report_module._cell("a_b_c"), "a\\_b\\_c")
 
     def test_a_name_cannot_smuggle_an_html_entity_past_the_guards(self):
-        """The entity SPELLING defeated every character-level defence.
+        """The entity SPELLING defeated every character-level defense.
 
         ``&#x202E;`` is not a bidi character, so the bidi scrub let it through,
         and the renderer turned it into U+202E -- a right-to-left override in
@@ -1225,7 +1225,7 @@ class ReportTests(unittest.TestCase):
 
         The path is operator input and used to be the last way to overflow the
         body from inside the header. It is clipped now, so the header -- and
-        every line of it -- stays readable; ``_fit_body`` remains as defence in
+        every line of it -- stays readable; ``_fit_body`` remains as defense in
         depth and is tested directly (ReportBoundaryTests).
         """
         absurd = Path("/tmp/" + "d" * 100_000 + ".json")
@@ -1706,7 +1706,7 @@ class ReportBoundaryTests(unittest.TestCase):
     def test_multi_byte_names_cannot_overflow_the_byte_budget(self):
         """GitHub's limit is bytes: 30,000 Cyrillic characters are 60,000 bytes.
 
-        Measuring characters (the old behaviour) would have shipped a body
+        Measuring characters (the old behavior) would have shipped a body
         twice the allowed size for any database full of non-Latin names.
         """
         text = "\u044b" * (MAX_REPORT_BYTES + 1)

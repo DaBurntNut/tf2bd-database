@@ -582,7 +582,7 @@ class DemoteTests(unittest.TestCase):
         self.assertEqual(len(database["players"]), 1)
 
     def test_sync_never_demotes_when_the_caller_forgets_enable_demote(self):
-        """Defence in depth: removals without the flag demote nobody.
+        """Defense in depth: removals without the flag demote nobody.
 
         The CLI never gets here (it empties the set when --demote is off), but a
         future caller that hands over removed_ids and forgets the flag must not
