@@ -618,7 +618,9 @@ def _redact_text_query_parameter(match: re.Match[str], depth: int) -> str:
 
     # Redact parameter names that contain an encoded delimiter or secret.
     safe_name = raw_name if _SAFE_QUERY_NAME.fullmatch(raw_name) else "REDACTED"
-    # A semicolon separates parameters here, so it stays with the value.
+    # A semicolon separates parameters here, so it stays with the value. No test
+    # can show the difference -- _QUERY_PARAM_IN_TEXT's value excludes ';', so one
+    # never reaches this trim -- but the lists are kept apart to match the regex.
     end = _prose_tail_start(value, ".,:!?")
     return f"{match.group('separator')}{safe_name}=REDACTED{value[end:]}"
 

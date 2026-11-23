@@ -754,6 +754,61 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("USERNAME_PASSWORD", shown)
         self.assertIn("https://example.invalid/watch", shown)
 
+    def test_a_semicolon_after_a_link_stays_with_the_sentence(self):
+        """The prose trim list includes ';'; the query one must not.
+
+        Mutation testing killed neither direction: no test distinguished the
+        two punctuation lists, so collapsing them to one string -- the obvious
+        "tidy-up" -- passed the whole suite. The cost is not cosmetic. A
+        semicolon left attached to the match is swallowed by the redaction
+        along with everything after it, so the remainder of the sentence
+        disappears from the report.
+        """
+        shown = sources.redact_urls_in_text("see https://e.invalid/?token=SECRET; next")
+        self.assertEqual("see https://e.invalid/?token=REDACTED; next", shown)
+        self.assertNotIn("SECRET", shown)
+
+    def test_prose_tail_start_separates_a_link_from_the_prose_around_it(self):
+        """Pin the trim helper's contract directly.
+
+        A closing bracket means two different things: part of the link when
+        the match opened it, and part of the sentence when it did not. Six
+        mutants of this logic survived the suite -- dropping the brace pair,
+        counting closers without openers, an off-by-one on the balance -- all
+        reachable in principle but only through inputs like '?token=S {(}))',
+        which would pin accidents rather than the rule. The rule is cheap to
+        state here instead.
+        """
+        prose, query = ".,;:!?", ".,:!?"
+        for value, punctuation, expected in (
+            # A bracket the match opened itself belongs to the link.
+            ("()", prose, 2),
+            ("(a)", prose, 3),
+            ("[a]", prose, 3),
+            ("{a}", prose, 3),
+            # A bracket the match never opened belongs to the sentence.
+            ("a)", prose, 1),
+            ("a]", prose, 1),
+            ("a}", prose, 1),
+            ("a))", prose, 1),
+            ("(a))", prose, 3),
+            # Punctuation goes first, then unmatched brackets behind it.
+            ("a).", prose, 1),
+            # Nothing but a closer leaves nothing of the link.
+            (")", prose, 0),
+            ("]", prose, 0),
+            ("}", prose, 0),
+            # The one difference between the two lists.
+            ("a;", prose, 1),
+            ("a;", query, 2),
+            ("a.", query, 1),
+            # Degenerate inputs stay in range.
+            ("a", prose, 1),
+            ("", prose, 0),
+        ):
+            with self.subTest(value=value, punctuation=punctuation):
+                self.assertEqual(expected, sources._prose_tail_start(value, punctuation))
+
     def test_redacting_prose_stays_fast_on_blanks_that_never_close(self):
         """A run of blanks with no closing ``@`` must not cost super-linear time.
 
