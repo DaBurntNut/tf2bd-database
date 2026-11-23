@@ -86,6 +86,29 @@ class MassDemotionGuardTests(unittest.TestCase):
         self.assertTrue(update_snapshot)
         self.assertIsNone(note)
 
+    def test_the_database_floor_is_exact_at_five_entries(self):
+        """The floor is "at least 5", and only the floor may decide this case.
+
+        The small-purge test above holds the FRACTION below its threshold as
+        well, so it answers the same way whichever comparison the floor uses:
+        mutation testing replaced ``>=`` with ``>`` there and the whole suite
+        stayed green, which is how a guard that no longer fires at exactly its
+        documented floor would ship. Here the fraction is far above 25% in
+        both rows, so the floor is the only thing that can change the verdict.
+        """
+        self.assertFalse(sync_module._looks_like_mass_removal(4, 5574, 4, 8))
+        self.assertTrue(sync_module._looks_like_mass_removal(5, 5574, 5, 8))
+
+        # The same boundary through the planner the CLI actually calls.
+        _, update_snapshot, note, _ = self.plan(4, 5574, impact=(4, 8))
+        self.assertTrue(update_snapshot)
+        self.assertIsNone(note)
+
+        removed, update_snapshot, note, _ = self.plan(5, 5574, impact=(5, 8))
+        self.assertEqual(removed, set())
+        self.assertFalse(update_snapshot)
+        self.assertIn("looks like an upstream problem", note)
+
     def test_the_database_guard_needs_something_to_guard(self):
         # With no demotable entries there is nothing to protect, so the
         # database-relative rule stays quiet and only the snapshot rule applies.
