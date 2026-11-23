@@ -52,7 +52,7 @@ permissions: {}
 
 # Pin tool versions so both Python matrix legs use identical check tooling.
 env:
-  RUFF_VERSION: "0.17.4"
+  RUFF_VERSION: "0.17.6"
   MYPY_VERSION: "2.4.1"
   BANDIT_VERSION: "1.9.4"
   # 7.16.2 is the last release that installs on Python 3.10: 7.17.0 raised the
