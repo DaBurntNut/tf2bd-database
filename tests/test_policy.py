@@ -93,10 +93,16 @@ class MassDemotionGuardTests(unittest.TestCase):
         self.assertTrue(sync_module._looks_like_mass_removal(2000, 5574, 0, 0))
 
     def test_the_guard_reports_how_much_of_the_database_is_at_stake(self):
-        self.assertIn("26% of the 108 cheater(s)", sync_module._demotion_scale(28, 108))
+        self.assertIn("26% of the 108 cheaters", sync_module._demotion_scale(28, 108))
         self.assertIn("no tracked cheaters", sync_module._demotion_scale(9, 0))
         # Never claim more than the whole database.
         self.assertIn("100%", sync_module._demotion_scale(500, 108))
+
+    def test_the_guard_says_cheater_not_cheaters_for_a_single_entry(self):
+        # This note is published in the pull request body, so it uses the same
+        # plural helper as the rest of the report instead of writing "cheater(s)".
+        self.assertIn("100% of the 1 cheater this database could lose", sync_module._demotion_scale(1, 1))
+        self.assertIn("50% of the 2 cheaters this database could lose", sync_module._demotion_scale(1, 2))
 
     def test_removals_beyond_the_demotable_count_are_still_measured(self):
         # More removals than demotable entries cannot happen in a real run (sync
@@ -154,6 +160,14 @@ class MassDemotionGuardTests(unittest.TestCase):
         self.assertFalse(update_snapshot)
         self.assertIn("disappeared upstream at once", note)
         self.assertIn("not refreshed", snapshot_note)
+
+    def test_the_guard_counts_snapshot_steamids_not_raw_entries(self):
+        # Both figures come from the snapshot's DISTINCT usable SteamIDs, so the
+        # note must not call them "entries" -- that word means raw rows (which
+        # include duplicates and unusable ones) everywhere else in the report.
+        _, _, note, _ = self.plan(51, 100)
+        self.assertIn("51 of 100 snapshot SteamIDs", note)
+        self.assertNotIn("snapshot entries", note)
 
     def test_many_removals_from_a_large_snapshot_are_normal(self):
         # 100 exceeds the count floor but is only 10% of this snapshot.

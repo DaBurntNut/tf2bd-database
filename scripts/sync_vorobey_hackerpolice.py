@@ -516,7 +516,7 @@ def _demotion_scale(to_demote: int, at_risk: int) -> str:
     if at_risk <= 0:
         return "no tracked cheaters to compare against"
     share = min(to_demote, at_risk) / at_risk
-    return f"{share:.0%} of the {at_risk:,} cheater(s) this database could lose"
+    return f"{share:.0%} of the {at_risk:,} {plural(at_risk, 'cheater', 'cheaters')} this database could lose"
 
 
 def _plan_demotion(
@@ -553,7 +553,7 @@ def _plan_demotion(
         else:
             removed = set(removed_upstream)
             LOGGER.info(
-                "%d SteamIDs removed upstream since the snapshot (%d entries).",
+                "%d SteamIDs removed upstream since the snapshot (%d SteamIDs).",
                 len(removed),
                 len(previous_index.by_steamid),
             )
@@ -574,7 +574,7 @@ def _plan_demotion(
                 len(removed), len(previous_index.by_steamid), *demotion_impact
             ):
                 demotion_note = (
-                    f"skipped - {len(removed):,} of {len(previous_index.by_steamid):,} snapshot entries "
+                    f"skipped - {len(removed):,} of {len(previous_index.by_steamid):,} snapshot SteamIDs "
                     f"disappeared upstream at once ({_demotion_scale(*demotion_impact)}), which looks "
                     "like an upstream problem, not real removals "
                     "(re-run with --allow-mass-demotion to force)"
@@ -617,7 +617,7 @@ def run(args: argparse.Namespace) -> int:
         removed_upstream = removed_steamids(previous_index, index)
         removed_count = len(removed_upstream)
         LOGGER.info(
-            "Snapshot diff vs. previous snapshot: %d SteamIDs added, %d removed (%d -> %d entries).",
+            "Snapshot diff vs. previous snapshot: %d SteamIDs added, %d removed (%d -> %d SteamIDs).",
             added_count,
             removed_count,
             len(previous_index.by_steamid),
