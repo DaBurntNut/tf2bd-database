@@ -466,6 +466,55 @@ class ReportTests(unittest.TestCase):
         self.assertIn("(100 → 101 SteamIDs; net +1 distinct SteamID)", report)
         self.assertNotIn("net +1 distinct SteamIDs", report)
 
+    def test_every_count_in_the_header_agrees_with_its_own_noun(self):
+        """Randomised invariant testing found four counts bolted to a fixed noun.
+
+        Each one is a number the upstream file decides, so each one can be 1 on
+        a real day: a list that still holds a single row, a baseline captured
+        when it did, a list that collapsed to one usable SteamID, and a row
+        whose evidence overflowed by exactly one. All four published "1 ...s"
+        in the pull request body. They are checked together because they are
+        one defect in four places, and a test per site would have let the next
+        site be added without one.
+        """
+        singular = render_report(
+            self.info(
+                source_total=1,
+                previous_source_total=1,
+                previous_source_ids=33,
+                source_ids=1,
+                added_to_source=0,
+                removed_from_source=32,
+            )
+        )
+        self.assertIn("- Vorobey hackerpolice list (1 entry)", singular)
+        self.assertIn("- Previous snapshot: 1 entry;", singular)
+        self.assertIn("(33 → 1 SteamID; net -32 distinct SteamIDs)", singular)
+
+        plural_report = render_report(
+            self.info(
+                source_total=2,
+                previous_source_total=2,
+                previous_source_ids=33,
+                source_ids=2,
+                added_to_source=0,
+                removed_from_source=31,
+            )
+        )
+        self.assertIn("- Vorobey hackerpolice list (2 entries)", plural_report)
+        self.assertIn("- Previous snapshot: 2 entries;", plural_report)
+        self.assertIn("(33 → 2 SteamIDs; net -31 distinct SteamIDs)", plural_report)
+
+        # Zero takes the plural, as English does ("0 entries").
+        self.assertIn("- Vorobey hackerpolice list (0 entries)", render_report(self.info(source_total=0)))
+
+    def test_a_single_omitted_evidence_link_reads_as_one_entry(self):
+        links = tuple(f"https://discord.com/channels/1/2/{n}" for n in range(MAX_EVIDENCE_LINKS))
+        for omitted, expected in ((1, "and 1 more evidence entry"), (2, "and 2 more evidence entries")):
+            with self.subTest(omitted=omitted):
+                change = Change("[U:1:5]", "n", ("suspicious",), ("cheater",), links, evidence_omitted=omitted)
+                self.assertIn(expected, render_report(self.info([change])))
+
     def test_snapshot_diff_initial_snapshot_without_previous(self):
         report = render_report(self.info(added_to_source=10, snapshot_changed=True))
         self.assertIn("**10 new SteamIDs added**, **0 SteamIDs removed** (no previous snapshot", report)

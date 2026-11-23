@@ -485,7 +485,7 @@ def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     hidden = max(0, len(links) - len(shown)) + max(0, omitted)
     if hidden:
         # Keep the overflow note plain; it counts evidence links not shown.
-        cell += f", and {_count(hidden)} more evidence entries"
+        cell += f", and {_count(hidden)} more evidence {plural(hidden, 'entry', 'entries')}"
     return cell
 
 
@@ -740,7 +740,7 @@ def _net_change_text(added: int, removed: int) -> str:
 
 def _header_lines(info: RunInfo) -> list[str]:
     """The ``- Key: value`` bullet block at the top of the report."""
-    source_note = f"{_count(info.source_total)} entries"
+    source_note = f"{_count(info.source_total)} {plural(info.source_total, 'entry', 'entries')}"
     if info.source_skipped:
         source_note += f", {_count(info.source_skipped)} unusable"
     source = redact_urls_in_text(info.source)
@@ -763,7 +763,8 @@ def _header_lines(info: RunInfo) -> list[str]:
         # of the arrow, and the net -- counts distinct usable SteamIDs, so the
         # subtraction a reader performs on the arrow always matches the net.
         lines.append(
-            f"- Previous snapshot: {_count(info.previous_source_total)} entries; "
+            f"- Previous snapshot: {_count(info.previous_source_total)} "
+            f"{plural(info.previous_source_total, 'entry', 'entries')}; "
             f"{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} "
             "removed upstream since then (only those are demotion candidates)"
         )
@@ -771,7 +772,8 @@ def _header_lines(info: RunInfo) -> list[str]:
             f"- Snapshot diff: **{_count(info.added_to_source)} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
             f"**{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} removed** "
-            f"({_count(info.previous_source_ids)} → {_count(info.source_ids)} SteamIDs; "
+            f"({_count(info.previous_source_ids)} → {_count(info.source_ids)} "
+            f"{plural(info.source_ids, 'SteamID', 'SteamIDs')}; "
             f"{_net_change_text(info.added_to_source, info.removed_from_source)})"
         )
     elif info.snapshot_changed:
