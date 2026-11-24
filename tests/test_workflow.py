@@ -490,13 +490,20 @@ class RepositoryDataTests(unittest.TestCase):
         # after a manual formatting-only change.
         self.assertEqual(dumps(database), original)
 
-    # The scammer list is deliberately not checked here. The bot never reads it,
-    # never writes it, and never names it, so holding it to this tool's idea of
-    # valid or canonical only means CI failing over an edit to a file that has
-    # nothing to do with the sync.
+    # rules.garou3299.json is deliberately not validated here. It is TF2BD's
+    # file, read by the detector and never by this bot, so holding it to this
+    # tool's idea of valid or canonical would only fail CI over an edit that has
+    # nothing to do with the sync. The one property below is different: the
+    # demotion policy depends on it.
 
     def test_the_shipped_racist_rule_still_justifies_automatic_racist_proofs(self):
-        """The demotion policy relies on TF2BD's rule continuing to mark racist."""
+        """The demotion policy relies on TF2BD's rule continuing to mark racist.
+
+        The detector writes ``[auto] automatically marked: Racist | reason: ...``
+        proofs when this rule fires, and demotion keeps exactly those lines while
+        stripping the cheater evidence. If the shipped rule stopped marking
+        racist, that evidence would quietly stop existing.
+        """
         document = strict_json_loads((self.ROOT / "rules.garou3299.json").read_bytes())
         self.assertIsInstance(document, dict)
         rules = document.get("rules")
