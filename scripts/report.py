@@ -194,7 +194,7 @@ def _text(value: str, *, allow_autolinks: bool = False) -> str:
 
 
 def _code(value: str, *, in_table: bool = False) -> str:
-    """Make a string safe inside an inline code span (``…``).
+    r"""Make a string safe inside an inline code span (``…``).
 
     A code span is delimited by a run of backticks and can never contain a run
     that long, so the fence is grown past the longest run in the value: a value

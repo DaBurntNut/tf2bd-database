@@ -367,7 +367,7 @@ def write_snapshot(path: Path, raw: bytes, original: bytes | None, *, dry_run: b
     return changed
 
 
-def _log_outcome(modified: bool, changes: list[Change], path: Path, *, dry_run: bool) -> None:
+def _log_outcome(changes: list[Change], path: Path, *, modified: bool, dry_run: bool) -> None:
     count = len(changes)
     what = f"{count} {plural(count, 'entry', 'entries')}"
     if not modified:
@@ -391,7 +391,7 @@ def _same_file(first: Path, second: Path) -> bool:
     try:
         if first.resolve() == second.resolve():
             return True
-        return first.exists() and second.exists() and os.path.samefile(first, second)
+        return first.exists() and second.exists() and first.samefile(second)
     except (OSError, ValueError, RuntimeError):
         # Treat path-resolution failures as non-aliases; later file operations report unusable paths.
         return False
@@ -715,7 +715,7 @@ def run(args: argparse.Namespace) -> int:
     # Write the database before advancing the snapshot; skipped demotions remain candidates.
     # Safe snapshot-only changes still refresh the baseline.
     write_database(database_path, rendered, original, dry_run=args.dry_run)
-    _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
+    _log_outcome(changes, database_path, modified=modified, dry_run=args.dry_run)
     if update_snapshot:
         write_snapshot(snapshot_path, source_bytes, previous_bytes, dry_run=args.dry_run)
         if snapshot_changed:
