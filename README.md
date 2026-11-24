@@ -19,8 +19,11 @@ Send a permanent Steam profile link or ID **with video evidence** to
 
 ## What the bot does
 
-Every day at **05:23 UTC** (GitHub can delay the run) it compares this database
-with Vorobey's list and opens a pull request. Scheduled runs do not change the
+Once a day it compares this database with Vorobey's list and opens a pull
+request. The schedule asks for **05:23 UTC**, but GitHub queues scheduled jobs:
+the last ten runs started between **06:10 and 06:53 UTC**, a median of 57
+minutes late, and none within fifteen minutes of the stated time. Nothing in
+the bot depends on the exact minute. Scheduled runs do not change the
 default branch until you merge that pull request. A manual run from the default
 branch (**Actions → Run workflow**) can instead open a pull request, commit
 directly, or only report a dry run; a dispatch from another branch runs the
@@ -183,6 +186,20 @@ than from the raw totals, so the line can never contradict itself.
   all (`permissions: {}`); each job opts in to exactly what it needs, so a job
   added later cannot inherit a write token by accident. The checks job does not
   even fetch the Git history it never reads.
+
+## If the daily run seems to have stopped
+
+GitHub disables scheduled workflows in a public repository after 60 days with
+no repository activity. It does this silently — no email, no failed run, no
+entry in the log; the daily sync simply stops happening. This repository has
+never been quiet that long, but a cheater list that nobody touches for two
+months is exactly the case where it would bite, and the symptom looks like a
+broken bot rather than a paused one.
+
+So if the syncs have gone missing, check **Actions** before reading any code:
+a workflow switched off this way is greyed out there, and one click re-enables
+it (`gh workflow enable "Sync Vorobey hackerpolice"` does the same). Filtering
+the run list by the `schedule` event shows when the last automatic run was.
 
 ## Run it yourself
 
