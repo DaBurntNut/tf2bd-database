@@ -12,6 +12,7 @@ from unittest import mock
 
 from _support import (
     HACKERPOLICE_PROOF,
+    frozen_clock,
     player,
 )
 
@@ -1316,10 +1317,11 @@ class ReportTests(unittest.TestCase):
         """The reduced caps only kick in when the body really is too big."""
         changes = [Change(f"[U:1:{1000 + n}]", f"n{n}", ("suspicious",), ("cheater",)) for n in range(5)]
         info = self.info(changes, removed_upstream=("[U:1:9]",))
-        self.assertEqual(
-            render_report(info),
-            report_module._render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS),
-        )
+        with frozen_clock():
+            self.assertEqual(
+                render_report(info),
+                report_module._render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS),
+            )
         self.assertNotIn("more entries not shown here", render_report(info))
 
     def test_dry_run_note(self):
@@ -2194,11 +2196,14 @@ class CapBoundaryTests(unittest.TestCase):
             dry_run=False,
             changes=changes,
         )
-        full = render_report(info)
-        self.assertEqual(full.count("| `[U:1:"), 150)  # No entries were dropped.
-        budget = len(full.encode("utf-8"))
-        with mock.patch.object(report_module, "MAX_REPORT_BYTES", budget):
-            self.assertEqual(render_report(info), full)  # Exact fit: no shrink or truncation.
+        # Two renders are compared, and the header carries the wall-clock
+        # minute, so the clock has to hold still or this is a coin flip.
+        with frozen_clock():
+            full = render_report(info)
+            self.assertEqual(full.count("| `[U:1:"), 150)  # No entries were dropped.
+            budget = len(full.encode("utf-8"))
+            with mock.patch.object(report_module, "MAX_REPORT_BYTES", budget):
+                self.assertEqual(render_report(info), full)  # Exact fit: no shrink or truncation.
 
 
 class RenderMemoTests(unittest.TestCase):

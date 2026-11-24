@@ -28,6 +28,26 @@ SOURCE_API_URL = "https://api.github.com/repos/Nocrex/Tom/contents/playerlist.vo
 SOURCE_BODY = b'\xef\xbb\xbf{"players": [{"steamid": "[U:1:100]", "attributes": ["cheater"]}]}'
 
 
+@contextlib.contextmanager
+def frozen_clock():
+    """Hold the report's ``Run at:`` line still for the duration of a test.
+
+    The header carries the wall-clock minute, so any test that renders the
+    same run twice and compares the two is a coin flip: it passes unless the
+    minute happens to tick between the renders. That failed once in CI here,
+    and a test that fails once every few thousand runs is worse than one that
+    fails every time, because it trains everyone to re-run instead of look.
+
+    Tests about size, shrinking or stability should freeze the clock; tests
+    about the timestamp itself should not.
+    """
+    import time as _time
+
+    fixed = _time.gmtime(1_700_000_000)
+    with mock.patch.object(_time, "gmtime", return_value=fixed):
+        yield
+
+
 def player(steamid, attributes, **extra):
     entry = {"attributes": list(attributes), "steamid": steamid}
     entry.update(extra)
