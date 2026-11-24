@@ -44,7 +44,7 @@ class WorkflowContractTests(unittest.TestCase):
     root = Path(__file__).resolve().parent.parent
     workflow_path = root / ".github" / "workflows" / "sync-vorobey-hackerpolice.yml"
     dependabot_path = root / ".github" / "dependabot.yml"
-    requirements_path = root / ".github" / "requirements-ci.txt"
+    pyproject_path = root / "pyproject.toml"
 
     @classmethod
     def setUpClass(cls):
@@ -146,7 +146,6 @@ class WorkflowContractTests(unittest.TestCase):
             "rules.garou3299.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
             ".github/dependabot.yml",
-            ".github/requirements-ci.txt",
             ".github/workflows/sync-vorobey-hackerpolice.yml",
             "pyproject.toml",
             "scripts/playerlist.py",
@@ -347,11 +346,24 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("contents: write", jobs["checks"])
         self.assertNotIn("pull-requests: write", jobs["checks"])
 
+    def ci_group(self) -> str:
+        """The body of pyproject.toml's ``[dependency-groups] ci`` list.
+
+        Parsed with a regex rather than tomllib: these tests also run on the
+        3.10 matrix leg, where tomllib does not exist.
+        """
+        text = self.pyproject_path.read_text(encoding="utf-8")
+        match = re.search(r"^\[dependency-groups\]\s*$(.*?)^\[", text, re.M | re.S)
+        self.assertIsNotNone(match, "pyproject.toml has no [dependency-groups] table")
+        body = re.search(r"^ci\s*=\s*\[(.*?)^\]", match.group(1), re.M | re.S)
+        self.assertIsNotNone(body, "[dependency-groups] has no ci group")
+        return body.group(1)
+
     def pinned_tools(self) -> dict[str, str]:
-        """The ``name == version`` pins in the CI requirements file."""
+        """The ``name == version`` pins in the ci dependency group."""
         pins = {}
-        for line in self.requirements_path.read_text(encoding="utf-8").splitlines():
-            line = line.split("#", 1)[0].strip()
+        for raw in self.ci_group().splitlines():
+            line = raw.split("#", 1)[0].strip().rstrip(",").strip('"')
             if line:
                 name, separator, version = line.partition("==")
                 self.assertTrue(separator, f"{line} is not pinned with ==")
@@ -361,18 +373,28 @@ class WorkflowContractTests(unittest.TestCase):
     def test_every_tool_the_workflow_runs_is_pinned_exactly_once(self):
         """An unpinned release could move a gate under us without a commit."""
         pins = self.pinned_tools()
-        text = self.requirements_path.read_text(encoding="utf-8")
+        group = self.ci_group()
         for tool in ("ruff", "mypy", "bandit", "coverage", "vulture"):
             self.assertIn(tool, pins, f"{tool} runs in CI but is not pinned")
             self.assertRegex(pins[tool], r"^\d+(\.\d+)*$", f"{tool} needs an exact version")
-            self.assertEqual(len(re.findall(rf"^{tool}==", text, re.M)), 1, f"{tool} is pinned twice")
+            self.assertEqual(len(re.findall(rf'"{tool}==', group)), 1, f"{tool} is pinned twice")
             self.assertIn(f"python3 -m {tool} ", self.workflow, f"{tool} is pinned but never run")
 
     def test_the_workflow_installs_the_pinned_tools_and_pins_nothing_inline(self):
         """One source of truth: a second inline pin could silently disagree."""
-        self.assertIn("-r .github/requirements-ci.txt", self.workflow)
+        self.assertIn("--group ci", self.workflow)
         for tool in ("ruff", "mypy", "bandit", "coverage", "vulture"):
             self.assertNotRegex(self.workflow, rf'"{tool}==[^"]*"', f"{tool} is also pinned inline")
+
+    def test_the_workflow_raises_pip_before_asking_for_a_dependency_group(self):
+        """``--group`` arrives in pip 25.1; setup-python can ship an older pip.
+
+        Without the upgrade the install dies with "no such option: --group" on
+        whichever leg happens to have the older pip -- a failure that looks
+        nothing like its cause.
+        """
+        install = self.workflow.split("--group ci", 1)[0]
+        self.assertIn('--upgrade "pip>=25.1"', install)
 
     def test_checks_run_for_all_events_and_only_pull_requests_run_no_sync(self):
         jobs = self.jobs()
@@ -392,10 +414,10 @@ class WorkflowContractTests(unittest.TestCase):
     def test_the_pip_entry_points_at_a_file_dependabot_can_actually_find(self):
         """A directory with no detectable manifest updates nothing, silently.
 
-        Dependabot's pip fetcher picks up ``.txt`` files with "requirements" in
-        the name under the configured directory. Point the entry somewhere else,
-        or rename the file, and the pins quietly stop being maintained with no
-        error anywhere -- the exact rot this entry exists to prevent.
+        Dependabot's pip fetcher reads pyproject.toml under the configured
+        directory. Point the entry somewhere else, or drop the
+        [dependency-groups] table, and the pins quietly stop being maintained
+        with no error anywhere -- the exact rot this entry exists to prevent.
         """
         text = self.dependabot_path.read_text(encoding="utf-8")
         block = text.split('package-ecosystem: "pip"', 1)[1]
@@ -403,8 +425,10 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIsNotNone(directory, "the pip entry needs a directory")
         target = self.root / directory.group(1).lstrip("/")
         self.assertTrue(target.is_dir(), f"{directory.group(1)} is not a directory")
-        found = [p.name for p in target.glob("*.txt") if "requirements" in p.name]
-        self.assertIn(self.requirements_path.name, found)
+        manifest = target / "pyproject.toml"
+        self.assertTrue(manifest.is_file(), f"no pyproject.toml in {directory.group(1)}")
+        self.assertEqual(manifest.resolve(), self.pyproject_path.resolve())
+        self.assertIn("[dependency-groups]", manifest.read_text(encoding="utf-8"))
 
     def test_dependabot_does_not_propose_a_coverage_that_cannot_install(self):
         """The 3.10 leg cannot take coverage >=7.17.0; an ignore keeps CI green."""

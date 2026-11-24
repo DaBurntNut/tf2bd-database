@@ -42,11 +42,9 @@ on:
       - "playerlist.scammers.json"
       - "rules.garou3299.json"
       - "snapshot/playerlist.vorobey-hackerpolice.json"
-      # Tests read the Dependabot config, the CI pin file and this workflow;
-      # include each in this filter.
+      # Tests read the Dependabot config and this workflow; include each in this filter.
       # README.md is not listed: no test reads it, so prose edits need no checks.
       - ".github/dependabot.yml"
-      - ".github/requirements-ci.txt"
       - ".github/workflows/sync-vorobey-hackerpolice.yml"
 
 # Least privilege by default: no job may read or write more than its own block.
@@ -86,9 +84,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install the pinned check tooling
-        # Versions live in .github/requirements-ci.txt so Dependabot can track
-        # them; installing once gives every step below identical tooling.
-        run: python3 -m pip install --quiet --disable-pip-version-check -r .github/requirements-ci.txt
+        # Versions live in pyproject.toml's [dependency-groups] so Dependabot
+        # can track them; installing once gives every step identical tooling.
+        # pip only learned --group in 25.1 and setup-python can ship an older
+        # one, so raise pip first -- without this the install fails with
+        # "no such option: --group".
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check --upgrade "pip>=25.1"
+          python3 -m pip install --quiet --disable-pip-version-check --group ci
 
       - name: Lint (ruff)
         run: |

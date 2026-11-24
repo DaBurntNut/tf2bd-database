@@ -1,5 +1,5 @@
 # Dependabot updates SHA-pinned actions and their release annotations, and the
-# CI check tooling pinned in .github/requirements-ci.txt.
+# CI check tooling pinned in pyproject.toml.
 # Runtime scripts use only the standard library, so nothing here ships to users.
 version: 2
 
@@ -20,7 +20,7 @@ updates:
   # Without this entry the five tool pins have no owner and rot silently: the
   # workflow installs exact versions, so nothing would ever propose a newer one.
   - package-ecosystem: "pip"
-    directory: "/.github"
+    directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5

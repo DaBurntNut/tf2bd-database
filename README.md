@@ -190,11 +190,12 @@ python3 scripts/sync_vorobey_hackerpolice.py --demote --report out.md
 ```
 
 The scripts use only Python's standard library. To run the coverage gate locally,
-install the same check tooling as CI first. The versions live in one file, so
-this cannot drift from the workflow:
+install the same check tooling as CI first. The versions live in pyproject.toml,
+so this cannot drift from the workflow (pip 25.1+ is needed for `--group`):
 
 ```
-python3 -m pip install -r .github/requirements-ci.txt
+python3 -m pip install --upgrade "pip>=25.1"
+python3 -m pip install --group ci
 python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
 python3 -m coverage report
 ```
