@@ -397,6 +397,64 @@ def _same_file(first: Path, second: Path) -> bool:
         return False
 
 
+def _local_source_paths(args: argparse.Namespace) -> list[Path]:
+    """The ``--source`` values that name a file on disk rather than a URL."""
+    return [Path(source) for source in args.source or [] if not http_scheme(source)]
+
+
+def _reject_empty_paths(args: argparse.Namespace) -> None:
+    """Reject empty paths instead of silently meaning the current directory or no report."""
+    for flag, value in (("--database", args.database), ("--snapshot", args.snapshot), ("--report", args.report)):
+        if value == "":
+            raise SyncError(f"{flag} must not be empty")
+    if any(source == "" for source in args.source or []):
+        raise SyncError("--source must not be empty")
+
+
+def _reject_report_aliases(args: argparse.Namespace, database_path: Path, snapshot_path: Path) -> None:
+    """The report is written first, so an aliased report path would destroy its own input."""
+    if not args.report:
+        return
+    report_path = Path(args.report)
+    protected = [database_path, snapshot_path, *_local_source_paths(args)]
+    if any(_same_file(report_path, path) for path in protected):
+        raise SyncError("--report must not be the same file as --database, --snapshot, or a local --source")
+
+
+def _reject_source_aliases(args: argparse.Namespace, database_path: Path, snapshot_path: Path) -> None:
+    """Keep a local source from aliasing an input or output, especially the snapshot baseline."""
+    for source in args.source or []:
+        if http_scheme(source):
+            continue
+        for flag, other in (("--database", database_path), ("--snapshot", snapshot_path)):
+            if _same_file(Path(source), other):
+                raise SyncError(f"--source must not be the same file as {flag}")
+
+
+def _reject_github_output_aliases(args: argparse.Namespace, database_path: Path, snapshot_path: Path) -> None:
+    """Keep the Actions output file from aliasing any input or output of the run."""
+    github_output = os.environ.get("GITHUB_OUTPUT")
+    if not github_output:
+        return
+    protected = [("--database", database_path), ("--snapshot", snapshot_path)]
+    if args.report:
+        protected.append(("--report", Path(args.report)))
+    protected.extend(("--source", path) for path in _local_source_paths(args))
+    for flag, path in protected:
+        if _same_file(Path(github_output), path):
+            raise SyncError(f"GITHUB_OUTPUT must not be the same file as {flag}")
+
+
+def _require_output_directories(args: argparse.Namespace, snapshot_path: Path) -> None:
+    """Fail before any work when an output directory is missing -- always a typo."""
+    outputs = [("--snapshot", snapshot_path)]
+    if args.report:
+        outputs.append(("--report", Path(args.report)))
+    for flag, path in outputs:
+        if not path.parent.is_dir():
+            raise SyncError(f"{flag} directory does not exist: {display_path(path.parent)}")
+
+
 def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     """Refuse any arrangement where the tool would overwrite its own inputs.
 
@@ -407,50 +465,15 @@ def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     rewrite it; and an output path in a directory that does not exist is a
     typo, never a design case.
     """
-    # Reject empty paths instead of treating them as the current directory or ignoring the report.
-    for flag, value in (("--database", args.database), ("--snapshot", args.snapshot), ("--report", args.report)):
-        if value == "":
-            raise SyncError(f"{flag} must not be empty")
-    if any(source == "" for source in args.source or []):
-        raise SyncError("--source must not be empty")
-
+    _reject_empty_paths(args)
     database_path = Path(args.database)
     snapshot_path = Path(args.snapshot)
     if _same_file(snapshot_path, database_path):
         raise SyncError("--snapshot and --database must be different files")
-    if args.report:
-        report_path = Path(args.report)
-        protected = [database_path, snapshot_path]
-        protected += [Path(source) for source in args.source or [] if not http_scheme(source)]
-        if any(_same_file(report_path, path) for path in protected):
-            raise SyncError("--report must not be the same file as --database, --snapshot, or a local --source")
-    for source in args.source or []:
-        if http_scheme(source):
-            continue
-        # Prevent local sources from aliasing inputs or outputs, especially the snapshot baseline.
-        for flag, other in (("--database", database_path), ("--snapshot", snapshot_path)):
-            if _same_file(Path(source), other):
-                raise SyncError(f"--source must not be the same file as {flag}")
-
-    # Prevent GITHUB_OUTPUT from aliasing any input or output file.
-    github_output = os.environ.get("GITHUB_OUTPUT")
-    if github_output:
-        github_protected = [("--database", database_path), ("--snapshot", snapshot_path)]
-        if args.report:
-            github_protected.append(("--report", Path(args.report)))
-        github_protected.extend(("--source", Path(source)) for source in args.source or [] if not http_scheme(source))
-        for flag, path in github_protected:
-            if _same_file(Path(github_output), path):
-                raise SyncError(f"GITHUB_OUTPUT must not be the same file as {flag}")
-
-    # Fail early when an output directory is missing.
-    outputs = [("--snapshot", snapshot_path)]
-    if args.report:
-        outputs.append(("--report", Path(args.report)))
-    for flag, path in outputs:
-        if not path.parent.is_dir():
-            raise SyncError(f"{flag} directory does not exist: {display_path(path.parent)}")
-
+    _reject_report_aliases(args, database_path, snapshot_path)
+    _reject_source_aliases(args, database_path, snapshot_path)
+    _reject_github_output_aliases(args, database_path, snapshot_path)
+    _require_output_directories(args, snapshot_path)
     return database_path, snapshot_path
 
 

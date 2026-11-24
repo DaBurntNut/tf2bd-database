@@ -185,63 +185,88 @@ def _is_secret_field_name(name: str) -> bool:
     return normalized is not None and _DIAGNOSTIC_SECRET_MARKER.search(normalized) is not None
 
 
+def _names_a_secret_before(value: str, separator: int) -> bool:
+    """True when the field name ending at ``separator`` is a credential name.
+
+    Reads backwards over any blanks, one optional quote, then the run of
+    characters a field name may use, so ``"api_key" : x`` is recognised as
+    readily as ``api_key=x``.
+    """
+    key_end = separator
+    while key_end and value[key_end - 1].isspace():
+        key_end -= 1
+    if key_end and value[key_end - 1] in "'\"":
+        key_end -= 1
+    key_start = key_end
+    while key_start and value[key_start - 1] in _DIAGNOSTIC_FIELD_CHARS:
+        key_start -= 1
+    return _is_secret_field_name(value[key_start:key_end])
+
+
+def _unquoted_value_end(value: str, start: int) -> int:
+    """Index just past a bare value: everything up to the next delimiter."""
+    end = start
+    while end < len(value) and value[end] not in _DIAGNOSTIC_VALUE_DELIMITERS:
+        end += 1
+    return end
+
+
+def _quoted_value_end(value: str, start: int, quote: str) -> int:
+    """Index just past a quoted value, honouring backslash escapes."""
+    end = start + 1
+    escaped = False
+    while end < len(value):
+        char = value[end]
+        end += 1
+        if char == quote and not escaped:
+            break
+        escaped = char == "\\" and not escaped
+        if char != "\\":
+            escaped = False
+    return end
+
+
+def _secret_value_span(value: str, separator: int) -> tuple[int, int, bool] | None:
+    """Locate the value after ``separator`` as ``(start, end, quoted)``.
+
+    ``None`` means there is no value to redact -- the text ended, or the next
+    character already delimits the next field.
+    """
+    start = separator + 1
+    while start < len(value) and value[start].isspace():
+        start += 1
+    if start == len(value) or value[start] in _DIAGNOSTIC_VALUE_DELIMITERS:
+        return None
+    quote = value[start] if value[start] in "'\"" else ""
+    if not quote:
+        return start, _unquoted_value_end(value, start), False
+    end = _quoted_value_end(value, start, quote)
+    if end - start == 2:
+        # An empty quoted body, as in ``password=''SECRET``. Redacting the
+        # empty body would leave the secret itself in the message, so treat
+        # the pair as unquoted and take everything up to the delimiter.
+        return start, _unquoted_value_end(value, start), False
+    return start, end, True
+
+
 def _redact_diagnostic_secret_pairs(value: str) -> str:
     """Redact sensitive fields with a linear scan instead of a backtracking regex."""
     parts: list[str] = []
     copied_through = 0
     separator = 0
     while separator < len(value):
-        if value[separator] not in "=:":
+        if value[separator] not in "=:" or not _names_a_secret_before(value, separator):
             separator += 1
             continue
-
-        key_end = separator
-        while key_end and value[key_end - 1].isspace():
-            key_end -= 1
-        quote = value[key_end - 1] if key_end and value[key_end - 1] in "'\"" else ""
-        if quote:
-            key_end -= 1
-        key_start = key_end
-        while key_start and value[key_start - 1] in _DIAGNOSTIC_FIELD_CHARS:
-            key_start -= 1
-        if not _is_secret_field_name(value[key_start:key_end]):
+        span = _secret_value_span(value, separator)
+        if span is None:
             separator += 1
             continue
-        value_start = separator + 1
-        while value_start < len(value) and value[value_start].isspace():
-            value_start += 1
-        if value_start == len(value) or value[value_start] in _DIAGNOSTIC_VALUE_DELIMITERS:
-            separator += 1
-            continue
+        value_start, value_end, quoted = span
 
-        value_end = value_start
-        value_quote = value[value_start] if value[value_start] in "'\"" else ""
-        if value_quote:
-            value_end += 1
-            escaped = False
-            while value_end < len(value):
-                char = value[value_end]
-                value_end += 1
-                if char == value_quote and not escaped:
-                    break
-                escaped = char == "\\" and not escaped
-                if char != "\\":
-                    escaped = False
-            if value_end - value_start == 2:
-                # An empty quoted body, as in ``password=''SECRET``. Redacting the
-                # empty body would leave the secret itself in the message, so treat
-                # the pair as unquoted and take everything up to the delimiter.
-                value_quote = ""
-                value_end = value_start
-                while value_end < len(value) and value[value_end] not in _DIAGNOSTIC_VALUE_DELIMITERS:
-                    value_end += 1
-        else:
-            while value_end < len(value) and value[value_end] not in _DIAGNOSTIC_VALUE_DELIMITERS:
-                value_end += 1
-
-        raw_value = value[value_start:value_end]
         trailing = ""
-        if not value_quote:
+        if not quoted:
+            raw_value = value[value_start:value_end]
             unpunctuated = raw_value.rstrip(".,:!?)]}>")
             if unpunctuated:
                 trailing = raw_value[len(unpunctuated) :]
