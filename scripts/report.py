@@ -370,7 +370,8 @@ def _youtube_short_url(link: str) -> str | None:
 
     ONE rule for every YouTube spelling, short or long: the result is
     ``youtu.be/<id>`` plus a timestamp if -- and only if -- the input carried a
-    real one (``t`` / ``start``, any form YouTube accepts). Every other query
+    real one (``t`` or ``start`` on the way in, any form YouTube accepts,
+    always written back as ``t``). Every other query
     parameter is dropped, including the ``si=`` share tag, so
     ``youtu.be/ID?si=abc`` and ``youtube.com/watch?v=ID&si=abc`` both become
     ``youtu.be/ID`` while ``youtu.be/ID?si=abc&t=326`` becomes
@@ -407,11 +408,18 @@ def _youtube_short_url(link: str) -> str | None:
         return None
     # Keep the FIRST real timestamp and drop everything else, including any
     # later one: two positions cannot both be the moment a proof means, and
-    # repeating the key would only make the reader guess which YouTube honors.
-    kept = next(
-        ((key, value) for key, value in pairs if key in _YOUTUBE_TIMESTAMP_KEYS and _YOUTUBE_TIME.match(value)), None
+    # repeating the key would only make the reader guess which one counts.
+    #
+    # Always write it back as "t", whichever key it arrived under. The result
+    # is a youtu.be link, and "t" is the parameter that domain reads; "start"
+    # belongs to the embed player, so copying that spelling onto a short link
+    # would hand the reviewer a link that silently opens at 0:00. Rewriting
+    # the key is safe in the other direction too, because "t" is understood
+    # everywhere this function can emit.
+    moment = next(
+        (value for key, value in pairs if key in _YOUTUBE_TIMESTAMP_KEYS and _YOUTUBE_TIME.match(value)), None
     )
-    timestamp = "?" + urllib.parse.urlencode([kept]) if kept is not None else ""
+    timestamp = "?" + urllib.parse.urlencode([("t", moment)]) if moment is not None else ""
     return f"https://youtu.be/{video_id}{timestamp}"
 
 

@@ -1897,7 +1897,7 @@ class CapBoundaryTests(unittest.TestCase):
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=1m30s", "https://youtu.be/DXQ5gEDIhzE?t=1m30s"),
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=1h2m3s", "https://youtu.be/DXQ5gEDIhzE?t=1h2m3s"),
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=90", "https://youtu.be/DXQ5gEDIhzE?t=90"),
-            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=90", "https://youtu.be/DXQ5gEDIhzE?start=90"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=90", "https://youtu.be/DXQ5gEDIhzE?t=90"),
             ("https://www.youtube.com/shorts/DXQ5gEDIhzE?t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
             ("https://www.youtube.com/embed/DXQ5gEDIhzE?t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
         ):
@@ -1964,7 +1964,7 @@ class CapBoundaryTests(unittest.TestCase):
         for link, expected in (
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s&t=1m30s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s&start=90", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
-            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=90&t=42s", "https://youtu.be/DXQ5gEDIhzE?start=90"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=90&t=42s", "https://youtu.be/DXQ5gEDIhzE?t=90"),
             ("https://youtu.be/DXQ5gEDIhzE?t=5s&t=6s&t=7s", "https://youtu.be/DXQ5gEDIhzE?t=5s"),
             # A junk value is skipped, not counted as the one timestamp.
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=abc&t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
@@ -1974,6 +1974,25 @@ class CapBoundaryTests(unittest.TestCase):
         # A repeated key can no longer inflate the rewritten link.
         flood = "https://www.youtube.com/watch?v=DXQ5gEDIhzE&" + "&".join(["t=1s"] * 40)
         self.assertEqual(report_module._youtube_short_url(flood), "https://youtu.be/DXQ5gEDIhzE?t=1s")
+
+    def test_the_moment_is_always_written_back_as_t(self):
+        """``start`` is the embed player's spelling; the output is a short link.
+
+        An embed or live URL carries the moment as ``start``. Copying that
+        spelling onto youtu.be hands the reviewer a link that quietly opens at
+        0:00, because the short domain reads ``t``. Only the key changes; the
+        value is carried across untouched.
+        """
+        for link, expected in (
+            ("https://www.youtube.com/embed/DXQ5gEDIhzE?start=90", "https://youtu.be/DXQ5gEDIhzE?t=90"),
+            ("https://www.youtube.com/live/DXQ5gEDIhzE?start=5m", "https://youtu.be/DXQ5gEDIhzE?t=5m"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=1h2m3s", "https://youtu.be/DXQ5gEDIhzE?t=1h2m3s"),
+            ("https://youtu.be/DXQ5gEDIhzE?start=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+            # The share tag still goes, and the moment still arrives as t.
+            ("https://youtu.be/DXQ5gEDIhzE?si=abc&start=326", "https://youtu.be/DXQ5gEDIhzE?t=326"),
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._youtube_short_url(link), expected)
 
     def test_no_timestamp_is_ever_invented(self):
         # The rule is "carry it only if the long form had one".
