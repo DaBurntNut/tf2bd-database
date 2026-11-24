@@ -10,6 +10,3 @@ coverage.xml
 
 # Prevent abandoned atomic-write temporaries from being staged.
 .tf2bd-sync-*.tmp
-
-# Local review catalog; do not publish stale message references.
-docs/bot-messages.md
