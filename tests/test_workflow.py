@@ -187,6 +187,7 @@ class WorkflowContractTests(unittest.TestCase):
             "python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v",
             "python3 -m coverage report",
             "python3 -m vulture scripts tests --min-confidence 60",
+            "python3 tests/clock_flake_check.py",
         ):
             self.assertIn(command, checks)
             self.assertNotIn(command, sync)

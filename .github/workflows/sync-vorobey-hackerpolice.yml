@@ -113,6 +113,13 @@ jobs:
           python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
           python3 -m coverage report
 
+      - name: No test may depend on the clock standing still
+        # Re-runs the suite with the clock advanced on every read. A test that
+        # renders the same run twice and compares the results otherwise passes
+        # unless the minute ticks between them, which is a failure that shows
+        # up once in a few thousand runs and reproduces for nobody.
+        run: python3 tests/clock_flake_check.py
+
       - name: Dead code (vulture)
         run: python3 -m vulture scripts tests --min-confidence 60
 
