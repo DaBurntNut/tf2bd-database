@@ -1945,10 +1945,21 @@ class CapBoundaryTests(unittest.TestCase):
             "1.5",
             "1H30M",
             "5S",
+            # A single unit in the wrong case: the pattern is case-sensitive
+            # because YouTube's is, and "1H" is not a time YouTube reads.
+            "1H",
+            "2M",
+            "3S",
             "1 30",
             "1h 30m",
             "42s evil",
             "1e3",
+            # Digits outside ASCII. re.ASCII keeps \d from matching these, so
+            # they can never reach the rewritten link as a percent-encoded
+            # blob that no player understands.
+            "\u0664\u0662",
+            "\uff14\uff12",
+            "\u0661h\u0663\u0660m",
         ):
             with self.subTest(value=value):
                 link = f"https://www.youtube.com/watch?v=DXQ5gEDIhzE&t={value}"

@@ -88,11 +88,13 @@ every entry is named the same way. The link target points at the exact upstream
 URL, except a YouTube video, which targets YouTube's own short form
 (`https://youtu.be/<id>`): a faithful alias of the same video that keeps the
 markdown short. One rule covers every YouTube spelling, short or long: the id,
-plus a timestamp (`t` / `start`) when the link actually carried one, because a
-proof is often one specific moment in a long video. Every other parameter is
-dropped, including the `si=` share tag, so
-`youtu.be/ID?si=abc` → `youtu.be/ID` and
-`youtu.be/ID?si=abc&t=326` → `youtu.be/ID?t=326`. No timestamp is ever invented. That is a pure text rewrite — no
+plus the first timestamp the link actually carried, because a proof is often one
+specific moment in a long video. The moment may arrive as `t` or as the embed
+player's `start`, and is always written back as `t`, the parameter the short
+domain reads. Every other parameter is dropped, including the `si=` share tag, so
+`youtu.be/ID?si=abc` → `youtu.be/ID`,
+`youtu.be/ID?si=abc&t=326` → `youtu.be/ID?t=326` and
+`youtube.com/embed/ID?start=90` → `youtu.be/ID?t=90`. No timestamp is ever invented. That is a pure text rewrite — no
 request and no third-party shortener — so the report stays offline and the link
 stays verifiable. A link whose credentials had to be redacted is shown as plain
 code instead, never as a clickable target.
