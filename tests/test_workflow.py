@@ -128,8 +128,11 @@ class WorkflowContractTests(unittest.TestCase):
 
         The dependabot contract and the shipped JSON data are validated here.
         If any of those paths fall out of the workflow filter, a data-only
-        pull request could bypass its assertion. README.md is deliberately
-        absent: no test reads it, so its wording belongs to the maintainer.
+        pull request could bypass its assertion.
+
+        README.md is deliberately absent, and no test in this suite may read
+        it. The README belongs to the maintainer: it may be one line or a
+        hundred, and it may be deleted outright, without any check objecting.
         """
         block = self.workflow.split("  pull_request:\n", 1)[1].split("\npermissions:", 1)[0]
         patterns = re.findall(r'^\s+- "([^"]+)"', block, re.M)

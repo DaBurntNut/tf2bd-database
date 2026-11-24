@@ -43,12 +43,11 @@ on:
       - ".gitattributes"
       - ".gitignore"
       - "playerlist.garou3299.json"
-      # playerlist.scammers.json is not listed: the sync never reads or writes
-      # it and no test checks it, so an edit there has nothing to verify.
       - "rules.garou3299.json"
       - "snapshot/playerlist.vorobey-hackerpolice.json"
       # Tests read the Dependabot config and this workflow; include each in this filter.
-      # README.md is not listed: no test reads it, so prose edits need no checks.
+      # README.md is not listed, and no test may depend on it: its contents and its
+      # existence are the maintainer's to change, up to deleting the file outright.
       - ".github/dependabot.yml"
       - ".github/workflows/sync-vorobey-hackerpolice.yml"
 
