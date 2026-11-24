@@ -792,6 +792,17 @@ class DeclaredSchemaTests(unittest.TestCase):
                 self.assertEqual(len(result.errors), 1, result.errors)
                 self.assertIn("unusable steamid", result.errors[0])
 
+    def test_an_unusable_steamid_is_one_complaint_not_two(self):
+        """The error already names the field; a spelling warning adds nothing.
+
+        One problem per field is the rule the rest of the validator follows.
+        """
+        for spelling in ("not-a-steamid", "", "-5", "[G:1:123]", 0, {"a": 1}, []):
+            with self.subTest(steamid=spelling):
+                result = validate({"players": [{"steamid": spelling, "attributes": ["cheater"]}]})
+                self.assertEqual(len(result.errors), 1, result.errors)
+                self.assertEqual(result.warnings, [], "the error already covers this field")
+
     def test_a_steamid_warning_names_the_canonical_form_to_use(self):
         (warning,) = self._only_warnings({"steamid": "STEAM_0:1:123", "attributes": ["cheater"]})
         self.assertIn("expected [U:1:247]", warning)

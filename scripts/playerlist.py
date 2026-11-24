@@ -839,10 +839,14 @@ def _check_declared_schema(result: ValidationResult, position: int, shown: str, 
     validation in an editor, and the file names that schema itself.
     """
     steamid = player.get("steamid")
-    if isinstance(steamid, str) and not SCHEMA_STEAMID.fullmatch(steamid):
-        canonical = normalize_steamid(steamid)
-        suggestion = f", expected {canonical}" if canonical else ""
-        result.add_warning(f"players[{position}] ({shown}) stores a steamid the declared schema rejects{suggestion}")
+    canonical = normalize_steamid(steamid)
+    # Only a *resolvable* id stored in the wrong spelling is worth saying. An
+    # unresolvable one already produced an error naming the same field, and one
+    # problem per field is the rule everywhere else in here.
+    if canonical is not None and isinstance(steamid, str) and not SCHEMA_STEAMID.fullmatch(steamid):
+        result.add_warning(
+            f"players[{position}] ({shown}) stores a steamid the declared schema rejects, expected {canonical}"
+        )
 
     unexpected_entry = sorted(set(player) - SCHEMA_ENTRY_KEYS)
     if unexpected_entry:
