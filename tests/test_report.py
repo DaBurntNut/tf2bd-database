@@ -1904,6 +1904,56 @@ class CapBoundaryTests(unittest.TestCase):
             with self.subTest(link=link):
                 self.assertEqual(report_module._youtube_short_url(link), expected)
 
+    def test_a_timestamp_without_a_seconds_part_is_still_a_timestamp(self):
+        """YouTube reads t=5m as 5:00 and t=1h30m as 1:30:00.
+
+        These used to be dropped because the pattern demanded a trailing
+        seconds count, so a proof citing a moment in a long video silently
+        lost the moment and opened at 0:00 -- the one thing the rewrite
+        promises not to do.
+        """
+        for value, expected in (
+            ("2h", "https://youtu.be/DXQ5gEDIhzE?t=2h"),
+            ("5m", "https://youtu.be/DXQ5gEDIhzE?t=5m"),
+            ("1h30m", "https://youtu.be/DXQ5gEDIhzE?t=1h30m"),
+            ("1h2m", "https://youtu.be/DXQ5gEDIhzE?t=1h2m"),
+            ("1h30", "https://youtu.be/DXQ5gEDIhzE?t=1h30"),
+        ):
+            with self.subTest(value=value):
+                link = f"https://www.youtube.com/watch?v=DXQ5gEDIhzE&t={value}"
+                self.assertEqual(report_module._youtube_short_url(link), expected)
+
+    def test_a_value_that_is_not_a_time_is_never_pasted_into_the_link(self):
+        """Widening the accepted forms must not let arbitrary text through.
+
+        Each of these is rejected for its own reason: no digit at all, a unit
+        with no count, units out of order or repeated, the colon form YouTube
+        does not read, a sign or a decimal point, and an uppercase unit.
+        """
+        for value in (
+            "",
+            "h",
+            "m",
+            "s",
+            "hms",
+            "1:30",
+            "1m2h",
+            "1h1h1s",
+            "1s30m",
+            "-5",
+            "+5",
+            "1.5",
+            "1H30M",
+            "5S",
+            "1 30",
+            "1h 30m",
+            "42s evil",
+            "1e3",
+        ):
+            with self.subTest(value=value):
+                link = f"https://www.youtube.com/watch?v=DXQ5gEDIhzE&t={value}"
+                self.assertEqual(report_module._youtube_short_url(link), "https://youtu.be/DXQ5gEDIhzE")
+
     def test_no_timestamp_is_ever_invented(self):
         # The rule is "carry it only if the long form had one".
         for link in (

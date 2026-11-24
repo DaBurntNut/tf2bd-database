@@ -349,10 +349,14 @@ _YOUTUBE_ID_PATH = re.compile(r"^/(?:shorts|embed|live|v)/(?P<id>[A-Za-z0-9_-]+)
 _YOUTUBE_SHORT = re.compile(r"^https?://youtu\.be/(?P<id>[A-Za-z0-9_-]+)(?:\?(?P<query>[^#]*))?(?:#.*)?$", re.ASCII)
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
 # Query keys that name a position in the video, and the forms YouTube accepts
-# for one ("42", "42s", "1m30s", "1h2m3s"). Anything else is not a timestamp and
-# is dropped rather than pasted into the link.
+# for one: bare seconds ("42"), any of the hour/minute/second units in that
+# order ("42s", "5m", "2h", "1h30m", "1m30s", "1h2m3s"), and a trailing count
+# with the "s" left off ("1h30"). At least one digit is required, so an empty
+# or unit-only value is not a timestamp; the colon form ("1:30") is not one
+# either, because YouTube does not accept it. Anything else is dropped rather
+# than pasted into the link.
 _YOUTUBE_TIMESTAMP_KEYS = frozenset({"t", "start"})
-_YOUTUBE_TIME = re.compile(r"^(?:\d+h)?(?:\d+m)?(?:\d+s?)$", re.ASCII)
+_YOUTUBE_TIME = re.compile(r"^(?=\d)(?:\d+h)?(?:\d+m)?(?:\d+s?)?$", re.ASCII)
 
 
 def _youtube_short_url(link: str) -> str | None:
