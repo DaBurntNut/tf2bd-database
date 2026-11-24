@@ -742,5 +742,136 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual(len(result.warnings), 1)
 
 
+class DeclaredSchemaTests(unittest.TestCase):
+    """The playerlist files name a TF2BD schema; warn where they do not meet it.
+
+    ``normalize_steamid`` reads legacy and SteamID64 spellings on purpose, so
+    an upstream list in any format can be matched. A database that *stores*
+    one of those spellings still loads here but fails validation in an editor
+    pointed at the schema the file itself declares. Every check below is a
+    warning: none of them stops a sync.
+    """
+
+    def _only_warnings(self, entry):
+        result = validate({"players": [entry]})
+        self.assertEqual(result.errors, [], "a shape issue must never block a sync")
+        return result.warnings
+
+    def test_a_steamid_spelling_the_schema_rejects_is_flagged(self):
+        for spelling in (
+            "STEAM_0:1:123",
+            "STEAM_1:0:456",
+            "76561197960531246",
+            "https://steamcommunity.com/profiles/76561197960531246",
+            "U:1:123",
+        ):
+            with self.subTest(steamid=spelling):
+                warnings = self._only_warnings({"steamid": spelling, "attributes": ["cheater"]})
+                self.assertTrue(
+                    any("declared schema rejects" in w for w in warnings),
+                    f"{spelling} is stored in a form the schema forbids: {warnings}",
+                )
+
+    def test_the_canonical_spellings_are_not_flagged(self):
+        for spelling in ("[U:1:123]", "[U:1:123:2]", 76561197960531246):
+            with self.subTest(steamid=spelling):
+                self.assertEqual(self._only_warnings({"steamid": spelling, "attributes": ["cheater"]}), [])
+
+    def test_a_non_player_account_type_stays_a_hard_error(self):
+        """Here the tool is deliberately stricter than the schema it declares.
+
+        The schema's SteamID pattern accepts any letter, so ``[G:1:4]`` (a
+        group) and ``[A:1:4]`` (an anonymous account) satisfy it. Neither is a
+        player, so neither belongs in a playerlist, and the tool cannot reason
+        about an entry it cannot resolve to a person: that is an error that
+        stops the run, not a cosmetic warning.
+        """
+        for spelling in ("[A:1:123]", "[G:1:123]", "[C:1:123]", "[P:1:123]"):
+            with self.subTest(steamid=spelling):
+                result = validate({"players": [{"steamid": spelling, "attributes": ["cheater"]}]})
+                self.assertEqual(len(result.errors), 1, result.errors)
+                self.assertIn("unusable steamid", result.errors[0])
+
+    def test_a_steamid_warning_names_the_canonical_form_to_use(self):
+        (warning,) = self._only_warnings({"steamid": "STEAM_0:1:123", "attributes": ["cheater"]})
+        self.assertIn("expected [U:1:247]", warning)
+
+    def test_last_seen_must_carry_an_integer_time(self):
+        for last_seen in ({"player_name": "x"}, {"time": "1"}, {"time": 1.5}, {"time": True}, {"time": None}):
+            with self.subTest(last_seen=last_seen):
+                warnings = self._only_warnings(
+                    {"steamid": "[U:1:1]", "attributes": ["cheater"], "last_seen": last_seen}
+                )
+                self.assertTrue(any("integer 'time'" in w for w in warnings), warnings)
+
+    def test_a_well_formed_last_seen_is_silent(self):
+        for last_seen in ({"time": 1}, {"time": 1, "player_name": "x"}, {"time": 0}):
+            with self.subTest(last_seen=last_seen):
+                self.assertEqual(
+                    self._only_warnings({"steamid": "[U:1:1]", "attributes": ["cheater"], "last_seen": last_seen}),
+                    [],
+                )
+
+    def test_a_non_string_player_name_is_flagged_but_still_renders(self):
+        """The report prints whatever is there; the schema still wants a string."""
+        for value in (7, None, ["x"], {"a": 1}, True):
+            with self.subTest(player_name=value):
+                entry = {
+                    "steamid": "[U:1:1]",
+                    "attributes": ["cheater"],
+                    "last_seen": {"time": 1, "player_name": value},
+                }
+                warnings = self._only_warnings(entry)
+                self.assertTrue(any("non-string 'last_seen.player_name'" in w for w in warnings), warnings)
+                playerlist_module.player_name(entry)
+
+    def test_unexpected_keys_are_named(self):
+        warnings = self._only_warnings(
+            {"steamid": "[U:1:1]", "attributes": ["cheater"], "notes": "x", "last_seen": {"time": 1, "zz": 2}}
+        )
+        self.assertTrue(any("unexpected key: 'notes'" in w for w in warnings), warnings)
+        self.assertTrue(any("unexpected 'last_seen' key: 'zz'" in w for w in warnings), warnings)
+
+    def test_a_missing_last_seen_is_fine(self):
+        """It is optional in the schema, and most of a hand-built list omits it."""
+        self.assertEqual(self._only_warnings({"steamid": "[U:1:1]", "attributes": ["cheater"]}), [])
+
+    def test_a_malformed_last_seen_does_not_also_crash_the_name_lookup(self):
+        for last_seen in ("nope", 7, None, []):
+            with self.subTest(last_seen=last_seen):
+                entry = {"steamid": "[U:1:1]", "attributes": ["cheater"], "last_seen": last_seen}
+                self.assertTrue(self._only_warnings(entry))
+                self.assertEqual(playerlist_module.player_name(entry), "")
+
+
+class ShippedDataMatchesItsDeclaredSchemaTests(unittest.TestCase):
+    """The file the bot writes must satisfy the schema it points at.
+
+    The bot only ever rewrites ``attributes``, so a violation here means a
+    hand edit introduced one. Catching it in CI is the whole point: the
+    maintainer's editor would show it, but a commit need not go through one.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def test_the_synced_database_has_no_schema_warnings_at_all(self):
+        database = json.loads((self.ROOT / "playerlist.garou3299.json").read_text(encoding="utf-8"))
+        result = validate(database)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.warnings, [], "the file declares a schema it no longer matches")
+
+    def test_the_scammer_list_deviates_only_in_its_attribute_vocabulary(self):
+        """``scammer`` is not a TF2BD attribute, and that list is the maintainer's.
+
+        The bot never reads this file. Pin the deviation so it stays the only
+        one rather than becoming cover for a second, accidental problem.
+        """
+        database = json.loads((self.ROOT / "playerlist.scammers.json").read_text(encoding="utf-8"))
+        result = validate(database)
+        self.assertEqual(result.errors, [])
+        self.assertTrue(result.warnings)
+        self.assertEqual([w for w in result.warnings if "unknown attribute" not in w], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

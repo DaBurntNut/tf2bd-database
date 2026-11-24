@@ -67,6 +67,16 @@ MAX_ACCOUNT_ID_DIGITS = 10
 # Below this length a mixed-case blob is an ordinary word, not a credential.
 MIN_OPAQUE_CREDENTIAL_CHARS = 12
 
+# The playerlist files declare the TF2BD v3 schema, and that schema is stricter
+# about shape than this tool needs to be about meaning. normalize_steamid
+# deliberately reads legacy and SteamID64 spellings so an upstream list in any
+# format can be matched, but a file that *stores* one of those spellings is
+# rejected by the editor validating against the declared schema. Warn, never
+# fail: the sync itself works fine either way.
+SCHEMA_STEAMID = re.compile(r"\[[A-Za-z]:\d:\d+(?::\d+)?\]")
+SCHEMA_LAST_SEEN_KEYS = frozenset({"player_name", "time"})
+SCHEMA_ENTRY_KEYS = frozenset({"attributes", "last_seen", "proof", "steamid"})
+
 # Substrings that make a field or query-parameter name look like a credential.
 #
 # This is the single vocabulary both redactors share: ``sources`` applies it to
@@ -820,6 +830,48 @@ class ValidationResult:
         return not self.errors and self.errors_omitted == 0
 
 
+def _check_declared_schema(result: ValidationResult, position: int, shown: str, player: Player) -> None:
+    """Warn about shapes the declared TF2BD schema rejects but this tool tolerates.
+
+    These are warnings on purpose. None of them stops a sync - the tool reads a
+    legacy SteamID spelling perfectly well, and a missing ``last_seen.time``
+    only costs a player name in the report - but each one makes the file fail
+    validation in an editor, and the file names that schema itself.
+    """
+    steamid = player.get("steamid")
+    if isinstance(steamid, str) and not SCHEMA_STEAMID.fullmatch(steamid):
+        canonical = normalize_steamid(steamid)
+        suggestion = f", expected {canonical}" if canonical else ""
+        result.add_warning(f"players[{position}] ({shown}) stores a steamid the declared schema rejects{suggestion}")
+
+    unexpected_entry = sorted(set(player) - SCHEMA_ENTRY_KEYS)
+    if unexpected_entry:
+        shown_keys = ", ".join(_shown(key) for key in unexpected_entry[:3])
+        label = "key" if len(unexpected_entry) == 1 else "keys"
+        result.add_warning(f"players[{position}] ({shown}) has unexpected {label}: {shown_keys}")
+
+    if "last_seen" not in player:
+        return
+    last_seen = player.get("last_seen")
+    if not isinstance(last_seen, dict):
+        result.add_warning(f"players[{position}] ({shown}) has a 'last_seen' that is not an object")
+        return
+    moment = last_seen.get("time")
+    # bool is an int subclass; "time": true is not a timestamp.
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        result.add_warning(
+            f"players[{position}] ({shown}) has a 'last_seen' without an integer 'time', which the schema requires"
+        )
+    name = last_seen.get("player_name")
+    if "player_name" in last_seen and not isinstance(name, str):
+        result.add_warning(f"players[{position}] ({shown}) has a non-string 'last_seen.player_name'")
+    unexpected = sorted(set(last_seen) - SCHEMA_LAST_SEEN_KEYS)
+    if unexpected:
+        shown_keys = ", ".join(_shown(key) for key in unexpected[:3])
+        label = "key" if len(unexpected) == 1 else "keys"
+        result.add_warning(f"players[{position}] ({shown}) has unexpected 'last_seen' {label}: {shown_keys}")
+
+
 def validate(database: PlayerList) -> ValidationResult:
     """Check the invariants this tool relies on (unique, usable SteamIDs)."""
     result = ValidationResult()
@@ -867,5 +919,7 @@ def validate(database: PlayerList) -> ValidationResult:
         proof = player.get("proof")
         if "proof" in player and (not isinstance(proof, list) or not all(isinstance(item, str) for item in proof)):
             result.add_error(f"players[{position}] ({shown}) has a malformed 'proof' (must be an array of strings)")
+
+        _check_declared_schema(result, position, shown, player)
 
     return result
