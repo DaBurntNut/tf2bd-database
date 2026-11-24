@@ -53,6 +53,29 @@ class NormalizeSteamIdTests(unittest.TestCase):
             self.assertIsNone(normalize_steamid(probe), probe)
         self.assertIsNone(playerlist_module._bounded_int("²"))  # Defensive guard; normal input cannot reach this case.
 
+    def test_account_id_one_is_the_lowest_usable_steamid(self):
+        """The test above pins the id just below the range; this pins the first
+        id inside it, in every notation. Without it, narrowing either range
+        check to ``1 < account`` passes the entire suite while quietly dropping
+        a real player from the list.
+        """
+        from playerlist import STEAMID64_BASE
+
+        for probe in (
+            1,
+            "1",
+            "0000000001",
+            "[U:1:1]",
+            "U:1:1",
+            "[U:1:1:0]",
+            "STEAM_0:1:0",
+            STEAMID64_BASE + 1,
+            str(STEAMID64_BASE + 1),
+            f"https://steamcommunity.com/profiles/{STEAMID64_BASE + 1}",
+        ):
+            with self.subTest(probe=probe):
+                self.assertEqual(normalize_steamid(probe), "[U:1:1]")
+
     def test_non_ascii_digits_are_rejected_not_crashed(self):
         """Regression: "²".isdigit() is True but int("²") raises, so a single
         corrupted SteamID used to crash the whole run; "١٢٣" was silently
@@ -529,6 +552,64 @@ class DisplayPathTests(unittest.TestCase):
                 shown = display_path(value)
                 self.assertNotIn(secret, shown)
                 self.assertIn("REDACTED", shown)
+
+    def test_a_quoted_secret_is_redacted_whole_even_when_it_holds_a_delimiter(self):
+        """A quoted value runs to its closing quote, not to the first space or
+        comma inside it. Scanning it as though it were unquoted would stop at
+        the delimiter and leave the tail of the secret -- and a stray quote --
+        in the message.
+        """
+        for value, expected in (
+            ('password="a b"', "password=REDACTED"),
+            ("token='a,b'", "token=REDACTED"),
+            ('secret="a;b"', "secret=REDACTED"),
+            ('api_key="a&b"', "api_key=REDACTED"),
+            ('password="a\tb"', "password=REDACTED"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(display_path(value), expected)
+
+    def test_a_backslash_escape_does_not_end_a_quoted_secret_early(self):
+        """An escaped quote is part of the value; an escaped backslash is not an
+        escape for the quote that follows it. Getting either wrong ends the
+        value at the wrong character and prints the rest of the secret.
+        """
+        for value, expected in (
+            ('token="a\\"b c"', "token=REDACTED"),
+            ('key:"a\\\\".', "key:REDACTED."),
+            ("token='\\\\'&z=1", "token=REDACTED&z=1"),
+            ('api_key="a\\\\\\\\"', "api_key=REDACTED"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(display_path(value), expected)
+
+    def test_an_unterminated_quoted_secret_is_redacted_to_the_end(self):
+        """A value whose quote never closes runs to the end of the text, and it
+        stays a QUOTED span: the trailing-punctuation rule that would hand back
+        a final ``.`` or ``!`` applies to bare values only. Treating the span as
+        bare here would print the last character of the secret.
+        """
+        for value, expected in (
+            ('key:"abc.', "key:REDACTED"),
+            ('token="secret!', "token=REDACTED"),
+            ('password="a b.', "password=REDACTED"),
+            ("api_key='x,", "api_key=REDACTED"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(display_path(value), expected)
+
+    def test_an_unquoted_secret_ends_at_the_delimiter_and_keeps_the_rest(self):
+        """The counterpart to the quoted cases: a bare value stops at the first
+        delimiter, and whatever follows it is ordinary text that must survive.
+        """
+        for value, expected in (
+            ("api_key=a)b more", "api_key=REDACTED more"),
+            ("token=a,b", "token=REDACTED,b"),
+            ('token="x".', "token=REDACTED."),
+            ("password:''.", "password:REDACTED."),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(display_path(value), expected)
 
     def test_ordinary_english_after_bearer_or_basic_is_not_redacted(self):
         # These words are ordinary English, and this redactor runs over player

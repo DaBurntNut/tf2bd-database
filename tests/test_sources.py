@@ -866,6 +866,52 @@ class SourceFetchTests(unittest.TestCase):
                 self.assertEqual(expected, shown)
                 self.assertNotIn("SECRETPW", shown)
 
+    def test_prose_exactly_at_the_inspection_limit_is_still_inspected(self):
+        """The limit is a maximum, not a threshold: text OF that length is
+        inspected, and only text past it is dropped unread. An off-by-one here
+        would throw away a redactable message that is exactly at the edge.
+        """
+        limit = sources._MAX_URL_PARSE_CHARS
+        for length, inspected in ((limit - 1, True), (limit, True), (limit + 1, False)):
+            with self.subTest(length=length):
+                text = "http://u:pw@x.test/?a=1 " + "b" * (length - 24)
+                self.assertEqual(len(text), length)
+                shown = sources.redact_urls_in_text(text)
+                self.assertNotIn("u:pw@", shown)
+                if inspected:
+                    self.assertTrue(shown.startswith("http://x.test/?a=1 "), shown[:40])
+                else:
+                    self.assertEqual(shown, "[text omitted: too long to inspect safely]")
+
+    def test_one_bare_url_is_told_apart_from_prose_that_merely_has_punctuation(self):
+        """Prose is not parsed as a URL just because it contains a colon, and a
+        lone URL is not left unparsed just because it has no scheme. The HTML
+        reference case is the subtle one: ``a#b&#64;c`` is prose whose ``#``
+        introduces an entity, not a fragment.
+        """
+        for text, expected in (
+            ("http://x.test/a", True),
+            ("https://x.test/a", True),
+            ("HTTP://x.test/a", True),
+            ("see http://x.test", False),
+            ("a?b", True),
+            ("a#b", True),
+            ("a#b&#64;c", False),
+            ("a:b", False),
+            ("x", False),
+        ):
+            with self.subTest(text=text):
+                self.assertIs(sources._is_one_bare_url(text), expected)
+
+    def test_an_encoded_scheme_inside_entity_brackets_is_not_left_in_prose(self):
+        """Decoding reveals a URL that the raw text hides behind ``%3A%2F%2F``
+        and HTML brackets. It must be reported as omitted rather than passed
+        through with the encoded scheme intact.
+        """
+        shown = sources.redact_urls_in_text("&lt;http%3A%2F%2F[::1]&gt;")
+        self.assertNotIn("%3A%2F%2F", shown)
+        self.assertIn("omitted", shown)
+
     def test_a_quote_inside_userinfo_cannot_smuggle_a_password_through_prose(self):
         """``'`` is a legal sub-delimiter in userinfo, and the prose patterns stop at it.
 
