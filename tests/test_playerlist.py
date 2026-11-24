@@ -639,7 +639,7 @@ class ValidateTests(unittest.TestCase):
             {
                 "players": [
                     {"steamid": "x\n### fake heading\x1b[32m", "attributes": []},
-                    {"steamid": "[U:1:2]", "attributes": ["scammer\nINFO: all good\x1b[0m"]},
+                    {"steamid": "[U:1:2]", "attributes": ["not-a-real-attribute\nINFO: all good\x1b[0m"]},
                 ]
             }
         )
@@ -737,7 +737,9 @@ class ValidateTests(unittest.TestCase):
                 self.assertIn("has no attributes", result.errors[0])
 
     def test_unknown_attribute_is_only_a_warning(self):
-        result = validate({"players": [{"steamid": "[U:1:1]", "attributes": ["scammer"]}]})
+        # Any string that is not one of KNOWN_ATTRIBUTES will do; it is spelled
+        # out here so nobody mistakes it for a tag this project recognises.
+        result = validate({"players": [{"steamid": "[U:1:1]", "attributes": ["not-a-real-attribute"]}]})
         self.assertEqual(result.errors, [])
         self.assertEqual(len(result.warnings), 1)
 
