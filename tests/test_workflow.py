@@ -555,7 +555,7 @@ class RepositoryDataTests(unittest.TestCase):
                 break
         return "\n".join(lines[start:end])
 
-    def test_a_running_sync_is_never_cancelled_and_cannot_hang_forever(self):
+    def test_a_running_sync_is_never_canceled_and_cannot_hang_forever(self):
         workflow = (self.ROOT / ".github/workflows/sync-vorobey-hackerpolice.yml").read_text(encoding="utf-8")
         sync_block = self.job_block(workflow, "sync")
         self.assertIn("cancel-in-progress: false", workflow)

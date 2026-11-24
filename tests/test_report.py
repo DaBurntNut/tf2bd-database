@@ -1954,6 +1954,27 @@ class CapBoundaryTests(unittest.TestCase):
                 link = f"https://www.youtube.com/watch?v=DXQ5gEDIhzE&t={value}"
                 self.assertEqual(report_module._youtube_short_url(link), "https://youtu.be/DXQ5gEDIhzE")
 
+    def test_only_the_first_timestamp_survives(self):
+        """Two positions cannot both be the moment a proof means.
+
+        Passing every match through produced links like ``?t=42s&t=1m30s``,
+        which leaves the reader guessing which one YouTube honors and
+        contradicts the single timestamp this function promises.
+        """
+        for link, expected in (
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s&t=1m30s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s&start=90", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=90&t=42s", "https://youtu.be/DXQ5gEDIhzE?start=90"),
+            ("https://youtu.be/DXQ5gEDIhzE?t=5s&t=6s&t=7s", "https://youtu.be/DXQ5gEDIhzE?t=5s"),
+            # A junk value is skipped, not counted as the one timestamp.
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=abc&t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._youtube_short_url(link), expected)
+        # A repeated key can no longer inflate the rewritten link.
+        flood = "https://www.youtube.com/watch?v=DXQ5gEDIhzE&" + "&".join(["t=1s"] * 40)
+        self.assertEqual(report_module._youtube_short_url(flood), "https://youtu.be/DXQ5gEDIhzE?t=1s")
+
     def test_no_timestamp_is_ever_invented(self):
         # The rule is "carry it only if the long form had one".
         for link in (

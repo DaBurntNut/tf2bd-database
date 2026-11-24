@@ -405,9 +405,13 @@ def _youtube_short_url(link: str) -> str | None:
                 video_id = by_path.group("id")
     if video_id is None or not _VIDEO_ID.match(video_id):
         return None
-    # Keep a real timestamp, in the order it appeared; drop everything else.
-    kept = [(key, value) for key, value in pairs if key in _YOUTUBE_TIMESTAMP_KEYS and _YOUTUBE_TIME.match(value)]
-    timestamp = "?" + urllib.parse.urlencode(kept) if kept else ""
+    # Keep the FIRST real timestamp and drop everything else, including any
+    # later one: two positions cannot both be the moment a proof means, and
+    # repeating the key would only make the reader guess which YouTube honors.
+    kept = next(
+        ((key, value) for key, value in pairs if key in _YOUTUBE_TIMESTAMP_KEYS and _YOUTUBE_TIME.match(value)), None
+    )
+    timestamp = "?" + urllib.parse.urlencode([kept]) if kept is not None else ""
     return f"https://youtu.be/{video_id}{timestamp}"
 
 

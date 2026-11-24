@@ -1624,7 +1624,7 @@ class CliTests(unittest.TestCase):
             sync_module._load_index(SimpleNamespace(source=["x"]))
         self.assertIn("no usable SteamIDs", str(caught.exception))
 
-    def test_a_cancelled_write_leaves_no_temp_file(self):
+    def test_a_canceled_write_leaves_no_temp_file(self):
         """Ctrl-C mid-write must not leave junk in the repository."""
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "playerlist.json"
