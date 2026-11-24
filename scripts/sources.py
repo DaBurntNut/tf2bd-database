@@ -473,6 +473,99 @@ def _sanitized_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tup
     return safe_items, changed
 
 
+def _path_hides_userinfo(parts: urllib.parse.SplitResult) -> bool:
+    """True when a malformed HTTP URL left credentials in its path.
+
+    ``urlsplit`` only fills ``netloc`` when the URL has a ``//``, so
+    ``https:user@host`` parses with an empty authority and the userinfo sits
+    in ``path`` where the authority rules never see it. Percent-encoding can
+    hide the ``@`` as well, so a bounded number of decoding layers is
+    inspected -- unless the path is itself an encoded URL, which
+    ``_redact_nested_url`` handles later with the depth counter.
+    """
+    if parts.scheme.lower() not in {"http", "https"} or parts.netloc:
+        return False
+    if "@" in parts.path:
+        return True
+    if not _PERCENT_ESCAPE.search(parts.path) or _ENCODED_HTTP_URL_MARKER.search(parts.path) is not None:
+        return False
+    candidate = parts.path
+    for _ in range(_MAX_NESTED_URL_DEPTH):
+        decoded = urllib.parse.unquote(candidate)
+        if decoded == candidate:
+            break
+        candidate = decoded
+        if "@" in candidate:
+            return True
+    # Still encoded after the inspection limit: it cannot be shown to be safe.
+    return _PERCENT_ESCAPE.search(candidate) is not None
+
+
+def _netloc_without_encoded_userinfo(netloc: str) -> str | None:
+    """Strip userinfo whose ``@`` is percent-encoded, or ``None`` if unsafe to show.
+
+    Encoded reserved characters are not delimiters to ``urlsplit``, so it
+    reports no username, but a later consumer may decode them and find one.
+    """
+    candidate = netloc
+    for _ in range(_MAX_NESTED_URL_DEPTH):
+        decoded = urllib.parse.unquote(candidate)
+        if decoded == candidate:
+            break
+        candidate = decoded
+        at = candidate.rfind("@")
+        if at >= 0:
+            # A delimiter before the ``@`` means this is no longer one authority.
+            return None if any(char in candidate[:at] for char in "/?#") else candidate[at + 1 :]
+    # Omit a netloc that is still encoded after the inspection limit.
+    return None if _PERCENT_ESCAPE.search(candidate) else netloc
+
+
+def _authority_without_userinfo(parts: urllib.parse.SplitResult) -> str:
+    """Rebuild ``host[:port]`` from a parsed URL, dropping any ``user:password``."""
+    host = parts.hostname or ""
+    # Restore IPv6 brackets when rebuilding the authority.
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:  # Ignore malformed ports rather than failing during redaction.
+        return host
+    return host if port is None else f"{host}:{port}"
+
+
+def _redacted_path(path: str, depth: int) -> str:
+    """Redact a URL nested inside a path, keeping it one path component."""
+    safe_path = _redact_nested_url(path, depth)
+    if safe_path == path:
+        return path
+    # Keep nested URL separators inside the path; never let a decoded ? or # escape its component.
+    return urllib.parse.quote(_no_surrogates(safe_path), safe="/:@!$&'()*+,;=-._~")
+
+
+def _redacted_query(query: str, depth: int) -> str:
+    """Redact secret-looking parameters and nested URLs in a query string."""
+    if not query:
+        return query
+    safe_items, changed = _sanitized_pairs(_query_pairs(query), depth)
+    return urllib.parse.urlencode(safe_items) if changed else query
+
+
+def _redacted_fragment(fragment: str, depth: int) -> str:
+    """Redact a fragment, which may be query-shaped (OAuth) or hold a nested URL."""
+    if not fragment:
+        return fragment
+    if "=" in fragment:
+        fragment = _redacted_query(fragment, depth)
+    return _redact_nested_url(fragment, depth)
+
+
+def _fit_url_for_display(shown: str) -> str:
+    """Make a redacted URL safe to print, on one line and within the display cap."""
+    shown = redact_diagnostic_text(_one_line(_no_surrogates(shown)))
+    return shown if len(shown) <= MAX_URL_DISPLAY_CHARS else shown[:MAX_URL_DISPLAY_CHARS] + "…"
+
+
 def _redact_url(url: str, depth: int) -> str:
     """Hide credentials in a URL before it is logged or published.
 
@@ -484,6 +577,9 @@ def _redact_url(url: str, depth: int) -> str:
     so the line still identifies what was fetched. Oversized URLs are omitted
     before parsing: even a giant path need not be scanned to display a truncated
     link, and a giant query could make ``parse_qsl`` allocate millions of pairs.
+
+    Anything that cannot be shown to be credential-free is omitted rather than
+    guessed at, so each step below either narrows the URL or gives up on it.
     """
     if len(url) > _MAX_URL_PARSE_CHARS:
         return "[URL omitted: too long to inspect safely]"
@@ -492,92 +588,33 @@ def _redact_url(url: str, depth: int) -> str:
     decoded_url = _html_unescape_bounded(url)
     if decoded_url is None:
         return "[URL omitted: too deeply encoded to inspect safely]"
-    url = decoded_url
     try:
-        parts = urllib.parse.urlsplit(url)
+        parts = urllib.parse.urlsplit(decoded_url)
     except ValueError:
         # Omit unparseable URLs rather than risk echoing credentials.
         return "[malformed URL omitted]"
-    is_http_without_authority = parts.scheme.lower() in {"http", "https"} and not parts.netloc
-    if is_http_without_authority and (
-        "@" in parts.path
-        or (_PERCENT_ESCAPE.search(parts.path) and _ENCODED_HTTP_URL_MARKER.search(parts.path) is None)
-    ):
-        # urllib leaves userinfo-looking text in the path of malformed URLs such as ``https:user@host``.
-        if "@" in parts.path:
-            return "[malformed URL omitted]"
-        candidate = parts.path
-        for _ in range(_MAX_NESTED_URL_DEPTH):
-            decoded = urllib.parse.unquote(candidate)
-            if decoded == candidate:
-                break
-            candidate = decoded
-            if "@" in candidate:
-                return "[malformed URL omitted]"
-        if _PERCENT_ESCAPE.search(candidate):
-            return "[malformed URL omitted]"
+
+    if _path_hides_userinfo(parts):
+        return "[malformed URL omitted]"
 
     netloc = parts.netloc
     if parts.username is None and _PERCENT_ESCAPE.search(netloc):
-        # Encoded reserved characters are not delimiters to urlsplit(), but a later consumer may decode them.
-        candidate = netloc
-        found_encoded_userinfo = False
-        for _ in range(_MAX_NESTED_URL_DEPTH):
-            decoded = urllib.parse.unquote(candidate)
-            if decoded == candidate:
-                break
-            candidate = decoded
-            at = candidate.rfind("@")
-            if at >= 0:
-                if any(char in candidate[:at] for char in "/?#"):
-                    return "[malformed URL omitted]"
-                netloc = candidate[at + 1 :]
-                found_encoded_userinfo = True
-                break
-        if not found_encoded_userinfo and _PERCENT_ESCAPE.search(candidate):
+        resolved = _netloc_without_encoded_userinfo(netloc)
+        if resolved is None:
             return "[malformed URL omitted]"
+        netloc = resolved
+    elif parts.username is not None:
+        netloc = _authority_without_userinfo(parts)
 
-    if parts.username is not None:
-        host = parts.hostname or ""
-        # Restore IPv6 brackets when rebuilding the authority.
-        if ":" in host:
-            host = f"[{host}]"
-        try:
-            port = parts.port
-        except ValueError:  # Ignore malformed ports rather than failing during redaction.
-            port = None
-        if port is not None:
-            host = f"{host}:{port}"
-        netloc = host
-
-    path = parts.path
-    safe_path = _redact_nested_url(path, depth)
-    if safe_path != path:
-        # Keep nested URL separators inside the path; never let a decoded ? or # escape its component.
-        path = urllib.parse.quote(_no_surrogates(safe_path), safe="/:@!$&'()*+,;=-._~")
-
-    query = parts.query
-    if query:
-        safe_items, changed = _sanitized_pairs(_query_pairs(query), depth)
-        if changed:
-            query = urllib.parse.urlencode(safe_items)
-
-    # Redact query-shaped fragments (for example, OAuth tokens) and nested URLs in ordinary anchors.
-    fragment = parts.fragment
-    if fragment and "=" in fragment:
-        safe_items, changed = _sanitized_pairs(_query_pairs(fragment), depth)
-        if changed:
-            fragment = urllib.parse.urlencode(safe_items)
-    if fragment:
-        fragment = _redact_nested_url(fragment, depth)
+    path = _redacted_path(parts.path, depth)
+    query = _redacted_query(parts.query, depth)
+    fragment = _redacted_fragment(parts.fragment, depth)
 
     if netloc == parts.netloc and path == parts.path and query == parts.query and fragment == parts.fragment:
         shown = original_url  # Preserve the caller's original spelling when nothing needs redaction.
     else:
         shown = urllib.parse.urlunsplit((parts.scheme, netloc, path, query, fragment))
-    # Keep output encodable and on one line.
-    shown = redact_diagnostic_text(_one_line(_no_surrogates(shown)))
-    return shown if len(shown) <= MAX_URL_DISPLAY_CHARS else shown[:MAX_URL_DISPLAY_CHARS] + "…"
+    return _fit_url_for_display(shown)
 
 
 def redact_url(url: str) -> str:

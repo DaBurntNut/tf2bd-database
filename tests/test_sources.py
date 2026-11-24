@@ -844,6 +844,28 @@ class SourceFetchTests(unittest.TestCase):
                 self.assertNotIn("username", shown)
                 self.assertEqual("Proof: https://host.invalid/x", shown)
 
+    def test_an_encoded_at_sign_is_stripped_wherever_it_decodes(self):
+        """The authority is rebuilt from the text after the LAST decoded ``@``.
+
+        Three edges of that rule had no test. An ``@`` decoding to position
+        zero still delimits an (empty) userinfo; the host begins one character
+        past it, not at it; and a URL that already declares a username takes
+        the parsed-authority path even when the rest is percent-encoded. Each
+        case below fails if any of those three is altered.
+        """
+        for url, expected in (
+            # The decoded "@" lands at index 0 -- an empty userinfo still delimits.
+            ("https://%40host.invalid/x", "https://host.invalid/x"),
+            # The host starts after the "@", never at it.
+            ("https://%75%3A%53ECRETPW%40h.invalid/x", "https://h.invalid/x"),
+            # Declared username plus an encoded password: the port is unparseable and dropped.
+            ("https://u:%53ECRETPW@h.invalid:bad/x", "https://h.invalid/x"),
+        ):
+            with self.subTest(url=url):
+                shown = sources.redact_url(url)
+                self.assertEqual(expected, shown)
+                self.assertNotIn("SECRETPW", shown)
+
     def test_a_quote_inside_userinfo_cannot_smuggle_a_password_through_prose(self):
         """``'`` is a legal sub-delimiter in userinfo, and the prose patterns stop at it.
 
