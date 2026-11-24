@@ -1500,6 +1500,16 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "Yamaha MT-15",
+				"time": 1795527116
+			},
+			"steamid": "[U:1:472554140]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -3416,6 +3426,19 @@
 		},
 		{
 			"attributes": [
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "dangerous",
+				"time": 1795523137
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"niggers\""
+			],
+			"steamid": "[U:1:1035104890]"
+		},
+		{
+			"attributes": [
 				"suspicious"
 			],
 			"last_seen": {
@@ -3436,6 +3459,19 @@
 				"time": 1795366886
 			},
 			"steamid": "[U:1:1035397417]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "\u041b\u0410\u0417\u0415\u0420\u041d\u042b\u0419 \u0414\u041c\u0418\u0422\u0420\u0418\u0419",
+				"time": 1795527848
+			},
+			"proof": [
+				"ESP"
+			],
+			"steamid": "[U:1:1040862968]"
 		},
 		{
 			"attributes": [
@@ -3948,6 +3984,16 @@
 				"time": 1794854054
 			},
 			"steamid": "[U:1:1143565630]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "sky",
+				"time": 1795526288
+			},
+			"steamid": "[U:1:1145986381]"
 		},
 		{
 			"attributes": [
@@ -5940,6 +5986,19 @@
 		},
 		{
 			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "lobotomized heavy",
+				"time": 1795528927
+			},
+			"proof": [
+				"ESP"
+			],
+			"steamid": "[U:1:1893655731]"
+		},
+		{
+			"attributes": [
 				"cheater"
 			],
 			"last_seen": {
@@ -6006,6 +6065,26 @@
 				"ESP"
 			],
 			"steamid": "[U:1:1907063266]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "MUZA DO NAPIERDALANIA OPONENT\u00d3W",
+				"time": 1795528719
+			},
+			"steamid": "[U:1:1907160800]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "OwOw",
+				"time": 1795526228
+			},
+			"steamid": "[U:1:1911065379]"
 		},
 		{
 			"attributes": [
