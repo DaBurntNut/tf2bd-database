@@ -549,6 +549,36 @@ def _bounded_int(digits: str) -> int | None:
     return int(significant)
 
 
+def _canonical_account(account: int | None) -> str | None:
+    """Format an account id, rejecting zero and anything outside the 32-bit range."""
+    if account is None or not 0 < account < MAX_ACCOUNT_ID:
+        return None
+    return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+
+
+def _canonical_from_int(value: int) -> str | None:
+    """A bare integer is an account id when it is in range, and a SteamID64 otherwise."""
+    account = value if 0 < value < MAX_ACCOUNT_ID else _account_from_steamid64(value)
+    return _canonical_account(account)
+
+
+def _canonical_from_instance(match: re.Match[str]) -> str | None:
+    """``[U:1:account:instance]`` -- the instance field is 20 bits wide."""
+    instance = _bounded_int(match.group(2))
+    if instance is None or instance >= MAX_STEAMID_INSTANCE:
+        return None
+    return _canonical_account(_bounded_int(match.group(1)))
+
+
+def _canonical_from_steam2(match: re.Match[str]) -> str | None:
+    """``STEAM_X:Y:Z`` encodes the account id as ``2 * Z + Y``."""
+    auth_server, account_half = match.groups()
+    half = _bounded_int(account_half)
+    if half is None:
+        return None
+    return _canonical_account(half * 2 + int(auth_server))
+
+
 def normalize_steamid(value: Any) -> str | None:
     """Return canonical ``[U:1:<account id>]`` form, or ``None`` if unusable.
 
@@ -559,11 +589,8 @@ def normalize_steamid(value: Any) -> str | None:
     """
     if isinstance(value, bool):  # bool is an int subclass, but not a SteamID.
         return None
-
     if isinstance(value, int):
-        account = value if 0 < value < MAX_ACCOUNT_ID else _account_from_steamid64(value)
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
-
+        return _canonical_from_int(value)
     if not isinstance(value, str):
         return None
 
@@ -571,49 +598,30 @@ def normalize_steamid(value: Any) -> str | None:
     for pattern in (_U_RE, _U_BARE_RE):
         match = pattern.match(text)
         if match:
-            account = _bounded_int(match.group(1))
-            # Reject zero and values outside the 32-bit account-ID range.
-            if account is None or not 0 < account < MAX_ACCOUNT_ID:
-                return None
-            return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+            return _canonical_account(_bounded_int(match.group(1)))
 
     match = _U_INSTANCE_RE.match(text)
     if match:
-        account = _bounded_int(match.group(1))
-        instance = _bounded_int(match.group(2))
-        # The instance field is 20 bits; reject out-of-range values before canonicalizing.
-        if account is None or not 0 < account < MAX_ACCOUNT_ID or instance is None or instance >= MAX_STEAMID_INSTANCE:
-            return None
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+        return _canonical_from_instance(match)
 
     match = _STEAM2_RE.match(text)
     if match:
-        # STEAM_X:Y:Z encodes the account ID as 2 * Z + Y.
-        auth_server, account_half = match.groups()
-        half = _bounded_int(account_half)
-        if half is None:
-            return None
-        account = half * 2 + int(auth_server)
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if 0 < account < MAX_ACCOUNT_ID else None
+        return _canonical_from_steam2(match)
 
     if _STEAMID64_RE.match(text):
-        account = _account_from_steamid64(int(text))
-        if account is not None:
-            return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+        canonical = _canonical_account(_account_from_steamid64(int(text)))
+        # Not a return: a 17-digit string below the SteamID64 base is not a
+        # SteamID64 at all, and may still be a zero-padded account id below.
+        if canonical is not None:
+            return canonical
 
     if text.isascii() and text.isdigit():
-        # Accept bare account IDs as strings as well as integers. A 17-digit
-        # string below the SteamID64 base reaches here and may be a zero-padded
-        # account ID, which the range check below still has to validate.
-        account = _bounded_int(text)
-        if account is None or not 0 < account < MAX_ACCOUNT_ID:
-            return None
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+        # Accept bare account IDs as strings as well as integers.
+        return _canonical_account(_bounded_int(text))
 
     match = _PROFILE_URL_RE.fullmatch(text)
     if match:
-        account = _account_from_steamid64(int(match.group(1)))
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
+        return _canonical_account(_account_from_steamid64(int(match.group(1))))
 
     return None
 

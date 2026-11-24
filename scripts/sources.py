@@ -675,6 +675,55 @@ def _redact_text_query_parameter(match: re.Match[str], depth: int) -> str:
     return f"{match.group('separator')}{safe_name}=REDACTED{value[end:]}"
 
 
+def _redacted_entity_view(text: str, depth: int) -> str | None:
+    """Redact an HTML-decoded view of prose, or ``None`` to keep the original.
+
+    Entities can hide a delimiter (``&#64;`` for ``@``), so the decoded view is
+    inspected too -- but prose that decodes to itself, or whose decoded view
+    needed no redaction, must keep the spelling the caller wrote.
+    """
+    decoded = _html_unescape_bounded(text)
+    if decoded is None:
+        return "[URL omitted: too deeply encoded to inspect safely]"
+    if decoded == text:
+        return None
+    safe_decoded = _redact_urls_in_text(decoded, depth, decode_entities=False)
+    return safe_decoded if safe_decoded != decoded else None
+
+
+def _is_one_bare_url(text: str) -> bool:
+    """True when the whole string is a single URL, not prose that contains a colon."""
+    stripped = text.strip()
+    if any(char.isspace() for char in stripped):
+        return False
+    has_html_reference = html.unescape(stripped) != stripped
+    looks_like_http_url = stripped[:5].casefold() == "http:" or stripped[:6].casefold() == "https:"
+    return looks_like_http_url or "?" in stripped or ("#" in stripped and not has_html_reference)
+
+
+def _redacted_encoded_urls(text: str, depth: int) -> str | None:
+    """Redact URLs whose scheme is percent-encoded, or ``None`` if none survive decoding."""
+    if depth >= _MAX_NESTED_URL_DEPTH:
+        return "[nested URL omitted: too deep to inspect safely]"
+    candidate = text
+    safe_candidate: str | None = None
+    inspected_url = False
+    for _ in range(_MAX_NESTED_URL_DEPTH):
+        decoded = urllib.parse.unquote(candidate)
+        if decoded == candidate:
+            break
+        candidate = decoded
+        if _URL_IN_TEXT.search(candidate) or _HTTP_URL_WITH_AT_IN_TEXT.search(candidate):
+            inspected_url = True
+            safe = _redact_urls_in_text(candidate, depth + 1, decode_entities=False, inspect_encoded_urls=False)
+            if safe != candidate:
+                # Keep decoding the original view: another layer may reveal userinfo hidden beside a redacted query.
+                safe_candidate = safe
+    if _ENCODED_HTTP_URL_MARKER.search(candidate) or (inspected_url and _PERCENT_ESCAPE.search(candidate)):
+        return "[nested URL omitted: too deep to inspect safely]"
+    return safe_candidate
+
+
 def _redact_urls_in_text(
     text: str,
     depth: int,
@@ -688,55 +737,23 @@ def _redact_urls_in_text(
         # for a long paragraph sent the reader looking for a link that was never there.
         return "[text omitted: too long to inspect safely]"
     if decode_entities:
-        decoded = _html_unescape_bounded(text)
-        if decoded is None:
-            return "[URL omitted: too deeply encoded to inspect safely]"
-        if decoded != text:
-            # Inspect a decoded view for entity-hidden delimiters; preserve original prose if unchanged.
-            safe_decoded = _redact_urls_in_text(decoded, depth, decode_entities=False)
-            if safe_decoded != decoded:
-                return safe_decoded
+        from_entities = _redacted_entity_view(text, depth)
+        if from_entities is not None:
+            return from_entities
     text = _SPLIT_USERINFO_IN_TEXT.sub(_redact_userinfo_span, text)
     # Inspect HTTP strings containing @ even when malformed syntax left userinfo in the path.
     text = _HTTP_URL_WITH_AT_IN_TEXT.sub(lambda match: _redact_url_occurrence(match, depth), text)
     # Do not parse prose colons as schemes; redact standalone queries and embedded URLs separately.
-    stripped = text.strip()
-    has_html_reference = html.unescape(stripped) != stripped
-    looks_like_http_url = stripped[:5].casefold() == "http:" or stripped[:6].casefold() == "https:"
-    if not any(char.isspace() for char in stripped) and (
-        looks_like_http_url or "?" in stripped or ("#" in stripped and not has_html_reference)
-    ):
+    if _is_one_bare_url(text):
         text = _redact_url(text, depth)
     text = _URL_IN_TEXT.sub(lambda match: _redact_url_occurrence(match, depth), text)
     text = _QUERY_PARAM_IN_TEXT.sub(lambda match: _redact_text_query_parameter(match, depth), text)
 
     # Inspect percent-encoded URL schemes anywhere in prose or path text, not only in parsed query values.
     if inspect_encoded_urls and _ENCODED_HTTP_URL_MARKER.search(text):
-        if depth >= _MAX_NESTED_URL_DEPTH:
-            return "[nested URL omitted: too deep to inspect safely]"
-        candidate = text
-        safe_candidate: str | None = None
-        inspected_url = False
-        for _ in range(_MAX_NESTED_URL_DEPTH):
-            decoded = urllib.parse.unquote(candidate)
-            if decoded == candidate:
-                break
-            candidate = decoded
-            if _URL_IN_TEXT.search(candidate) or _HTTP_URL_WITH_AT_IN_TEXT.search(candidate):
-                inspected_url = True
-                safe = _redact_urls_in_text(
-                    candidate,
-                    depth + 1,
-                    decode_entities=False,
-                    inspect_encoded_urls=False,
-                )
-                if safe != candidate:
-                    # Keep decoding the original view: another layer may reveal userinfo hidden beside a redacted query.
-                    safe_candidate = safe
-        if _ENCODED_HTTP_URL_MARKER.search(candidate) or (inspected_url and _PERCENT_ESCAPE.search(candidate)):
-            return "[nested URL omitted: too deep to inspect safely]"
-        if safe_candidate is not None:
-            return safe_candidate
+        from_encoded = _redacted_encoded_urls(text, depth)
+        if from_encoded is not None:
+            return from_encoded
     return text
 
 
