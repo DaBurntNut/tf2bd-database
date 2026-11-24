@@ -749,8 +749,16 @@ def _safe_fetch_error(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def _log_retry(attempt: int, exc: Exception) -> None:
-    """Say, at debug level, why an attempt failed and that another follows."""
+def _pause_before_retry(attempt: int, exc: Exception) -> None:
+    """Back off before the next attempt, or return at once after the last one.
+
+    Every transient branch of the fetch loop needs the same three steps, and
+    the "is there another attempt?" guard is the one that matters: without it
+    the final failure still sleeps, delaying the fallback to the next source
+    for no reason.
+    """
+    if attempt >= FETCH_ATTEMPTS:
+        return
     LOGGER.debug(
         "  attempt %d of %d failed (%s); retrying in %d s.",
         attempt,
@@ -758,6 +766,7 @@ def _log_retry(attempt: int, exc: Exception) -> None:
         _safe_fetch_error(exc),
         RETRY_BACKOFF_SECONDS * attempt,
     )
+    time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
 
 def _fetch_bytes(url: str) -> bytes:
@@ -811,20 +820,14 @@ def _fetch_bytes(url: str) -> bytes:
             last_error = exc
             if exc.code != 429 and not 500 <= exc.code < 600:
                 break  # Non-retryable client error; try the next source.
-            if attempt < FETCH_ATTEMPTS:
-                _log_retry(attempt, exc)
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-        except OSError as exc:  # Retry network and socket errors.
+            _pause_before_retry(attempt, exc)
+        except (OSError, http.client.IncompleteRead) as exc:
+            # Transient: network and socket errors, a cut-short transfer
+            # (_ShortReadError is an OSError for this reason), and a response
+            # the HTTP decoder found incomplete. IncompleteRead is caught here
+            # rather than falling through to the HTTPException clause below.
             last_error = exc
-            if attempt < FETCH_ATTEMPTS:
-                _log_retry(attempt, exc)
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-        except http.client.IncompleteRead as exc:
-            # Retry incomplete HTTP responses.
-            last_error = exc
-            if attempt < FETCH_ATTEMPTS:
-                _log_retry(attempt, exc)
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            _pause_before_retry(attempt, exc)
         except (ValueError, http.client.HTTPException) as exc:
             # Report invalid URL or HTTP syntax as a fetch failure so the next source can be tried.
             raise SyncError(f"could not fetch {redact_url(url)}: {_safe_fetch_error(exc)}") from exc
