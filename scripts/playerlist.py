@@ -57,13 +57,36 @@ MAX_SHOWN_VALUE_CHARS = 120
 _MAX_SHOWN_INT_BITS = MAX_SHOWN_VALUE_CHARS * 4
 MAX_VALIDATION_MESSAGES = 100
 
+# CPython refuses to build an int from more than 4,300 digits by default; cap
+# the text before ``int()`` so the limit is ours and not a version-dependent
+# ValueError. See sys.set_int_max_str_digits.
+MAX_JSON_INT_DIGITS = 4_300
+# A Steam account id is a 32-bit value, so it never needs more than 10 digits.
+MAX_ACCOUNT_ID_DIGITS = 10
+# Below this length a mixed-case blob is an ordinary word, not a credential.
+MIN_OPAQUE_CREDENTIAL_CHARS = 12
+
+# Substrings that make a field or query-parameter name look like a credential.
+#
+# This is the single vocabulary both redactors share: ``sources`` applies it to
+# URL query names and this module applies it to free-form diagnostic text. Two
+# hand-maintained copies drifted apart once already (``key``, ``pass`` and
+# ``passphrase`` were redacted in URLs but printed in diagnostics), so the list
+# lives here, in the module both importers depend on.
+#
+# Matching is deliberately by substring, so ``pass`` also covers ``password``,
+# ``passwd`` and ``passphrase``, and ``key`` covers ``api_key``, ``ssh-key`` and
+# ``appkey``. That over-matches ordinary words such as ``monkey``: a redundant
+# ``REDACTED`` costs nothing, while a missed credential cannot be recalled once
+# it is in a public log.
+CREDENTIAL_NAME_MARKERS = (
+    r"token|secret|pass|pwd|auth|credential|session|sid|cookie|csrf|xsrf|code|sig|key|"
+    r"jwt|bearer|hmac|nonce|state|ticket|otp|mfa|assertion|saml|x-amz|x-goog"
+)
+
 # Diagnostics can contain free-form values, not just URLs. Redact common
 # credential fields and authorization headers even when they appear in prose.
-_DIAGNOSTIC_SECRET_MARKER = re.compile(
-    r"token|secret|password|passwd|pwd|auth|credential|session|sid|cookie|csrf|xsrf|code|sig|"
-    r"api[_-]?key|private[_-]?key|access[_-]?key|jwt|bearer|signature|hmac|nonce|state|ticket|otp|mfa",
-    re.IGNORECASE | re.ASCII,
-)
+_DIAGNOSTIC_SECRET_MARKER = re.compile(CREDENTIAL_NAME_MARKERS, re.IGNORECASE | re.ASCII)
 _DIAGNOSTIC_FIELD_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
 _DIAGNOSTIC_VALUE_DELIMITERS = frozenset(",;&\r\n\t ")
 _AUTHORIZATION_HEADER = re.compile(r"(?i)(?P<header>\b(?:proxy-)?authorization\s*:\s*)[^\r\n]*", re.ASCII)
@@ -247,7 +270,11 @@ def _looks_like_credential(token: str, separator: str) -> bool:
         return True
     # No digits or punctuation: only a long mixed-case blob is a credential. An
     # ordinary word ("of", "Instinct", "King") has neither.
-    return len(token) >= 12 and any(c.isupper() for c in token) and any(c.islower() for c in token)
+    return (
+        len(token) >= MIN_OPAQUE_CREDENTIAL_CHARS
+        and any(c.isupper() for c in token)
+        and any(c.islower() for c in token)
+    )
 
 
 def _redact_bearer_match(match: re.Match[str]) -> str:
@@ -463,7 +490,7 @@ def _bounded_int(digits: str) -> int | None:
     if not (digits.isascii() and digits.isdigit()):
         return None
     significant = digits.lstrip("0") or "0"
-    if len(significant) > 10:
+    if len(significant) > MAX_ACCOUNT_ID_DIGITS:
         return None
     return int(significant)
 
@@ -656,8 +683,8 @@ def _reject_out_of_range_float(text: str) -> float:
 
 def _parse_json_int(text: str) -> int:
     """Parse a JSON integer with a fixed digit cap across supported Python versions."""
-    digits = text[1:] if text.startswith("-") else text
-    if len(digits) > 4_300:
+    digits = text.removeprefix("-")
+    if len(digits) > MAX_JSON_INT_DIGITS:
         raise _StrictJSONError(f"{_shown(text)} is out of range for a JSON integer")
     return int(text)
 
@@ -746,12 +773,14 @@ class ValidationResult:
     warnings_omitted: int = 0
 
     def add_error(self, message: str) -> None:
+        """Record an error, counting rather than keeping it past the cap."""
         if len(self.errors) < MAX_VALIDATION_MESSAGES:
             self.errors.append(message)
         else:
             self.errors_omitted += 1
 
     def add_warning(self, message: str) -> None:
+        """Record a warning, counting rather than keeping it past the cap."""
         if len(self.warnings) < MAX_VALIDATION_MESSAGES:
             self.warnings.append(message)
         else:
@@ -759,13 +788,16 @@ class ValidationResult:
 
     @property
     def error_count(self) -> int:
+        """Every error seen, including those dropped at the cap."""
         return len(self.errors) + self.errors_omitted
 
     @property
     def warning_count(self) -> int:
+        """Every warning seen, including those dropped at the cap."""
         return len(self.warnings) + self.warnings_omitted
 
     def __bool__(self) -> bool:
+        """True when nothing blocked the file from being used."""
         return not self.errors and self.errors_omitted == 0
 
 

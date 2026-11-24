@@ -104,6 +104,7 @@ def _one_line_message(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser (also used by the tests as the CLI contract)."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -234,12 +235,21 @@ def _log_validation(result: ValidationResult, context: str) -> None:
     for warning in result.warnings:
         LOGGER.warning("%s", playerlist.display_raw(warning))
     if result.warnings_omitted:
-        LOGGER.warning("%s additional validation warning(s) omitted", result.warnings_omitted)
+        LOGGER.warning(
+            "%s additional validation %s omitted",
+            result.warnings_omitted,
+            plural(result.warnings_omitted, "warning", "warnings"),
+        )
     safe_context = display_path(context)
     for error in result.errors:
         LOGGER.error("%s: %s", safe_context, playerlist.display_raw(error))
     if result.errors_omitted:
-        LOGGER.error("%s: %s additional validation problem(s) omitted", safe_context, result.errors_omitted)
+        LOGGER.error(
+            "%s: %s additional validation %s omitted",
+            safe_context,
+            result.errors_omitted,
+            plural(result.errors_omitted, "problem", "problems"),
+        )
 
 
 def load_database(path: Path) -> tuple[PlayerList, str]:
@@ -256,7 +266,10 @@ def load_database(path: Path) -> tuple[PlayerList, str]:
     result = validate(database)
     _log_validation(result, f"{display_path(path)} is not a usable playerlist")
     if result.error_count:
-        raise SyncError(f"{display_path(path)} has {result.error_count} problem(s), nothing was written")
+        raise SyncError(
+            f"{display_path(path)} has {result.error_count} "
+            f"{plural(result.error_count, 'problem', 'problems')}, nothing was written"
+        )
     return database, original
 
 
@@ -726,6 +739,7 @@ def _force_utf8_streams() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the sync and return the process exit status."""
     _force_utf8_streams()
     args = build_parser().parse_args(argv)
 

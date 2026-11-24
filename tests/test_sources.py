@@ -1757,5 +1757,98 @@ class SnapshotReadTests(unittest.TestCase):
         self.assertIn("Permission denied", str(caught.exception))
 
 
+class CredentialVocabularyTests(unittest.TestCase):
+    """The two redactors must agree on what a credential name looks like.
+
+    ``sources`` redacts credential-looking URL query names; ``playerlist``
+    redacts credential-looking fields in free-form diagnostic text. They used
+    to carry two hand-written copies of the same word list, and the copies
+    drifted: ``key``, ``pass``, ``passphrase``, ``appkey`` and ``ssh_key`` were
+    redacted inside a URL but printed in the clear in a diagnostic, which ends
+    up in a public Actions log and in the pull request body.
+    """
+
+    CREDENTIAL_NAMES = (
+        "token",
+        "access_token",
+        "refresh_token",
+        "api_key",
+        "apikey",
+        "api-key",
+        "appkey",
+        "key",
+        "ssh_key",
+        "private_key",
+        "secret",
+        "client_secret",
+        "password",
+        "passwd",
+        "pwd",
+        "pass",
+        "passphrase",
+        "auth",
+        "authorization",
+        "bearer",
+        "session",
+        "sessionid",
+        "cookie",
+        "csrf",
+        "xsrf",
+        "signature",
+        "sig",
+        "hmac",
+        "nonce",
+        "otp",
+        "mfa",
+        "credential",
+        "jwt",
+        "oauth",
+        "x-api-key",
+        "assertion",
+        "saml",
+        "x-amz-date",
+    )
+    HARMLESS_NAMES = ("steamid", "attributes", "proof", "players", "v", "si", "list", "page")
+
+    def test_both_redactors_use_the_one_shared_vocabulary(self):
+        self.assertIs(sources._SECRET_QUERY_PARAM.pattern, playerlist_module.CREDENTIAL_NAME_MARKERS)
+        self.assertIs(
+            playerlist_module._DIAGNOSTIC_SECRET_MARKER.pattern,
+            playerlist_module.CREDENTIAL_NAME_MARKERS,
+        )
+
+    def test_every_credential_name_is_caught_by_both_modules(self):
+        for name in self.CREDENTIAL_NAMES:
+            with self.subTest(name=name):
+                self.assertTrue(
+                    playerlist_module._is_secret_field_name(name),
+                    f"{name} would be printed in a diagnostic",
+                )
+                self.assertTrue(
+                    sources._has_sensitive_query_name(name),
+                    f"{name} would be published in a URL",
+                )
+
+    def test_the_two_modules_never_disagree(self):
+        """Drift in either direction is the bug; this pins both.
+
+        Over-matching is deliberate, so ordinary words containing a marker
+        (``monkey`` contains ``key``) are expected to be redacted by both.
+        """
+        for name in self.CREDENTIAL_NAMES + self.HARMLESS_NAMES + ("monkey", "passage", "encode"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    playerlist_module._is_secret_field_name(name),
+                    sources._has_sensitive_query_name(name),
+                    f"the redactors disagree about {name!r}",
+                )
+
+    def test_ordinary_playerlist_fields_are_still_readable(self):
+        """Over-matching must not swallow the words a diagnostic needs."""
+        for name in self.HARMLESS_NAMES:
+            with self.subTest(name=name):
+                self.assertFalse(playerlist_module._is_secret_field_name(name))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

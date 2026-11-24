@@ -558,8 +558,28 @@ class ValidationLoggingTests(unittest.TestCase):
         with self.assertLogs(sync_module.LOGGER, level="WARNING") as captured:
             sync_module._log_validation(result, "database validation")
         output = "\n".join(captured.output)
-        self.assertIn("3 additional validation warning(s) omitted", output)
-        self.assertIn("database validation: 2 additional validation problem(s) omitted", output)
+        self.assertIn("3 additional validation warnings omitted", output)
+        self.assertIn("database validation: 2 additional validation problems omitted", output)
+
+    def test_a_single_omitted_validation_message_reads_as_one(self):
+        """These counts are written with the same plural helper as the report.
+
+        The log line used to read "1 additional validation warning(s) omitted"
+        for every count. The report stopped writing "(s)" long ago, so the two
+        halves of the same run disagreed about how to say the same thing.
+        """
+        result = playerlist_module.ValidationResult(
+            errors=["invalid entry"],
+            warnings=["unknown attribute"],
+            errors_omitted=1,
+            warnings_omitted=1,
+        )
+        with self.assertLogs(sync_module.LOGGER, level="WARNING") as captured:
+            sync_module._log_validation(result, "database validation")
+        output = "\n".join(captured.output)
+        self.assertIn("1 additional validation warning omitted", output)
+        self.assertIn("database validation: 1 additional validation problem omitted", output)
+        self.assertNotIn("(s)", output)
 
     def test_the_summary_is_flushed_before_the_outcome_is_logged(self):
         """A piped stdout is block-buffered while stderr is not.

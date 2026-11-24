@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from playerlist import (
+    CREDENTIAL_NAME_MARKERS,
     MAX_FILE_BYTES,
     SURROGATE_RE,
     display_path,
@@ -87,7 +88,7 @@ class SyncError(Exception):
 LOGGER = logging.getLogger("vorobey_sources")
 
 
-class _ShortRead(OSError):
+class _ShortReadError(OSError):
     """A response body that ended before the length the server declared.
 
     Deliberately an OSError: the retry loop treats OSError as a transient
@@ -285,12 +286,11 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     return HackerpoliceIndex.build(document, what=f"the previous snapshot {_display_path(path)}"), raw
 
 
-# Match credential-like parameter names broadly; false positives are safer than leaks.
-_SECRET_QUERY_PARAM = re.compile(
-    r"token|secret|pass|pwd|auth|credential|session|sid|cookie|csrf|xsrf|bearer|jwt|assertion|otp|mfa|nonce|state|ticket|"
-    r"apikey|api[_-]?key|sig|hmac|saml|key|x-amz|x-goog|code",
-    re.IGNORECASE,
-)
+# Match credential-like parameter names broadly; false positives are safer than
+# leaks. The vocabulary is shared with the diagnostic redactor so the two cannot
+# drift apart: no case-folding limit here, because a query name reaches us
+# straight off the wire and ``KEY`` spelled with a Kelvin sign must still match.
+_SECRET_QUERY_PARAM = re.compile(CREDENTIAL_NAME_MARKERS, re.IGNORECASE)
 _PERCENT_ESCAPE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
 _SAFE_QUERY_NAME = re.compile(r"[A-Za-z0-9_.-]+", re.ASCII)
 
@@ -735,7 +735,7 @@ def _safe_fetch_error(exc: Exception) -> str:
     """
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP status {exc.code}"
-    if isinstance(exc, _ShortRead):
+    if isinstance(exc, _ShortReadError):
         return str(exc)  # Generated locally from byte counts; safe to display.
     if isinstance(exc, http.client.IncompleteRead):
         return "incomplete HTTP response"
@@ -800,7 +800,7 @@ def _fetch_bytes(url: str) -> bytes:
                 raise _too_large(url)
             if declared is not None and not chunked and len(body) != declared:
                 # Retry if a declared response body ends early.
-                raise _ShortRead(f"received {len(body):,} of {declared:,} bytes")
+                raise _ShortReadError(f"received {len(body):,} of {declared:,} bytes")
             return body
         except urllib.error.HTTPError as exc:
             # Close HTTPError bodies before retrying or falling back.
