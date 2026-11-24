@@ -36,6 +36,7 @@ from playerlist import (
     SURROGATE_RE,
     display_path,
     error_reason,
+    fold_name_for_matching,
     normalize_steamid,
     read_bounded_regular_file,
     redact_diagnostic_text,
@@ -315,7 +316,7 @@ def _normalized_query_name(name: str) -> str | None:
     if _PERCENT_ESCAPE.search(decoded):
         # Fail closed on unresolved escapes; another decoder could expose a credential key.
         return None
-    return "".join(char for char in decoded if unicodedata.category(char)[0] not in {"C", "Z"}).casefold()
+    return fold_name_for_matching(decoded)
 
 
 def _has_sensitive_query_name(name: str) -> bool:

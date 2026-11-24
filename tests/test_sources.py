@@ -1849,6 +1849,45 @@ class CredentialVocabularyTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(playerlist_module._is_secret_field_name(name))
 
+    # A credential name hidden behind an invisible character or a look-alike
+    # letter. Each of these was printed in the clear by the diagnostic
+    # redactor; the soft hyphen was missing from a hand-written character
+    # list, and the look-alikes survived because nothing folded them onto the
+    # ASCII letters they imitate.
+    DISGUISED_NAMES = (
+        ("soft hyphen", "to\u00adken"),
+        ("zero-width space", "to\u200bken"),
+        ("zero-width joiner", "to\u200dken"),
+        ("byte-order mark", "to\ufeffken"),
+        ("full-width letters", "\uff54\uff4f\uff4b\uff45\uff4e"),
+        ("kelvin sign", "\u212aey"),
+        ("long s", "\u017fecret"),
+        ("percent-encoded", "to%6Ben"),
+        ("html reference", "to&#107;en"),
+    )
+
+    def test_a_disguised_credential_name_is_still_redacted(self):
+        for label, name in self.DISGUISED_NAMES:
+            with self.subTest(spelling=label):
+                self.assertTrue(
+                    playerlist_module._is_secret_field_name(name),
+                    f"{label} would be printed in a diagnostic",
+                )
+                self.assertTrue(
+                    sources._has_sensitive_query_name(name),
+                    f"{label} would be published in a URL",
+                )
+
+    def test_folding_is_by_unicode_category_not_a_fixed_list(self):
+        """Any control, format or separator character must fold away.
+
+        An enumerated list silently stops covering characters assigned after
+        it was written, which is how U+00AD came to be missing from it.
+        """
+        for code in ("\u0000", "\u001f", "\u007f", "\u00ad", "\u061c", "\u2060", "\u206a", "\u3000", "\ufff9"):
+            with self.subTest(char=hex(ord(code))):
+                self.assertEqual(playerlist_module.fold_name_for_matching(f"to{code}ken"), "token")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

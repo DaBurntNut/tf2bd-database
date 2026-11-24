@@ -14,6 +14,7 @@ import math
 import os
 import re
 import stat
+import unicodedata
 import urllib.parse
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -111,13 +112,31 @@ _PERCENT_ESCAPE_IN_TEXT = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
 _PERCENT_ESCAPE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
 # Field names keep plain characters plus percent escapes and HTML references.
 _FIELD_NAME_CHARS = re.compile(r"[A-Za-z0-9_.%-]+", re.ASCII)
-# Control and zero-width characters that servers ignore when matching a name.
-_INVISIBLE_IN_FIELD_NAME = re.compile("[\x00-\x20\x7f-\x9f\u200b-\u200f\u2028-\u202f\u2060\ufeff]", re.ASCII)
+# Characters a server ignores when matching a name are stripped by Unicode
+# category rather than by an enumerated list: the hand-written list used to
+# omit U+00AD SOFT HYPHEN, so ``to<shy>ken=`` walked straight past the
+# redactor while the same name was caught inside a URL.
 # A query-style pair anywhere in free text: find the name, then its value.
 _QUERY_PAIR_IN_TEXT = re.compile(r"[?&#;](?P<name>[^\s=&?#;]+)=(?P<value>[^\s&;#]*)", re.ASCII)
 _MAX_DIAGNOSTIC_DECODE_DEPTH = 8
 # Lone surrogates: JSON can encode them, UTF-8 cannot. Replace before output.
 SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def fold_name_for_matching(name: str) -> str:
+    """Fold a field or query-parameter name to the spelling a matcher should see.
+
+    Compatibility normalization first, so full-width and look-alike spellings
+    (``\uff54oken``, ``\u212aey``, ``\u017fecret``) collapse onto the ASCII letters they
+    imitate, then every control, format and separator character is dropped -
+    by Unicode category, so a newly assigned invisible character is covered
+    the day it exists rather than whenever the list is next updated.
+
+    Shared with ``sources`` so a name cannot be sensitive in a URL and
+    harmless in a diagnostic.
+    """
+    folded = unicodedata.normalize("NFKC", name)
+    return "".join(char for char in folded if unicodedata.category(char)[0] not in {"C", "Z"}).casefold()
 
 
 def _normalized_field_name(name: str) -> str | None:
@@ -138,7 +157,7 @@ def _normalized_field_name(name: str) -> str | None:
         # Still decoding at the depth limit. Fail closed rather than match on a
         # spelling that is not the one a server would end up with.
         return None
-    decoded = _INVISIBLE_IN_FIELD_NAME.sub("", decoded)
+    decoded = fold_name_for_matching(decoded)
     if not _FIELD_NAME_CHARS.fullmatch(decoded):
         # It decodes to something that is not a field name any more (an embedded
         # URL, say). Fail closed instead of guessing what a server would do.
