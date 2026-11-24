@@ -541,14 +541,19 @@ class RepositoryDataTests(unittest.TestCase):
         self.assertEqual(unrelated.returncode, 1, "the temporary-file rule must not hide unrelated dotfiles")
 
     def test_git_does_not_apply_line_ending_conversion_to_json_data(self):
-        """The snapshot must remain the exact upstream byte sequence."""
+        """The snapshot must remain the exact upstream byte sequence.
+
+        `git check-attr` answers for any path, existing or not, so a name that
+        leaves the repository would keep passing here forever. Each name is
+        therefore required to be a file that is actually shipped.
+        """
         for name in (
             "playerlist.garou3299.json",
-            "playerlist.scammers.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
             "rules.garou3299.json",
         ):
             with self.subTest(path=name):
+                self.assertTrue((self.ROOT / name).is_file(), f"{name} is named here but no longer shipped")
                 result = subprocess.run(
                     ["git", "check-attr", "text", "--", name],
                     cwd=self.ROOT,

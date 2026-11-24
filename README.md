@@ -174,7 +174,7 @@ than from the raw totals, so the line can never contradict itself.
   If the runner's output file fails during the append, the run cannot leave an
   unpublished database or snapshot change behind.
 - **Checked changes** — a pull request touching `scripts/`, `tests/`,
-  `playerlist.garou3299.json`, `playerlist.scammers.json`, `rules.garou3299.json`,
+  `playerlist.garou3299.json`, `rules.garou3299.json`,
   the hackerpolice snapshot, `pyproject.toml`, `.gitattributes`, `.gitignore`,
   `.github/dependabot.yml` or the workflow runs ruff, `mypy --strict`,
   a bandit security scan, vulture (dead code) and the tests under a branch-coverage
