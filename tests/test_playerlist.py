@@ -864,6 +864,34 @@ class ShippedDataMatchesItsDeclaredSchemaTests(unittest.TestCase):
     """
 
     ROOT = Path(__file__).resolve().parent.parent
+    SHIPPED = ("playerlist.garou3299.json", "playerlist.scammers.json")
+    SCHEMA_URL = "https://raw.githubusercontent.com/PazerOP/tf2_bot_detector/master/schemas/v3/playerlist.schema.json"
+    # The v3 playerlist schema sets additionalProperties:false at the top level.
+    TOP_LEVEL_KEYS = frozenset({"$schema", "file_info", "players"})
+
+    def _load(self, name):
+        return json.loads((self.ROOT / name).read_text(encoding="utf-8"))
+
+    def test_every_shipped_list_declares_the_schema_it_is_written_against(self):
+        """``$schema`` is required, and it is what makes the file self-describing.
+
+        ``validate()`` cannot own this rule: nearly every fixture in this suite
+        is a bare ``{"players": [...]}``, and warning there would be noise in
+        636 tests to catch one edit to one real file. Guard the real file.
+        """
+        for name in self.SHIPPED:
+            with self.subTest(file=name):
+                self.assertEqual(self._load(name).get("$schema"), self.SCHEMA_URL)
+
+    def test_no_shipped_list_carries_a_top_level_key_the_schema_forbids(self):
+        for name in self.SHIPPED:
+            with self.subTest(file=name):
+                self.assertEqual(set(self._load(name)) - self.TOP_LEVEL_KEYS, set())
+
+    def test_every_shipped_list_has_a_players_array(self):
+        for name in self.SHIPPED:
+            with self.subTest(file=name):
+                self.assertIsInstance(self._load(name).get("players"), list)
 
     def test_the_synced_database_has_no_schema_warnings_at_all(self):
         database = json.loads((self.ROOT / "playerlist.garou3299.json").read_text(encoding="utf-8"))
