@@ -11,8 +11,10 @@ name: Sync Vorobey hackerpolice
 on:
   schedule:
     # Nominally 05:23 UTC, off the busy top of the hour. GitHub queues scheduled
-    # jobs regardless: the last ten runs started 06:10-06:53 UTC, a median of 57
-    # minutes late, none within 15 minutes. Nothing here depends on the exact time.
+    # jobs, and how long it queues them is a property of the repository rather
+    # than of this line: over two weeks in November 2026 two repositories running
+    # this exact expression started a median of 0.9 and 8.5 hours late. Read it as
+    # "once a day", never as a clock; nothing here depends on the time of day.
     - cron: "23 5 * * *"
   workflow_dispatch:
     inputs:

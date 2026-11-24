@@ -20,10 +20,13 @@ Send a permanent Steam profile link or ID **with video evidence** to
 ## What the bot does
 
 Once a day it compares this database with Vorobey's list and opens a pull
-request. The schedule asks for **05:23 UTC**, but GitHub queues scheduled jobs:
-the last ten runs started between **06:10 and 06:53 UTC**, a median of 57
-minutes late, and none within fifteen minutes of the stated time. Nothing in
-the bot depends on the exact minute. Scheduled runs do not change the
+request. The schedule asks for **05:23 UTC**, but GitHub queues scheduled
+jobs, and how long it queues them depends on the repository rather than on
+the schedule: this fork's last ten runs started between **06:10 and 06:53
+UTC**, about an hour late, while the upstream repository — running the
+identical cron line — started between **12:19 and 16:13 UTC**, a median of
+**8.5 hours** late. Read it as "once a day"; nothing in the bot depends on
+the time of day. Scheduled runs do not change the
 default branch until you merge that pull request. A manual run from the default
 branch (**Actions → Run workflow**) can instead open a pull request, commit
 directly, or only report a dry run; a dispatch from another branch runs the
