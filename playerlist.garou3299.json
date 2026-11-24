@@ -1449,6 +1449,16 @@
 		},
 		{
 			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "v1p3r\u30e1",
+				"time": 1795540927
+			},
+			"steamid": "[U:1:442835673]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -3279,6 +3289,19 @@
 				"time": 1779039022
 			},
 			"steamid": "[U:1:1007705714]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "\u5c18\u661fDu5tar",
+				"time": 1795545087
+			},
+			"proof": [
+				"ESP"
+			],
+			"steamid": "[U:1:1008320002]"
 		},
 		{
 			"attributes": [
