@@ -749,6 +749,18 @@ def _safe_fetch_error(exc: Exception) -> str:
     return type(exc).__name__
 
 
+# 429 means "ask again later" and 5xx is the server's own failure; both can
+# succeed on the next attempt. Every other 4xx is a statement about the
+# request itself and will answer the same way however often it is repeated.
+TOO_MANY_REQUESTS = 429
+SERVER_ERRORS = range(500, 600)
+
+
+def _is_retryable_status(code: int) -> bool:
+    """True when another attempt at the same URL could plausibly succeed."""
+    return code == TOO_MANY_REQUESTS or code in SERVER_ERRORS
+
+
 def _pause_before_retry(attempt: int, exc: Exception) -> None:
     """Back off before the next attempt, or return at once after the last one.
 
@@ -818,8 +830,8 @@ def _fetch_bytes(url: str) -> bytes:
                 with contextlib.suppress(OSError, ValueError):
                     exc.close()
             last_error = exc
-            if exc.code != 429 and not 500 <= exc.code < 600:
-                break  # Non-retryable client error; try the next source.
+            if not _is_retryable_status(exc.code):
+                break  # Permanent: this URL will answer the same way. Next source.
             _pause_before_retry(attempt, exc)
         except (OSError, http.client.IncompleteRead) as exc:
             # Transient: network and socket errors, a cut-short transfer
