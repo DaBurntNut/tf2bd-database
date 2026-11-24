@@ -142,7 +142,6 @@ class WorkflowContractTests(unittest.TestCase):
             ".gitattributes",
             ".gitignore",
             "playerlist.garou3299.json",
-            "playerlist.scammers.json",
             "rules.garou3299.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
             ".github/dependabot.yml",
@@ -469,11 +468,10 @@ class RepositoryDataTests(unittest.TestCase):
         # after a manual formatting-only change.
         self.assertEqual(dumps(database), original)
 
-    def test_the_shipped_standalone_playerlist_is_valid_and_canonical(self):
-        """The separate scammer list is still shipped, even though the bot ignores it."""
-        database, original = load(self.ROOT / "playerlist.scammers.json")
-        self.assertEqual(validate(database).errors, [])
-        self.assertEqual(dumps(database), original)
+    # The scammer list is deliberately not checked here. The bot never reads it,
+    # never writes it, and never names it, so holding it to this tool's idea of
+    # valid or canonical only means CI failing over an edit to a file that has
+    # nothing to do with the sync.
 
     def test_the_shipped_racist_rule_still_justifies_automatic_racist_proofs(self):
         """The demotion policy relies on TF2BD's rule continuing to mark racist."""

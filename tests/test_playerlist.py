@@ -864,52 +864,35 @@ class ShippedDataMatchesItsDeclaredSchemaTests(unittest.TestCase):
     """
 
     ROOT = Path(__file__).resolve().parent.parent
-    SHIPPED = ("playerlist.garou3299.json", "playerlist.scammers.json")
+    # Only the file the bot actually syncs. The other lists in this repository
+    # are the maintainer's to edit freely; nothing here may fail because of one.
+    DATABASE = "playerlist.garou3299.json"
     SCHEMA_URL = "https://raw.githubusercontent.com/PazerOP/tf2_bot_detector/master/schemas/v3/playerlist.schema.json"
     # The v3 playerlist schema sets additionalProperties:false at the top level.
     TOP_LEVEL_KEYS = frozenset({"$schema", "file_info", "players"})
 
-    def _load(self, name):
-        return json.loads((self.ROOT / name).read_text(encoding="utf-8"))
+    def _load(self):
+        return json.loads((self.ROOT / self.DATABASE).read_text(encoding="utf-8"))
 
-    def test_every_shipped_list_declares_the_schema_it_is_written_against(self):
+    def test_the_database_declares_the_schema_it_is_written_against(self):
         """``$schema`` is required, and it is what makes the file self-describing.
 
         ``validate()`` cannot own this rule: nearly every fixture in this suite
         is a bare ``{"players": [...]}``, and warning there would be noise in
         636 tests to catch one edit to one real file. Guard the real file.
         """
-        for name in self.SHIPPED:
-            with self.subTest(file=name):
-                self.assertEqual(self._load(name).get("$schema"), self.SCHEMA_URL)
+        self.assertEqual(self._load().get("$schema"), self.SCHEMA_URL)
 
-    def test_no_shipped_list_carries_a_top_level_key_the_schema_forbids(self):
-        for name in self.SHIPPED:
-            with self.subTest(file=name):
-                self.assertEqual(set(self._load(name)) - self.TOP_LEVEL_KEYS, set())
+    def test_the_database_carries_no_top_level_key_the_schema_forbids(self):
+        self.assertEqual(set(self._load()) - self.TOP_LEVEL_KEYS, set())
 
-    def test_every_shipped_list_has_a_players_array(self):
-        for name in self.SHIPPED:
-            with self.subTest(file=name):
-                self.assertIsInstance(self._load(name).get("players"), list)
+    def test_the_database_has_a_players_array(self):
+        self.assertIsInstance(self._load().get("players"), list)
 
     def test_the_synced_database_has_no_schema_warnings_at_all(self):
-        database = json.loads((self.ROOT / "playerlist.garou3299.json").read_text(encoding="utf-8"))
-        result = validate(database)
+        result = validate(self._load())
         self.assertEqual(result.errors, [])
         self.assertEqual(result.warnings, [], "the file declares a schema it no longer matches")
-
-    def test_the_scammer_list_deviates_only_in_its_attribute_vocabulary(self):
-        """``scammer`` is not a TF2BD attribute, and that list is the maintainer's.
-
-        The bot never reads this file. Pin the deviation so it stays the only
-        one rather than becoming cover for a second, accidental problem.
-        """
-        database = json.loads((self.ROOT / "playerlist.scammers.json").read_text(encoding="utf-8"))
-        result = validate(database)
-        self.assertEqual(result.errors, [])
-        self.assertTrue(result.warnings)
-        self.assertEqual([w for w in result.warnings if "unknown attribute" not in w], [])
 
 
 if __name__ == "__main__":

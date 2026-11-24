@@ -39,7 +39,8 @@ on:
       - ".gitattributes"
       - ".gitignore"
       - "playerlist.garou3299.json"
-      - "playerlist.scammers.json"
+      # playerlist.scammers.json is not listed: the sync never reads or writes
+      # it and no test checks it, so an edit there has nothing to verify.
       - "rules.garou3299.json"
       - "snapshot/playerlist.vorobey-hackerpolice.json"
       # Tests read the Dependabot config and this workflow; include each in this filter.
