@@ -844,6 +844,68 @@ class SourceFetchTests(unittest.TestCase):
                 self.assertNotIn("username", shown)
                 self.assertEqual("Proof: https://host.invalid/x", shown)
 
+    def test_a_quote_inside_userinfo_cannot_smuggle_a_password_through_prose(self):
+        """``'`` is a legal sub-delimiter in userinfo, and the prose patterns stop at it.
+
+        ``redact_url`` always stripped these; only the in-prose scan let them
+        past, so the leak needed the URL to be surrounded by other words.
+        """
+        for delimiter in ("'", '"', "`", "<", ">"):
+            for scheme in ("https://", "http://", "ftp://", "//"):
+                with self.subTest(delimiter=delimiter, scheme=scheme):
+                    url = f"{scheme}us{delimiter}er:QUOTED_USERINFO_SECRET@host.invalid/x"
+                    shown = sources.redact_urls_in_text(f"Proof: {url} end")
+                    self.assertNotIn("QUOTED_USERINFO_SECRET", shown)
+                    self.assertEqual(f"Proof: {scheme}host.invalid/x end", shown)
+
+    def test_a_quote_cannot_be_used_to_reach_a_line_break(self):
+        """Neither half of the old pair caught both at once.
+
+        The line-break pattern's leading run stopped at a quote, and a
+        quote-only pattern would stop at the blank, so one character of each
+        kind slipped between them.
+        """
+        for userinfo in ("us'er na\nme", "<;a\tb", "x\n'y", "'", " '"):
+            with self.subTest(userinfo=userinfo):
+                shown = sources.redact_urls_in_text(f"Proof: https://{userinfo}:MIXED_BREAK_SECRET@host.invalid/x")
+                self.assertNotIn("MIXED_BREAK_SECRET", shown)
+
+    def test_a_proof_url_beside_an_unrelated_address_is_left_alone(self):
+        """Failing closed may not cost the reader a real link.
+
+        Every evidence URL carries a path, and the scan stops at its first
+        ``/``, so the surrounding prose survives even when a later ``@``
+        appears on the same line.
+        """
+        for text in (
+            "check 'https://steamcommunity.com/id/foo' and ask bob@corp.invalid",
+            "see <https://youtube.invalid/watch?v=abc> or mail me@there.invalid",
+            "`https://steamcommunity.com/profiles/765611980` filed by a@b.invalid",
+            "[clip](https://medal.invalid/clips/xyz) and contact x@y.invalid",
+            '{"url":"https://a.invalid/p","contact":"x@y.invalid"}',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(text, sources.redact_urls_in_text(text))
+
+    def test_a_bare_host_before_an_address_is_dropped_rather_than_parsed(self):
+        """A scheme and bare host with no path cannot be told apart from userinfo.
+
+        ``https://site.invalid' and ask bob@`` has the shape of a credential
+        split across prose, so the span goes whole. This is the same trade the
+        line-break pattern already made; it is recorded here so a future reader
+        sees it is chosen, not accidental.
+        """
+        shown = sources.redact_urls_in_text("check 'https://site.invalid' and ask bob@corp.invalid")
+        self.assertEqual("check 'https://corp.invalid", shown)
+
+    def test_break_characters_before_userinfo_cannot_cause_catastrophic_backtracking(self):
+        """The pattern anchors on the first break character, whichever kind it is."""
+        for payload in ("'" * 2_000, "'\"<>` \t" * 400, " " * 2_000, "a '" * 1_300 + "@h"):
+            with self.subTest(length=len(payload)):
+                started = time.perf_counter()
+                sources.redact_urls_in_text(f"https://{payload}")
+                self.assertLess(time.perf_counter() - started, 5.0)
+
     def test_percent_encoded_controls_cannot_split_a_credential_in_prose(self):
         for separator in ("%0A", "%0D", "%09", "%20", "%E2%80%8B", "%250A"):
             with self.subTest(separator=separator):

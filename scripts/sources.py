@@ -358,15 +358,23 @@ _QUERY_PARAM_IN_TEXT = re.compile(
     # Extend values to the next delimiter so secret suffixes are not exposed.
     r"(?P<value>[^&;#]*)"
 )
-# Catch userinfo split by line breaks; urlsplit ignores raw newlines.
-# The run before the whitespace must exclude whitespace itself. Spelling it
-# ``[^/@?#<>"'`]*\s+[^/@?#<>"'`]*@`` instead lets whitespace match either the
-# class or the ``\s+``, so a run of blanks with no closing ``@`` costs cubic
+# Catch userinfo that the URL patterns above cannot match as a single token:
+# a line break (urlsplit ignores raw newlines) or a quote, angle bracket or
+# backtick. Those quoting characters delimit URLs in prose and markup, which is
+# why the patterns above stop at them -- but ``'`` is a legal sub-delimiter in
+# userinfo (RFC 3986), so a password beside one used to survive the scan
+# (``https://us'er:SECRET@h``), including by prefixing a quote to reach a line
+# break. One pattern covers both: anything between ``//`` and ``@`` is dropped
+# whole rather than parsed.
+#
+# The run before the break character must exclude break characters itself.
+# Spelling it ``[^/@?#]*[<>"'`\s]+[^/@?#]*@`` instead lets a blank match either
+# the class or the repeat, so a run of blanks with no closing ``@`` costs cubic
 # time -- 2,000 characters took 42 seconds, and ``proof`` strings arrive from
-# the upstream list. Anchoring on the first whitespace keeps the matched span
-# identical while leaving only one way to divide the text.
-_MULTILINE_USERINFO_IN_TEXT = re.compile(
-    r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//)[^/@?#<>\"'`\s]*\s[^/@?#<>\"'`]*@",
+# the upstream list. Anchoring on the first break character keeps the matched
+# span identical while leaving only one way to divide the text.
+_SPLIT_USERINFO_IN_TEXT = re.compile(
+    r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//)[^/@?#<>\"'`\s]*[<>\"'`\s][^/@?#]*@",
     re.IGNORECASE | re.ASCII,
 )
 
@@ -603,8 +611,12 @@ def _redact_url_occurrence(match: re.Match[str], depth: int) -> str:
     return _redact_url(value[:end], depth) + value[end:]
 
 
-def _redact_multiline_userinfo(match: re.Match[str]) -> str:
-    """Replace userinfo that crosses a line break while embedded in prose."""
+def _redact_userinfo_span(match: re.Match[str]) -> str:
+    """Replace a userinfo span the URL patterns cannot match as one token.
+
+    Serves both the line-break and the quote/bracket cases: either way the
+    span between ``//`` and ``@`` is dropped whole rather than parsed.
+    """
     return f"{match.group('prefix')}REDACTED@"
 
 
@@ -647,7 +659,7 @@ def _redact_urls_in_text(
             safe_decoded = _redact_urls_in_text(decoded, depth, decode_entities=False)
             if safe_decoded != decoded:
                 return safe_decoded
-    text = _MULTILINE_USERINFO_IN_TEXT.sub(_redact_multiline_userinfo, text)
+    text = _SPLIT_USERINFO_IN_TEXT.sub(_redact_userinfo_span, text)
     # Inspect HTTP strings containing @ even when malformed syntax left userinfo in the path.
     text = _HTTP_URL_WITH_AT_IN_TEXT.sub(lambda match: _redact_url_occurrence(match, depth), text)
     # Do not parse prose colons as schemes; redact standalone queries and embedded URLs separately.
