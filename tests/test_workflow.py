@@ -261,11 +261,12 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("continue-on-error: true", block)
         self.assertIn('gh pr list --repo "$REPOSITORY" --head "$BOT_BRANCH" --state open', block)
 
-    def test_the_checks_job_tests_the_python_floor_the_readme_promises(self):
+    def test_the_checks_job_tests_the_documented_python_floor(self):
         """Keep the 3.10 floor and production 3.12 in the checks matrix.
 
         Without the floor leg, a 3.11+ API (``datetime.UTC``, ``tomllib``) or a
-        3.12-only f-string could pass CI while breaking the documented promise.
+        3.12-only f-string could pass CI while breaking the floor that
+        pyproject.toml and the lint target both declare.
         The write-capable sync job stays on 3.12 as the production runtime.
         """
         checks = self.jobs()["checks"]
