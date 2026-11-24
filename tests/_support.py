@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import itertools
 import os
 import sys
 import tempfile
@@ -46,6 +47,41 @@ def frozen_clock():
     fixed = _time.gmtime(1_700_000_000)
     with mock.patch.object(_time, "gmtime", return_value=fixed):
         yield
+
+
+def _tick_the_clock_on_every_read() -> None:
+    """Make the displayed clock read later on every call, process-wide.
+
+    The inverse of ``frozen_clock`` and the guard behind it: freezing the
+    clock fixes the two tests that compared two renders of one run, but
+    nothing stops a third being written the same way. Under this mode such a
+    test cannot pass, so the flake becomes a build failure the first time
+    anybody writes one rather than a red run once in a few thousand that
+    reproduces for nobody.
+
+    Enabled only by TF2BD_TICKING_CLOCK=1, which CI sets for a second pass
+    over the suite. Only ``gmtime`` moves, and only when called with no
+    argument: that is the single clock the published report reads, so
+    timeouts, retries and logging keep their real time and a failure here
+    means a genuine dependency on the displayed minute. A call that passes an
+    explicit timestamp is converting a known moment, not reading the clock,
+    and is answered truthfully.
+    """
+    import time as _time
+
+    real_gmtime = _time.gmtime
+    elapsed = itertools.count(60, 60)
+
+    def ticking_gmtime(seconds: float | None = None) -> _time.struct_time:
+        if seconds is not None:
+            return real_gmtime(seconds)
+        return real_gmtime(_time.time() + next(elapsed))
+
+    _time.gmtime = ticking_gmtime  # type: ignore[assignment]
+
+
+if os.environ.get("TF2BD_TICKING_CLOCK") == "1":
+    _tick_the_clock_on_every_read()
 
 
 def player(steamid, attributes, **extra):

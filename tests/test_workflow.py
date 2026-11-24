@@ -187,7 +187,7 @@ class WorkflowContractTests(unittest.TestCase):
             "python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v",
             "python3 -m coverage report",
             "python3 -m vulture scripts tests --min-confidence 60",
-            "python3 tests/clock_flake_check.py",
+            "python3 -m unittest discover -s tests -q",
         ):
             self.assertIn(command, checks)
             self.assertNotIn(command, sync)
@@ -201,6 +201,24 @@ class WorkflowContractTests(unittest.TestCase):
         for name, block in jobs.items():
             self.assertIn("timeout-minutes:", block, f"the {name} job has no timeout")
             self.assertIn("concurrency:", block, f"the {name} job has no concurrency group")
+
+    def test_the_second_test_pass_actually_ticks_the_clock(self):
+        """Without the env var the clock step is just the suite run twice.
+
+        The step re-runs the same discover command the coverage step already
+        ran; TF2BD_TICKING_CLOCK is the only thing that makes it a different
+        test. Dropping the variable would leave a green step that proves
+        nothing, so assert the variable and the command travel together.
+        """
+        checks = self.jobs()["checks"]
+        step = checks.split("No test may depend on the clock standing still", 1)[-1]
+        self.assertIn('TF2BD_TICKING_CLOCK: "1"', step)
+        self.assertIn("python3 -m unittest discover -s tests -q", step)
+        self.assertIn(
+            "TF2BD_TICKING_CLOCK",
+            (Path(__file__).resolve().parent / "_support.py").read_text(encoding="utf-8"),
+            "the workflow sets TF2BD_TICKING_CLOCK but nothing reads it",
+        )
 
     def test_the_sync_job_always_acts_on_the_default_branch(self):
         """A non-default workflow ref must never reach the write-capable job.
