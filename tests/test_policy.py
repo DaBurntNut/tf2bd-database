@@ -781,7 +781,8 @@ class MalformedEntryTests(unittest.TestCase):
         self.assertEqual(database["players"][0], "not a dict")
 
     def test_promote_skips_entries_it_cannot_interpret(self):
-        index = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in (200, 201, 202, 203)])
+        index = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in (200, 201, 202, 203, 204)])
+        mixed = player("[U:1:204]", ["suspicious", 1])
         database = {
             "players": [
                 "not a dict",
@@ -791,12 +792,20 @@ class MalformedEntryTests(unittest.TestCase):
                 player("[U:1:201]", [1]),
                 player("[U:1:202]", ["cheater"]),  # Already a cheater.
                 player("[U:1:203]", ["suspicious"]),
+                # A promotable attribute next to a non-string one. Dropping the
+                # all-strings check lets this entry through, and the bot writes
+                # ["cheater", "suspicious", 1] -- an integer in attributes, which
+                # makes TF2BD reject the whole file. A list of only non-string
+                # attributes cannot catch that: it is skipped a few lines later
+                # anyway, for having nothing promotable in it.
+                mixed,
                 player("[U:1:999]", ["suspicious"]),  # Not listed upstream.
             ]
         }
         changes = promote(database, index)
         promoted = [change.steamid for change in changes]
         self.assertEqual(promoted, ["[U:1:203]"])
+        self.assertEqual(mixed["attributes"], ["suspicious", 1], "a malformed entry must be left exactly as it was")
 
     def test_sync_tolerates_a_missing_players_array(self):
         self.assertEqual(promote({}, index_of()), [])

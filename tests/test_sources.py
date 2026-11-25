@@ -1473,11 +1473,22 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(raw, self.BODY)
 
     def test_oversized_local_source_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "big.json"
-            path.write_bytes(b"x" * 4096)
-            with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError):
-                load_first_available_raw([str(path)])
+        """The size limit must be the thing that rejects it, not a later parse error.
+
+        A file of junk fails JSON parsing as well, so asserting SyncError alone
+        still passes with the limit deleted. The second body is the one that
+        matters: its first MAX_SOURCE_BYTES bytes are valid JSON, so without the
+        limit the oversized read is simply truncated and accepted, and the bot
+        syncs against a silently shortened upstream list.
+        """
+        prefix = b'{"players":[{"steamid":"[U:1:100]","attributes":["cheater"]}]}'
+        for label, body in (("junk", b"x" * 4096), ("valid JSON prefix", prefix + b" " * 4096)):
+            with self.subTest(body=label), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "big.json"
+                path.write_bytes(body)
+                with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError) as caught:
+                    load_first_available_raw([str(path)])
+                self.assertIn("safety limit", str(caught.exception))
 
     @unittest.skipUnless(Path("/dev/zero").exists(), "needs a special file")
     def test_special_files_are_refused_before_opening(self):
