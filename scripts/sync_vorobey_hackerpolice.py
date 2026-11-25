@@ -367,6 +367,12 @@ def write_snapshot(path: Path, raw: bytes, original: bytes | None, *, dry_run: b
 
 
 def _log_outcome(changes: list[Change], path: Path, *, modified: bool, dry_run: bool) -> None:
+    """Log what the run did to the database, in the tense the run deserves.
+
+    The three outcomes are kept apart on purpose: nothing to do, a rewrite
+    that changed no tags, and a real set of changes. Each reads differently
+    under --dry-run, so a log line never claims a write that did not happen.
+    """
     count = len(changes)
     what = f"{count} {plural(count, 'entry', 'entries')}"
     if not modified:

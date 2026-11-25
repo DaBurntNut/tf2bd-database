@@ -725,7 +725,10 @@ def player_name(player: Player) -> str:
 
 
 def _player_sort_key(player: Player) -> tuple[bool, int]:
-    # Invalid entries sort last; stable sorting preserves their input order.
+    """Order players by account id, with unreadable entries kept last.
+
+    Invalid entries sort last; stable sorting preserves their input order.
+    """
     account = account_id(player.get("steamid")) if isinstance(player, dict) else None
     return (account is None, account or 0)
 
