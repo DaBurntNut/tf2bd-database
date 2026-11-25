@@ -1,5 +1,29 @@
 """Sync policy: promote and demote entries against the hackerpolice list.
 
+The six rules this bot is held to, in plain words:
+
+1. A SteamID marked ``suspicious`` here that IS on the hackerpolice list
+   becomes ``cheater``. No proof line is added.
+2. A SteamID marked ``suspicious`` + ``racist`` that IS on the list becomes
+   ``cheater`` + ``racist``. No proof line is added.
+3. A SteamID marked ONLY ``cheater`` that is later dropped from the
+   hackerpolice list has its WHOLE entry deleted from the database. This is
+   deliberate, not an oversight: the entry is there because the list vouched
+   for it, so when the list withdraws, the entry goes -- hand-written notes
+   and all.
+4. A SteamID marked ``cheater`` + ``racist`` that is later dropped from the
+   list keeps ``racist``, loses ``cheater``, and loses every proof line that
+   is not an ``[auto] ... Racist`` record (see :func:`is_racist_proof`).
+5. ``snapshot/playerlist.vorobey-hackerpolice.json`` stays an exact 1-to-1
+   copy of upstream -- the raw bytes, never re-serialised. (Written by
+   ``write_snapshot`` in ``sync_vorobey_hackerpolice.py``.)
+6. The pull request names every SteamID that disappeared upstream, including
+   ones this database never carried. (``render_removed_table`` in
+   ``report.py``.)
+
+All six are pinned by the test suite: break any one of them and the tests go
+red before the change can reach the database.
+
 Promotion: entries matching the Vorobey hackerpolice list gain ``cheater``.
 Demotion (opt-in via ``--demote``): entries carrying ``cheater`` lose it, or
 are removed entirely -- but ONLY for SteamIDs explicitly handed to
