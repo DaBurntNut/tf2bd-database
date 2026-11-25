@@ -1100,6 +1100,48 @@ class CliTests(unittest.TestCase):
             code = main(argv)
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def test_the_log_says_would_update_on_a_dry_run_and_updated_for_real(self):
+        """Two different words for the same run, and nothing pinned which one
+        appears. The bot could announce "Updated" having written nothing, or
+        claim a dry run while rewriting the database, with the suite green.
+        """
+        code, _, dry = self.run_cli("--source", str(self.source), "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("Dry run: would update 2 entries in", dry)
+        self.assertNotIn("Updated 2 entries in", dry)
+
+        code, _, real = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 0)
+        self.assertIn("Updated 2 entries in", real)
+        self.assertNotIn("Dry run", real)
+
+    def test_a_normalizing_run_says_rewrote_and_a_dry_one_says_would_rewrite(self):
+        """The same distinction on the no-tag-changes path, which has its own
+        wording and so needs its own case.
+        """
+        unsorted_database = dumps(
+            {
+                "$schema": "x",
+                "file_info": {},
+                "players": [
+                    player("[U:1:900]", ["cheater"]),  # Appended by hand, out of order.
+                    player("[U:1:100]", ["cheater"]),
+                ],
+            }
+        )
+        for dry_run, expected, forbidden in (
+            (True, "Dry run: would rewrite", "Rewrote"),
+            (False, "Rewrote", "Dry run"),
+        ):
+            with self.subTest(dry_run=dry_run):
+                self.database.write_text(unsorted_database, encoding="utf-8")
+                extra = ("--dry-run",) if dry_run else ()
+                code, _, stderr = self.run_cli("--source", str(self.source), "--demote", *extra)
+                self.assertEqual(code, 0)
+                self.assertIn("no tag changes: the file was normalized", stderr)
+                self.assertIn(expected, stderr)
+                self.assertNotIn(forbidden, stderr)
+
     def test_dry_run_does_not_write(self):
         original = self.database.read_text(encoding="utf-8")
         code, stdout, _ = self.run_cli("--source", str(self.source), "--dry-run", "--report", str(self.root / "r.md"))

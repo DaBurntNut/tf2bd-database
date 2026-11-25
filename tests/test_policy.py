@@ -142,6 +142,7 @@ class MassDemotionGuardTests(unittest.TestCase):
                 player("[U:1:1]", ["cheater"]),  # in previous snapshot -> at risk
                 player("[U:1:2]", ["cheater"]),  # never known to upstream -> exonerated
                 player("[U:1:3]", ["racist"]),  # no cheater tag -> untouched
+                player("[U:1:9]", ["racist"]),  # no cheater tag, but IS in the snapshot -> still untouched
                 player("[U:1:4]", ["cheater", "racist"]),  # in snapshot -> at risk
                 {"attributes": ["cheater"]},  # unusable SteamID -> skipped
                 {"steamid": "[U:1:5]", "attributes": "cheater"},  # malformed attributes

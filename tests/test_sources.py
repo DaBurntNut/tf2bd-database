@@ -171,6 +171,31 @@ class SourceFetchTests(unittest.TestCase):
                     load_first_available_raw([self.URL])
                 self.assertEqual(urlopen.call_count, 1)  # The response URL was not followed.
 
+    def test_the_contents_api_may_only_hand_off_to_githubs_raw_host(self):
+        """The redirect guard, exercised with the address the bot really uses.
+
+        Every other case here starts from the example.invalid fixture, so the
+        one branch that only exists for api.github.com was never tested from
+        api.github.com: loosening it to allow ANY destination from that host
+        left the whole suite green. The source is taken from the shipped list
+        rather than retyped, so it cannot drift away from the real one.
+        """
+        api = next(url for url in sources.DEFAULT_SOURCES if urllib.parse.urlsplit(url).hostname == "api.github.com")
+        self.assertTrue(sources._allowed_download_url(api, "https://raw.githubusercontent.com/Nocrex/Tom/x.json"))
+        self.assertTrue(sources._allowed_download_url(api, "https://api.github.com/other"))  # Same origin.
+        for bad in (
+            "https://evil.test/steal",
+            "https://raw.githubusercontent.com.evil.test/x",  # Lookalike host.
+            "http://raw.githubusercontent.com/x",  # Downgraded scheme.
+            "https://raw.githubusercontent.com:8443/x",  # Non-default port.
+            "https://user:pw@raw.githubusercontent.com/x",  # Credentials attached.
+            "https://github.com/Nocrex/Tom/raw/main/x.json",  # Not the raw host.
+        ):
+            with self.subTest(candidate=bad):
+                self.assertFalse(sources._allowed_download_url(api, bad))
+        # The allowance runs one way only.
+        self.assertFalse(sources._allowed_download_url("https://raw.githubusercontent.com/a/b", api))
+
     def test_an_oversized_download_url_is_rejected_before_url_parsing(self):
         candidate = "https://example.invalid/" + "x" * sources._MAX_URL_PARSE_CHARS
         with mock.patch("sources.urllib.parse.urlsplit", side_effect=AssertionError("must not parse")):
