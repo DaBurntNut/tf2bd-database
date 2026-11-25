@@ -345,6 +345,50 @@ class SourceFetchTests(unittest.TestCase):
         malformed_authority = "https://host" + encoded_host + ".invalid/path"
         self.assertIn("omitted", sources.redact_url(malformed_authority))
 
+    def test_a_blank_in_userinfo_cannot_smuggle_a_password_past_the_prose_scan(self):
+        """A blank splits the token, so no single-URL pattern ever parses the authority.
+
+        ``_SPLIT_USERINFO_IN_TEXT`` is the only scan that still sees the span, so it
+        must not insist on the two shapes a well-formed URL happens to have: the
+        ``//`` after the scheme, and a literal ``@``. Both were optional for an
+        attacker and mandatory for the pattern, and every case below rode through
+        into the pull request body and the console log.
+        """
+        secret = "BLANK_SPLIT_USERINFO_SECRET"
+        hosts = (
+            f"https:user name:{secret}@host.invalid/p",  # no slashes after the scheme
+            f"http:user name:{secret}@host.invalid/p",
+            f"https://user name%3a{secret}%40host.invalid/p",  # percent-encoded ':' and '@'
+            f"https://user name:{secret}%40host.invalid/p",
+            f"https://user name%3A{secret}%40host.invalid/p",  # uppercase escapes
+            f"https://user name%3a{secret}%2540host.invalid/p",  # doubly encoded '@'
+        )
+        for blank in (" ", "\t", "\n", "\r"):
+            for template in hosts:
+                text = template.replace(" ", blank)
+                with self.subTest(text=text):
+                    shown = sources.redact_urls_in_text(text)
+                    self.assertNotIn(secret, shown)
+                    # Any of the safe outcomes will do -- the span is replaced, the
+                    # authority is rebuilt without userinfo, or the whole URL is
+                    # omitted -- but the text must not come back untouched.
+                    self.assertNotEqual(shown, text)
+
+    def test_prose_that_merely_looks_like_userinfo_is_left_readable(self):
+        """Dropping the ``//`` requirement must not swallow ordinary sentences.
+
+        Only ``http``/``https`` may omit the slashes. A prose colon followed by an
+        address is far more common than a credential, and redacting it would hide
+        the diagnostic the reader came for.
+        """
+        for text in (
+            "note: jane doe@example.invalid",
+            "contact: ops team@example.invalid for access",
+            "see RFC 3986: user info@example.invalid",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(sources.redact_urls_in_text(text), text)
+
     def test_bare_secret_fields_and_authorization_headers_are_redacted(self):
         cases = (
             ("Diagnostic: access_token=BARE_ACCESS_TOKEN_SECRET", "BARE_ACCESS_TOKEN_SECRET"),

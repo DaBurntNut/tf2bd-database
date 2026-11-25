@@ -373,8 +373,23 @@ _QUERY_PARAM_IN_TEXT = re.compile(
 # time -- 2,000 characters took 42 seconds, and ``proof`` strings arrive from
 # the upstream list. Anchoring on the first break character keeps the matched
 # span identical while leaving only one way to divide the text.
+#
+# The ``//`` is optional after an explicit ``http:``/``https:``, because the
+# slashes are not what hides the credential: ``https:user name:SECRET@h.test``
+# has no authority for ``urlsplit`` to parse, no ``//`` for the pattern above,
+# and a blank that stops ``_HTTP_URL_WITH_AT_IN_TEXT`` -- so the password rode
+# through into the pull request body. Only ``http``/``https`` may drop the
+# slashes: allowing it for any scheme would turn ordinary prose such as
+# ``note: jane doe@example.com`` into a redacted span.
+#
+# The closing ``@`` may also be percent-encoded, at any number of layers
+# (``%40``, ``%2540``, ...): the blank already stopped every pattern that
+# parses the string as one URL, and ``_netloc_without_encoded_userinfo`` --
+# which does decode ``%40`` -- never sees it, because the blank split the
+# token before parsing. Whoever decodes the string later still reads a
+# password, so the span is dropped here as well.
 _SPLIT_USERINFO_IN_TEXT = re.compile(
-    r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//)[^/@?#<>\"'`\s]*[<>\"'`\s][^/@?#]*@",
+    r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//|https?:)[^/@?#<>\"'`\s]*[<>\"'`\s][^/@?#]*(?:@|%(?:25)*40)",
     re.IGNORECASE | re.ASCII,
 )
 
