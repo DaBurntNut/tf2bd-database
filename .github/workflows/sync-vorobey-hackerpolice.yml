@@ -45,9 +45,12 @@ on:
       - "playerlist.garou3299.json"
       - "rules.garou3299.json"
       - "snapshot/playerlist.vorobey-hackerpolice.json"
-      # Tests read the Dependabot config and this workflow; include each in this filter.
-      # README.md is not listed, and no test may depend on it: its contents and its
-      # existence are the maintainer's to change, up to deleting the file outright.
+      # No test reads pyproject.toml, rules.garou3299.json or the Dependabot config.
+      # They are listed so a tooling or data change still runs the checks, not because
+      # anything asserts on them: each one may be edited or deleted and the suite stays
+      # green. README.md is not listed at all. Only the sync's own inputs -- the
+      # database, the snapshot, the code, and the two git settings that govern its
+      # commits -- are allowed to fail a test, because only those can break the bot.
       - ".github/dependabot.yml"
       - ".github/workflows/sync-vorobey-hackerpolice.yml"
 

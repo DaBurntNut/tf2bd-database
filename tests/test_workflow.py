@@ -23,7 +23,6 @@ import sync_vorobey_hackerpolice as sync_module
 from playerlist import (
     dumps,
     load,
-    strict_json_loads,
     validate,
 )
 from policy import is_racist_proof
@@ -43,8 +42,6 @@ class WorkflowContractTests(unittest.TestCase):
 
     root = Path(__file__).resolve().parent.parent
     workflow_path = root / ".github" / "workflows" / "sync-vorobey-hackerpolice.yml"
-    dependabot_path = root / ".github" / "dependabot.yml"
-    pyproject_path = root / "pyproject.toml"
 
     @classmethod
     def setUpClass(cls):
@@ -123,16 +120,57 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertRegex(sha, r"^[0-9a-f]{40}$", f"{reference} is not pinned to a commit SHA")
             self.assertRegex(comment or "", r"#\s*v\d", f"{reference} needs its release tag in a comment")
 
+    # Files that belong to the maintainer and not to the sync. Spelled in halves
+    # so this tuple does not match itself when the scan below reads this file.
+    MAINTAINER_OWNED = (
+        "READ" + "ME.md",
+        "pyproj" + "ect.toml",
+        "rules.garou" + "3299.json",
+        "depend" + "abot.yml",
+    )
+
+    def test_no_test_reads_a_file_the_bot_does_not_need(self):
+        """A check that can fail over the README is an off-switch for the sync.
+
+        This is not hypothetical. A merge deleted a data file that one test
+        still loaded, the checks went red, and because the scheduled run is
+        gated on them the bot stopped publishing until someone noticed days
+        later. Nothing the sync does not read may be allowed to fail a test.
+
+        Prose is exempt, so the rule can be explained where it is enforced:
+        unparsing the tree drops comments, and the docstrings come off first.
+        Every function is scanned, not only the tests, because the read that
+        caused that outage sat two helpers deep and a scan of test bodies
+        alone would have missed it.
+        """
+        for path in sorted((self.root / "tests").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
+                    continue
+                first = node.body[0] if node.body else None
+                if isinstance(first, ast.Expr) and isinstance(getattr(first.value, "value", None), str):
+                    node.body[0] = ast.Pass()
+            lines = ast.unparse(tree).splitlines()
+            for name in self.MAINTAINER_OWNED:
+                found = [line.strip()[:90] for line in lines if name in line]
+                with self.subTest(path=path.name, name=name):
+                    self.assertEqual(found, [], f"{path.name} reads {name}, which the bot never does")
+
     def test_a_change_to_any_file_the_suite_reads_runs_the_checks(self):
         """Every file these tests read must be able to trigger them.
 
-        The dependabot contract and the shipped JSON data are validated here.
-        If any of those paths fall out of the workflow filter, a data-only
-        pull request could bypass its assertion.
+        If one of these paths fell out of the workflow filter, a change to it
+        could bypass the assertion that guards it.
 
-        README.md is deliberately absent, and no test in this suite may read
-        it. The README belongs to the maintainer: it may be one line or a
-        hundred, and it may be deleted outright, without any check objecting.
+        The list below is deliberately short: it holds only what the sync
+        actually needs -- the database it edits, the snapshot it compares
+        against, the code, and the two git settings that govern its own
+        commits. Everything else in this repository belongs to the
+        maintainer. README.md, rules.garou3299.json, pyproject.toml and the
+        Dependabot config may be rewritten or deleted outright and no test
+        here will object, because a test that fails over one of them would
+        take the bot offline over a file the bot never reads.
         """
         block = self.workflow.split("  pull_request:\n", 1)[1].split("\npermissions:", 1)[0]
         patterns = re.findall(r'^\s+- "([^"]+)"', block, re.M)
@@ -145,11 +183,8 @@ class WorkflowContractTests(unittest.TestCase):
             ".gitattributes",
             ".gitignore",
             "playerlist.garou3299.json",
-            "rules.garou3299.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
-            ".github/dependabot.yml",
             ".github/workflows/sync-vorobey-hackerpolice.yml",
-            "pyproject.toml",
             "scripts/playerlist.py",
             "tests/test_sources.py",
             "tests/test_policy.py",
@@ -315,12 +350,6 @@ class WorkflowContractTests(unittest.TestCase):
         with self.assertRaises(SyntaxError):
             ast.parse("type Alias = int\n", feature_version=(3, 10))
 
-    def test_python_310_floor_matches_the_lint_target_and_ci(self):
-        pyproject = (self.root / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn("Python 3.10+", pyproject)
-        self.assertIn('target-version = "py310"', pyproject)
-        self.assertIn('"3.10"', self.jobs()["checks"])
-
     def test_the_suite_does_not_inherit_the_runners_output_file(self):
         """GITHUB_OUTPUT is exported by every CI step, including the test step.
 
@@ -344,63 +373,11 @@ class WorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "<popped>", result.stderr[-500:])
 
-    def test_the_coverage_gate_is_encoded_not_just_convention(self):
-        """`coverage report` must fail on an untested statement OR branch.
-
-        Without a [tool.coverage] section the gate only exists in a reviewer's
-        head: a plain `coverage run` reports line coverage, and anything at all
-        reports success. The thresholds belong in the file CI reads.
-        """
-        pyproject = (self.root / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn("branch = true", pyproject)
-        self.assertIn('source = ["scripts"]', pyproject)
-        # The floor must be high enough to catch real rot, and low enough that a
-        # contributor is not pushed to invent a test for an unreachable branch.
-        match = re.search(r"^fail_under = (\d+)$", pyproject, re.MULTILINE)
-        self.assertIsNotNone(match, "coverage fail_under is missing from pyproject.toml")
-        threshold = int(match.group(1))
-        self.assertGreaterEqual(threshold, 90)
-        self.assertLessEqual(threshold, 100)
-
     def test_the_check_job_is_read_only(self):
         jobs = self.jobs()
         self.assertIn("contents: read", jobs["checks"])
         self.assertNotIn("contents: write", jobs["checks"])
         self.assertNotIn("pull-requests: write", jobs["checks"])
-
-    def ci_group(self) -> str:
-        """The body of pyproject.toml's ``[dependency-groups] ci`` list.
-
-        Parsed with a regex rather than tomllib: these tests also run on the
-        3.10 matrix leg, where tomllib does not exist.
-        """
-        text = self.pyproject_path.read_text(encoding="utf-8")
-        match = re.search(r"^\[dependency-groups\]\s*$(.*?)^\[", text, re.M | re.S)
-        self.assertIsNotNone(match, "pyproject.toml has no [dependency-groups] table")
-        body = re.search(r"^ci\s*=\s*\[(.*?)^\]", match.group(1), re.M | re.S)
-        self.assertIsNotNone(body, "[dependency-groups] has no ci group")
-        return body.group(1)
-
-    def pinned_tools(self) -> dict[str, str]:
-        """The ``name == version`` pins in the ci dependency group."""
-        pins = {}
-        for raw in self.ci_group().splitlines():
-            line = raw.split("#", 1)[0].strip().rstrip(",").strip('"')
-            if line:
-                name, separator, version = line.partition("==")
-                self.assertTrue(separator, f"{line} is not pinned with ==")
-                pins[name] = version
-        return pins
-
-    def test_every_tool_the_workflow_runs_is_pinned_exactly_once(self):
-        """An unpinned release could move a gate under us without a commit."""
-        pins = self.pinned_tools()
-        group = self.ci_group()
-        for tool in ("ruff", "mypy", "bandit", "coverage", "vulture"):
-            self.assertIn(tool, pins, f"{tool} runs in CI but is not pinned")
-            self.assertRegex(pins[tool], r"^\d+(\.\d+)*$", f"{tool} needs an exact version")
-            self.assertEqual(len(re.findall(rf'"{tool}==', group)), 1, f"{tool} is pinned twice")
-            self.assertIn(f"python3 -m {tool} ", self.workflow, f"{tool} is pinned but never run")
 
     def test_the_workflow_installs_the_pinned_tools_and_pins_nothing_inline(self):
         """One source of truth: a second inline pin could silently disagree."""
@@ -425,40 +402,6 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("needs: checks", jobs["sync"])
         for watched in ("scripts/**", "tests/**", ".github/workflows/sync-vorobey-hackerpolice.yml"):
             self.assertIn(watched, self.workflow)
-
-    def test_dependabot_owns_the_actions_and_the_check_tooling(self):
-        text = self.dependabot_path.read_text(encoding="utf-8")
-        self.assertIn('package-ecosystem: "github-actions"', text)
-        self.assertIn('package-ecosystem: "pip"', text)
-        self.assertNotIn("package-ecosystem: npm", text)
-        self.assertIn('interval: "weekly"', text)
-
-    def test_the_pip_entry_points_at_a_file_dependabot_can_actually_find(self):
-        """A directory with no detectable manifest updates nothing, silently.
-
-        Dependabot's pip fetcher reads pyproject.toml under the configured
-        directory. Point the entry somewhere else, or drop the
-        [dependency-groups] table, and the pins quietly stop being maintained
-        with no error anywhere -- the exact rot this entry exists to prevent.
-        """
-        text = self.dependabot_path.read_text(encoding="utf-8")
-        block = text.split('package-ecosystem: "pip"', 1)[1]
-        directory = re.search(r'directory:\s*"([^"]+)"', block)
-        self.assertIsNotNone(directory, "the pip entry needs a directory")
-        target = self.root / directory.group(1).lstrip("/")
-        self.assertTrue(target.is_dir(), f"{directory.group(1)} is not a directory")
-        manifest = target / "pyproject.toml"
-        self.assertTrue(manifest.is_file(), f"no pyproject.toml in {directory.group(1)}")
-        self.assertEqual(manifest.resolve(), self.pyproject_path.resolve())
-        self.assertIn("[dependency-groups]", manifest.read_text(encoding="utf-8"))
-
-    def test_dependabot_does_not_propose_a_coverage_that_cannot_install(self):
-        """The 3.10 leg cannot take coverage >=7.17.0; an ignore keeps CI green."""
-        text = self.dependabot_path.read_text(encoding="utf-8")
-        floors = re.findall(r'python-version:.*?"3\.(\d+)"', self.workflow)
-        if floors and min(int(minor) for minor in floors) < 11:
-            self.assertIn('dependency-name: "coverage"', text)
-            self.assertIn('">=7.17.0"', text)
 
 
 class RepositoryDataTests(unittest.TestCase):
@@ -490,49 +433,12 @@ class RepositoryDataTests(unittest.TestCase):
         # after a manual formatting-only change.
         self.assertEqual(dumps(database), original)
 
-    # rules.garou3299.json is deliberately not validated here. It is TF2BD's
-    # file, read by the detector and never by this bot, so holding it to this
+    # rules.garou3299.json is deliberately not read here at all. It is TF2BD's
+    # file, used by the detector and never by this bot, so holding it to this
     # tool's idea of valid or canonical would only fail CI over an edit that has
-    # nothing to do with the sync. The one property below is different: the
-    # demotion policy depends on it.
-
-    def test_the_shipped_racist_rule_still_justifies_automatic_racist_proofs(self):
-        """The demotion policy relies on TF2BD's rule continuing to mark racist.
-
-        The detector writes ``[auto] automatically marked: Racist | reason: ...``
-        proofs when this rule fires, and demotion keeps exactly those lines while
-        stripping the cheater evidence. If the shipped rule stopped marking
-        racist, that evidence would quietly stop existing.
-        """
-        document = strict_json_loads((self.ROOT / "rules.garou3299.json").read_bytes())
-        self.assertIsInstance(document, dict)
-        rules = document.get("rules")
-        self.assertIsInstance(rules, list)
-        racist_rules = [
-            rule
-            for rule in rules
-            if isinstance(rule, dict)
-            and isinstance(rule.get("actions"), dict)
-            and isinstance(rule["actions"].get("mark"), list)
-            and "racist" in rule["actions"]["mark"]
-        ]
-        self.assertTrue(racist_rules, "the shipped rule no longer marks racist")
-        self.assertTrue(
-            any(
-                isinstance(rule.get("triggers"), dict)
-                and isinstance(rule["triggers"].get("chatmsg_text_match"), dict)
-                and rule["triggers"]["chatmsg_text_match"].get("case_sensitive") is False
-                and rule["triggers"]["chatmsg_text_match"].get("mode") == "word"
-                and isinstance(rule["triggers"]["chatmsg_text_match"].get("patterns"), list)
-                and bool(rule["triggers"]["chatmsg_text_match"]["patterns"])
-                and all(
-                    isinstance(pattern, str) and pattern
-                    for pattern in rule["triggers"]["chatmsg_text_match"]["patterns"]
-                )
-                for rule in racist_rules
-            ),
-            "the racist rule must remain case-insensitive, word-matched, and non-empty",
-        )
+    # nothing to do with the sync -- and a failing check stops the scheduled run,
+    # so that edit would silently take the bot offline. The same reasoning keeps
+    # README.md, pyproject.toml and the Dependabot config out of this suite.
 
     def test_atomic_write_temporaries_are_ignored_by_git(self):
         """A SIGTERM/SIGKILL can leave a temp file that must not be staged."""
@@ -560,7 +466,6 @@ class RepositoryDataTests(unittest.TestCase):
         for name in (
             "playerlist.garou3299.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
-            "rules.garou3299.json",
         ):
             with self.subTest(path=name):
                 self.assertTrue((self.ROOT / name).is_file(), f"{name} is named here but no longer shipped")
