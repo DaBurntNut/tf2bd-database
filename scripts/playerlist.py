@@ -113,7 +113,18 @@ _CREDENTIAL_CHARS = re.compile(r"[0-9_\-./+=:~]", re.ASCII)
 # Also sanitize URL userinfo when the generic path formatter is used directly.
 _URL_USERINFO_PREFIX = re.compile(r"(?:https?:/{0,4}|//)", re.IGNORECASE | re.ASCII)
 _URL_USERINFO_IN_TEXT = re.compile(
-    r"(?P<prefix>(?:https?:/{0,4}|//))[^/\s?#<>\"'`@]*@",
+    r"(?P<prefix>(?:https?:/{0,4}|//))[^/\s?#<>\"'`@]*(?:@|%(?:25)*40)",
+    re.IGNORECASE | re.ASCII,
+)
+# The pattern above reads a URL as one token, so a blank inside the userinfo
+# ends the run before the ``@`` and the credential survives -- the same hole
+# ``sources._SPLIT_USERINFO_IN_TEXT`` closes for prose, reached here through
+# the diagnostic preview of an unusable database value (which lands in a
+# public job log). The run before the break character must itself exclude
+# break characters: letting a blank match either the class or the repeat
+# costs cubic time on a long run with no closing ``@``.
+_SPLIT_USERINFO_IN_DIAGNOSTIC = re.compile(
+    r"(?P<prefix>(?:https?:/{0,4}|//))[^/@?#<>\"'`\s]*[<>\"'`\s][^/@?#]*(?:@|%(?:25)*40)",
     re.IGNORECASE | re.ASCII,
 )
 # Identify nested percent-encoded URL schemes before they are clipped out of view.
@@ -339,12 +350,41 @@ def _redact_bearer_match(match: re.Match[str]) -> str:
     return f"{match.group('scheme')} REDACTED"
 
 
-def redact_diagnostic_text(value: str) -> str:
-    """Redact common bare secrets, authorization headers, and URL userinfo."""
+def _redact_literal_diagnostic_text(value: str) -> str:
+    """Redact the text exactly as written, without decoding any spelling of it."""
     value = _AUTHORIZATION_HEADER.sub(r"\g<header>REDACTED", value)
     value = _BEARER_CREDENTIAL.sub(_redact_bearer_match, value)
+    # Drop a blank-split userinfo span whole before the single-token pattern runs.
+    value = _SPLIT_USERINFO_IN_DIAGNOSTIC.sub(r"\g<prefix>REDACTED@", value)
     value = _URL_USERINFO_IN_TEXT.sub(r"\g<prefix>REDACTED@", value)
     return _redact_encoded_query_pairs(_redact_diagnostic_secret_pairs(value))
+
+
+def redact_diagnostic_text(value: str) -> str:
+    """Redact common bare secrets, authorization headers, and URL userinfo.
+
+    A credential's *field name* can be spelled with HTML character references
+    (``&#116;&#111;&#107;&#101;&#110;=SECRET``), which matches no field name
+    this module knows -- so the secret was printed verbatim into diagnostics,
+    and from there into a public job log. Percent-encoding of the same trick
+    was already decoded before matching; character references now are too.
+
+    Each decoded layer is inspected in turn and the first one that reveals a
+    credential wins, because decoding can expose a different secret at each
+    level. Text whose decoded view needs no redaction keeps the spelling the
+    caller wrote: a benign ``&amp;`` in a player name is not rewritten.
+    """
+    shown = _redact_literal_diagnostic_text(value)
+    decoded = value
+    for _ in range(_MAX_DIAGNOSTIC_DECODE_DEPTH):
+        step = html.unescape(decoded)
+        if step == decoded:
+            break
+        decoded = step
+        from_entities = _redact_literal_diagnostic_text(decoded)
+        if from_entities != decoded:
+            return from_entities
+    return shown
 
 
 def _redact_diagnostic_preview(value: str, limit: int) -> str:

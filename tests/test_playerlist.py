@@ -674,6 +674,62 @@ class DisplayPathTests(unittest.TestCase):
                 if secret:
                     self.assertNotIn(secret, shown)
 
+    def test_a_credential_name_spelled_as_character_references_is_still_matched(self):
+        """``&#116;&#111;&#107;&#101;&#110;`` is ``token``, and matched no field name.
+
+        Percent-encoding of the same trick was already decoded before matching.
+        A database value carrying this reached the console -- and so a public
+        job log -- with the secret intact.
+        """
+        secret = "ENTITY_NAME_SECRET"
+        for value in (
+            f"https://h.invalid/p?&#116;&#111;&#107;&#101;&#110;={secret}",
+            f"https://h.invalid/p?&#x74;&#x6f;&#x6b;&#x65;&#x6e;={secret}",
+            f"https://h.invalid/p?&amp;#116;&amp;#111;&amp;#107;&amp;#101;&amp;#110;={secret}",
+        ):
+            with self.subTest(value=value):
+                shown = redact_diagnostic_text(value)
+                self.assertNotIn(secret, shown)
+                self.assertIn("REDACTED", shown)
+
+    def test_character_references_in_ordinary_text_are_left_as_the_author_wrote_them(self):
+        """Only a reference that *hides a credential* may change the spelling."""
+        for value in ("a &amp; b", "Tom &lt;3", "see &#9731; snowman", "&amp;&amp;&amp;"):
+            with self.subTest(value=value):
+                self.assertEqual(redact_diagnostic_text(value), value)
+
+    def test_decoding_stops_at_the_depth_limit_without_rewriting_harmless_text(self):
+        """``&amp;amp;...`` peels one layer per pass and never reveals a secret.
+
+        The decode loop has to end somewhere; when it ends by exhausting the
+        limit rather than by settling, the text the author wrote is what gets
+        printed -- there is no credential here to justify a different spelling.
+        """
+        nested = "&" + "amp;" * (playerlist_module._MAX_DIAGNOSTIC_DECODE_DEPTH + 4) + "x"
+        self.assertEqual(redact_diagnostic_text(nested), nested)
+
+    def test_a_blank_in_userinfo_cannot_hide_a_password_from_a_diagnostic(self):
+        """A blank ends the single-token scan before its ``@``; the span must still go.
+
+        This is the diagnostic twin of ``sources._SPLIT_USERINFO_IN_TEXT``: an
+        unusable database value is previewed into the log, so the same shapes
+        have to be caught here.
+        """
+        secret = "DIAGNOSTIC_BLANK_USERINFO_SECRET"
+        for blank in (" ", "\t", "\n", "\r"):
+            for template in (
+                f"https://u x:{secret}@h.invalid/p",
+                f"https:u x:{secret}@h.invalid/p",
+                f"//u x:{secret}@h.invalid/p",
+                f"https://u x%3a{secret}%40h.invalid/p",
+                f"https://u x:{secret}%2540h.invalid/p",
+            ):
+                value = template.replace(" ", blank)
+                with self.subTest(value=value):
+                    shown = redact_diagnostic_text(value)
+                    self.assertNotIn(secret, shown)
+                    self.assertIn("REDACTED", shown)
+
     def test_a_path_that_is_not_a_string_still_works(self):
         self.assertEqual(display_path(Path("/tmp/x.json")), "/tmp/x.json")
 
