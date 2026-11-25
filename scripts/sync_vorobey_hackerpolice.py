@@ -275,14 +275,13 @@ def load_database(path: Path) -> tuple[PlayerList, str]:
 
 def _fsync_directory(directory: Path) -> None:
     """Best-effort fsync of a directory so a rename survives an OS crash."""
-    try:
+    # Directory fsync is best-effort; some platforms do not support it.
+    with contextlib.suppress(OSError):
         fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
-    except OSError:
-        pass  # Directory fsync is best-effort; some platforms do not support it.
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:

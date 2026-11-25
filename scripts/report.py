@@ -111,7 +111,7 @@ _ESCAPES = {
 }
 
 # Escape pipes because they terminate table cells.
-_CELL_ESCAPES = str.maketrans({**_ESCAPES, "|": "\\|"})
+_CELL_ESCAPES = str.maketrans(_ESCAPES | {"|": "\\|"})
 _TEXT_ESCAPES = str.maketrans(_ESCAPES)
 
 # Escape backslashes and pipes inside table code spans.
