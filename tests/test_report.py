@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 import string
 import tempfile
@@ -1511,6 +1512,28 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         self.assertGreaterEqual(len(removed_rows), 100)
         self.assertIn("more SteamIDs not shown here", report)
         self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+
+    def test_the_shrink_ladder_never_makes_a_bigger_table_print_fewer_names(self):
+        """A rung the report can actually reach, for every table size on the way down.
+
+        The ladder is a descending list of row caps, so a coarse rung silently
+        punishes the larger table: with a 200 -> 100 jump, 200 removals beside a
+        full change table overflow at 200 rows and land on 100, while a 150-row
+        table renders first time. The bigger limit then prints FIFTY FEWER names
+        than the smaller one -- the opposite of what a limit means. Each rung
+        must therefore be reachable from the one above it.
+        """
+        removed_rungs = [removed for _, removed in report_module._SHRINK_STEPS]
+        self.assertEqual(removed_rungs, sorted(removed_rungs, reverse=True), "rungs must descend")
+        descent = sorted({MAX_REMOVED_TABLE_ROWS, *removed_rungs}, reverse=True)
+        for above, below in itertools.pairwise(descent):
+            if below < report_module._REMOVED_TABLE_FLOOR:
+                break
+            self.assertLessEqual(
+                above - below,
+                50,
+                f"the drop from {above} to {below} rows is coarse enough to lose names",
+            )
 
     def test_a_quiet_report_names_every_removed_id_up_to_the_cap(self):
         """Nothing is hidden until the cap itself is reached."""

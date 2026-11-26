@@ -1003,9 +1003,16 @@ def _render_body(
 # Shrinking the change table first would be the wrong trade: it would answer "we
 # removed 300 IDs upstream" in full while hiding which of your own entries were
 # deleted for it.
+# The removed-list rungs descend in even steps rather than halving. Coarse rungs
+# make a SMALLER cap print MORE names: with a 200 -> 100 jump, a run of 200
+# removals and 150 changes overflows at 200 rows and lands on 100, while a cap of
+# 150 renders all 150 first time. Even steps keep a larger cap from ever losing
+# to a smaller one.
 _REMOVED_TABLE_FLOOR = 100
 _SHRINK_STEPS: tuple[tuple[int, int], ...] = (
+    (MAX_CHANGE_TABLE_ROWS, 250),
     (MAX_CHANGE_TABLE_ROWS, 200),
+    (MAX_CHANGE_TABLE_ROWS, 150),
     (MAX_CHANGE_TABLE_ROWS, _REMOVED_TABLE_FLOOR),
     (100, _REMOVED_TABLE_FLOOR),
     (50, _REMOVED_TABLE_FLOOR),
