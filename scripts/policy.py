@@ -72,7 +72,9 @@ __all__ = [
     "sync",
 ]
 
-# Bound evidence to the report's display cap, plus one character for truncation.
+# The report's display cap for a single evidence link. ``_evidence_links``
+# clips to one character beyond it, so a link sitting exactly at the cap stays
+# distinguishable from one that was cut short.
 MAX_EVIDENCE_LINK_CHARS = 500
 MAX_EVIDENCE_LINKS = 10
 

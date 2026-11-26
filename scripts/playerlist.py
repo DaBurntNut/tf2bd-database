@@ -54,7 +54,11 @@ _PROFILE_URL_RE = re.compile(
 
 # Bound untrusted values included in validation messages.
 MAX_SHOWN_VALUE_CHARS = 120
-# Bound integer formatting before building diagnostic previews.
+# Bound integer formatting before building diagnostic previews: converting a
+# very large int to decimal costs quadratic time, so one is described rather
+# than rendered. Four bits per character over-estimates the ~3.32 a decimal
+# digit really needs, which keeps the guard on the safe side -- no value that
+# could fit the preview is rejected by it.
 _MAX_SHOWN_INT_BITS = MAX_SHOWN_VALUE_CHARS * 4
 MAX_VALIDATION_MESSAGES = 100
 
@@ -133,10 +137,6 @@ _PERCENT_ESCAPE_IN_TEXT = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
 _PERCENT_ESCAPE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
 # Field names keep plain characters plus percent escapes and HTML references.
 _FIELD_NAME_CHARS = re.compile(r"[A-Za-z0-9_.%-]+", re.ASCII)
-# Characters a server ignores when matching a name are stripped by Unicode
-# category rather than by an enumerated list: the hand-written list used to
-# omit U+00AD SOFT HYPHEN, so ``to<shy>ken=`` walked straight past the
-# redactor while the same name was caught inside a URL.
 # A query-style pair anywhere in free text: find the name, then its value.
 _QUERY_PAIR_IN_TEXT = re.compile(r"[?&#;](?P<name>[^\s=&?#;]+)=(?P<value>[^\s&;#]*)", re.ASCII)
 _MAX_DIAGNOSTIC_DECODE_DEPTH = 8
@@ -151,7 +151,10 @@ def fold_name_for_matching(name: str) -> str:
     (``\uff54oken``, ``\u212aey``, ``\u017fecret``) collapse onto the ASCII letters they
     imitate, then every control, format and separator character is dropped -
     by Unicode category, so a newly assigned invisible character is covered
-    the day it exists rather than whenever the list is next updated.
+    the day it exists rather than whenever the list is next updated. An
+    enumerated list of such characters used to be maintained by hand and
+    omitted U+00AD SOFT HYPHEN, so ``to<shy>ken=`` walked straight past the
+    diagnostic redactor while the same name was caught inside a URL.
 
     Shared with ``sources`` so a name cannot be sensitive in a URL and
     harmless in a diagnostic.
