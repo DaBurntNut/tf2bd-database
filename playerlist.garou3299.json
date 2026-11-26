@@ -1472,6 +1472,20 @@
 		},
 		{
 			"attributes": [
+				"racist"
+			],
+			"last_seen": {
+				"player_name": "hue janus",
+				"time": 1795715937
+			},
+			"proof": [
+				"[auto] automatically marked: Racist | reason: \"stryker is a nigger lmao\"",
+				"[auto] automatically marked: Racist | reason: \"im gonna fuck you in the ass nigger\""
+			],
+			"steamid": "[U:1:447249059]"
+		},
+		{
+			"attributes": [
 				"cheater"
 			],
 			"last_seen": {
@@ -1776,6 +1790,19 @@
 				"Bot Account"
 			],
 			"steamid": "[U:1:662301978]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "\uaea0\ubd09\uc774",
+				"time": 1795710607
+			},
+			"proof": [
+				"Silent Aim & ESP"
+			],
+			"steamid": "[U:1:671539392]"
 		},
 		{
 			"attributes": [
@@ -2595,6 +2622,16 @@
 				"time": 1779902663
 			},
 			"steamid": "[U:1:753976513]"
+		},
+		{
+			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "MICHAEL MYERS",
+				"time": 1795716083
+			},
+			"steamid": "[U:1:760865344]"
 		},
 		{
 			"attributes": [
@@ -3426,11 +3463,13 @@
 			],
 			"last_seen": {
 				"player_name": "Blood Transfusion Specialist",
-				"time": 1793383414
+				"time": 1795719472
 			},
 			"proof": [
 				"[auto] automatically marked: Racist | reason: \"fuck you nigger\"",
-				"[auto] automatically marked: Racist | reason: \"shutup nigger\""
+				"[auto] automatically marked: Racist | reason: \"shutup nigger\"",
+				"[auto] automatically marked: Racist | reason: \"no one cares nigger\"",
+				"[auto] automatically marked: Racist | reason: \"no one cares nigga\""
 			],
 			"steamid": "[U:1:1031949409]"
 		},
@@ -4568,6 +4607,16 @@
 		},
 		{
 			"attributes": [
+				"cheater"
+			],
+			"last_seen": {
+				"player_name": "Pink Flower",
+				"time": 1795625189
+			},
+			"steamid": "[U:1:1280349693]"
+		},
+		{
+			"attributes": [
 				"racist"
 			],
 			"last_seen": {
@@ -4903,6 +4952,19 @@
 				"Silent Aim & ESP"
 			],
 			"steamid": "[U:1:1476642742]"
+		},
+		{
+			"attributes": [
+				"suspicious"
+			],
+			"last_seen": {
+				"player_name": "TB",
+				"time": 1795627234
+			},
+			"proof": [
+				"Silent Aim & ESP"
+			],
+			"steamid": "[U:1:1485168891]"
 		},
 		{
 			"attributes": [
