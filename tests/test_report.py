@@ -1486,6 +1486,41 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         report = render_report(self.info(removed_upstream=tuple(steamids)))
         self.assertIn("… and 1 more SteamID not shown here", report)
 
+    def test_an_over_budget_report_shortens_the_removed_list_before_the_change_table(self):
+        """A busy run must not hide this database's own changes to name more upstream IDs.
+
+        With a full change table AND more removed IDs than fit, something has to
+        give. The change table is the record of what happened HERE -- which
+        entries lost ``cheater``, which were deleted outright -- so it is kept
+        whole and the cheaper list of bare SteamIDs is shortened instead. The
+        earlier ladder shrank the change table first, which answered "400 IDs
+        disappeared upstream" in full while hiding the entries deleted for it.
+        """
+        changes = tuple(
+            Change(f"[U:1:{500000 + n}]", f"player{n}", ("cheater",), (), kind="demote")
+            for n in range(MAX_CHANGE_TABLE_ROWS)
+        )
+        removed = tuple(f"[U:1:{700000 + n}]" for n in range(MAX_REMOVED_TABLE_ROWS + 50))
+        report = render_report(self.info(changes=changes, removed_upstream=removed))
+
+        change_rows = [line for line in report.splitlines() if line.startswith("| `[U:1:5")]
+        removed_rows = [line for line in report.splitlines() if line.startswith("| `[U:1:7")]
+        self.assertEqual(len(change_rows), MAX_CHANGE_TABLE_ROWS, "the change table must survive intact")
+        # The removed list gave ground, but is still worth reading.
+        self.assertLess(len(removed_rows), MAX_REMOVED_TABLE_ROWS)
+        self.assertGreaterEqual(len(removed_rows), 100)
+        self.assertIn("more SteamIDs not shown here", report)
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+
+    def test_a_quiet_report_names_every_removed_id_up_to_the_cap(self):
+        """Nothing is hidden until the cap itself is reached."""
+        removed = tuple(f"[U:1:{700000 + n}]" for n in range(MAX_REMOVED_TABLE_ROWS))
+        report = render_report(self.info(removed_upstream=removed))
+        rows = [line for line in report.splitlines() if line.startswith("| `[U:1:7")]
+        self.assertEqual(len(rows), MAX_REMOVED_TABLE_ROWS)
+        self.assertNotIn("not shown here", report)
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+
     def test_an_unusable_steamid_never_crashes_the_table(self):
         report = render_report(self.info(removed_upstream=("nonsense",)))
         self.assertIn("| `nonsense` | - |", report)

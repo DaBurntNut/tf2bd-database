@@ -2086,10 +2086,20 @@ class DocumentedLimitsTests(unittest.TestCase):
 
     def test_the_documented_report_limits(self):
         # Published behavior: change tables stop at 150 rows, the removed-ID
-        # table at 100 rows, and the report body at 60,000 bytes.
+        # table at 350 rows, and the report body at 60,000 bytes.
         self.assertEqual(report_module.MAX_CHANGE_TABLE_ROWS, 150)
-        self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 100)
+        self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 350)
         self.assertEqual(report_module.MAX_REPORT_BYTES, 60_000)
+        # 350 is not a round number: it is the most rows that still render. A
+        # removed-ID row costs ~151 bytes, so 400 rows (61,201) would overflow
+        # the 60,000-byte budget and the shrink ladder would fall back to far
+        # FEWER names than the old cap of 100 showed. Raising this constant
+        # without re-measuring the row cost makes busy reports worse, not better.
+        self.assertLessEqual(
+            report_module.MAX_REMOVED_TABLE_ROWS * 151,
+            report_module.MAX_REPORT_BYTES,
+            "the removed-ID table must still fit the body budget on its own",
+        )
 
     def test_the_display_caps(self):
         self.assertEqual(report_module.MAX_NAME_CHARS, 80)

@@ -58,7 +58,7 @@ __all__ = [
 
 # Limit report size below GitHub's body cap; reduce row limits before hard truncation.
 MAX_CHANGE_TABLE_ROWS = 150
-MAX_REMOVED_TABLE_ROWS = 100
+MAX_REMOVED_TABLE_ROWS = 350
 # Bound closing-sentence SteamID lists to keep the summary readable.
 MAX_CLOSING_STEAMIDS = 150
 # Measure the shared report budget in UTF-8 bytes.
@@ -990,16 +990,30 @@ def _render_body(
     return "\n".join(lines)
 
 
-# Row caps tried in order when the body is over budget. Change-table rows shrink
-# first because they carry the review value; the removed-ID list is next, and the
-# last resort (``_fit_body``) only cuts text the tables could not give up.
+# Row caps tried in order when the body is over budget.
+#
+# The removed-ID list gives ground first, but only down to _REMOVED_TABLE_FLOOR.
+# A long list of bare SteamIDs is the cheapest thing to shorten -- every row
+# costs the same and says the same kind of thing -- whereas the change table is
+# the review record of what happened to THIS database, so it is kept whole for
+# as long as possible. Once the removed list is down to its floor, change rows
+# shrink, and only then does the removed list give up the rest; the last resort
+# (``_fit_body``) cuts text the tables could not give up.
+#
+# Shrinking the change table first would be the wrong trade: it would answer "we
+# removed 400 IDs upstream" in full while hiding which of your own entries were
+# deleted for it.
+_REMOVED_TABLE_FLOOR = 100
 _SHRINK_STEPS: tuple[tuple[int, int], ...] = (
-    (100, MAX_REMOVED_TABLE_ROWS),
-    (50, MAX_REMOVED_TABLE_ROWS),
-    (25, MAX_REMOVED_TABLE_ROWS),
-    (10, MAX_REMOVED_TABLE_ROWS),
-    (5, MAX_REMOVED_TABLE_ROWS),
-    (1, MAX_REMOVED_TABLE_ROWS),
+    (MAX_CHANGE_TABLE_ROWS, 300),
+    (MAX_CHANGE_TABLE_ROWS, 200),
+    (MAX_CHANGE_TABLE_ROWS, _REMOVED_TABLE_FLOOR),
+    (100, _REMOVED_TABLE_FLOOR),
+    (50, _REMOVED_TABLE_FLOOR),
+    (25, _REMOVED_TABLE_FLOOR),
+    (10, _REMOVED_TABLE_FLOOR),
+    (5, _REMOVED_TABLE_FLOOR),
+    (1, _REMOVED_TABLE_FLOOR),
     (1, 50),
     (1, 10),
     (1, 1),
