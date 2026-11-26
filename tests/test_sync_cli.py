@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -32,6 +33,7 @@ from _support import (
 )
 
 import playerlist as playerlist_module
+import policy as policy_module
 import report as report_module
 import sources
 import sync_vorobey_hackerpolice as sync_module
@@ -1791,6 +1793,30 @@ class CliTests(unittest.TestCase):
         # The failed run must leave the snapshot baseline unchanged.
         self.assertEqual(snapshot.read_bytes(), before)
 
+    def test_a_url_listed_first_does_not_excuse_a_later_source_from_the_check(self):
+        """Every source is checked, not just sources up to the first URL.
+
+        ``--source`` repeats to declare fallbacks, and the loop skips URLs
+        because only a local path can alias a local file. Skipping the ONE url
+        and skipping the REST OF THE LIST differ by a single word, and the
+        difference is silent: the fallback would quietly become the baseline
+        it is supposed to be compared against. Ordering the arguments this way
+        is what makes the loop prove it keeps going.
+        """
+        snapshot = self.write_snapshot_fixture(hackerpolice_entry("[U:1:300]"))
+        before = snapshot.read_bytes()
+        code, _, stderr = self.run_cli(
+            "--source",
+            "https://example.invalid/list.json",
+            "--source",
+            str(snapshot),
+            "--snapshot",
+            str(snapshot),
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--source must not be the same file as --snapshot", stderr)
+        self.assertEqual(snapshot.read_bytes(), before)
+
     def test_a_broken_snapshot_is_not_reported_as_a_broken_upstream_list(self):
         """The index builder serves two documents: the list AND the snapshot.
 
@@ -1840,6 +1866,31 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             [p.name for p in self.root.iterdir() if ".tmp" in p.name], []
         )  # Refuse before creating any output files.
+
+    def test_a_report_without_a_trailing_newline_gets_exactly_one(self):
+        """The line that adds the newline had never run in any test.
+
+        Today's renderer always ends with one, so the guard only earns its
+        keep if the renderer ever stops doing that -- which is exactly when
+        nobody would be looking. A report file with no final newline makes
+        `git diff` print "\\ No newline at end of file" on every bot commit.
+
+        The branch stayed invisible because it is written as a conditional
+        expression, and coverage does not count those as branches: the suite
+        reported 100% with this half never executed.
+        """
+        report_path = self.root / "report.md"
+        with mock.patch.object(sync_module, "render_report", return_value="no newline here"):
+            code, _, _ = self.run_cli("--source", str(self.source), "--report", str(report_path))
+        self.assertEqual(code, 0)
+        self.assertEqual(report_path.read_text(encoding="utf-8"), "no newline here\n")
+
+    def test_a_report_that_already_ends_in_a_newline_does_not_gain_another(self):
+        report_path = self.root / "report.md"
+        with mock.patch.object(sync_module, "render_report", return_value="ends already\n"):
+            code, _, _ = self.run_cli("--source", str(self.source), "--report", str(report_path))
+        self.assertEqual(code, 0)
+        self.assertEqual(report_path.read_text(encoding="utf-8"), "ends already\n")
 
     def test_missing_database_is_an_error(self):
         self.database.unlink()
@@ -2134,6 +2185,55 @@ class DocumentedLimitsTests(unittest.TestCase):
         # Steam account IDs are 32-bit; instance identifiers use 20 bits.
         self.assertEqual(playerlist_module.MAX_ACCOUNT_ID, 2**32)
         self.assertEqual(playerlist_module.MAX_STEAMID_INSTANCE, 2**20)
+
+    def test_the_remaining_limits_that_no_other_test_pins(self):
+        """The last caps a full mutation run could still move unnoticed.
+
+        Each of these survived being replaced by a neighboring value while all
+        658 tests stayed green, for the reason this class exists: the tests
+        around them derive their sizes FROM the constant, so they prove the
+        comparison is exact and cannot see the number itself drift.
+        """
+        # How much of a malformed file is explained before the list is cut off,
+        # and how deep a diagnostic will decode to describe a nested value.
+        self.assertEqual(playerlist_module.MAX_VALIDATION_MESSAGES, 100)
+        self.assertEqual(playerlist_module._MAX_DIAGNOSTIC_DECODE_DEPTH, 8)
+        # A SteamID64 has 17 digits; 10 bounds the account part and keeps a
+        # hostile 4,300-digit number away from Python's int-parsing limit.
+        self.assertEqual(playerlist_module.MAX_ACCOUNT_ID_DIGITS, 10)
+        self.assertEqual(playerlist_module.MAX_JSON_INT_DIGITS, 4_300)
+        # Evidence shown per change, and the label naming the database.
+        self.assertEqual(policy_module.MAX_EVIDENCE_LINK_CHARS, 500)
+        self.assertEqual(report_module.MAX_DATABASE_LABEL_CHARS, 80)
+        self.assertEqual(report_module._MAX_EVIDENCE_STATUS_CACHE, 20_000)
+        # The floor the removed-ID table may shrink to, and the HTTP status the
+        # fetcher treats as "slow down" rather than "give up".
+        self.assertEqual(report_module._REMOVED_TABLE_FLOOR, 100)
+        self.assertEqual(sources.TOO_MANY_REQUESTS, 429)
+        # How many layers of encoding a nested URL is unwrapped through before
+        # the redactor fails closed. Raising it costs time on hostile input.
+        self.assertEqual(sources._MAX_NESTED_URL_DEPTH, 8)
+
+    def test_the_records_passed_between_stages_cannot_be_edited_in_place(self):
+        """Each stage hands the next a fact, not a mutable buffer.
+
+        A change record is built by the policy, read by the report and named in
+        the pull request; a source record is built once and reused per attempt.
+        Freezing them is what stops a later stage from quietly rewriting what an
+        earlier one decided, so the suite should notice if it is ever unfrozen.
+        """
+        change = policy_module.Change("[U:1:1]", "n", ("suspicious",), ("cheater",))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            change.steamid = "[U:1:2]"  # type: ignore[misc]
+        info = report_module.RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://example.invalid/list.json",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            info.dry_run = True  # type: ignore[misc]
 
 
 class InterruptTests(unittest.TestCase):

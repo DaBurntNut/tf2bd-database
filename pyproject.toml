@@ -50,6 +50,17 @@ source = ["scripts"]
 # Keep coverage honest without demanding the impossible last few percent. The
 # suite currently sits at 100%; the floor exists so it cannot silently rot, not
 # so a contributor has to invent a test for an unreachable branch to pass CI.
+#
+# Read that 100% as "every line ran at least once", NOT as "every behavior is
+# checked". Two gaps it cannot see:
+#   * a conditional expression (``a if cond else b``) is one line with no
+#     branch arcs, so coverage reports it fully covered with one side never
+#     executed. There are 65 of them in scripts/. One -- the line that adds a
+#     missing trailing newline to the report -- had never run in any test
+#     while this file reported 100%.
+#   * running a line is not the same as asserting on what it did. A test can
+#     execute a limit check and never notice the limit itself changing.
+# Mutation testing is what finds both; coverage is a floor, not a verdict.
 fail_under = 95
 show_missing = true
 skip_covered = true

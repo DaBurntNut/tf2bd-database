@@ -171,6 +171,30 @@ class MassDemotionGuardTests(unittest.TestCase):
     def test_the_impact_tolerates_a_malformed_database(self):
         self.assertEqual(sync_module._demotion_impact({"players": "nope"}, {"[U:1:1]"}, index_of()), (0, 0))
 
+    def test_a_malformed_entry_midway_does_not_cut_the_count_short(self):
+        """One bad entry must be stepped over, not treated as the end of the list.
+
+        This count is what the mass-demotion guard divides by: understating it
+        understates the blast radius, so a purge that should be vetoed is
+        waved through. Entries the bot skips -- a non-dict row, a missing
+        SteamID, malformed attributes -- have to be skipped INDIVIDUALLY. The
+        existing coverage put the junk last, where abandoning the loop and
+        stepping over it produce the same answer.
+        """
+        good = [player(f"[U:1:{n}]", ["cheater"]) for n in range(1, 7)]
+        junk = ["not an entry", {"attributes": ["cheater"]}, {"steamid": "[U:1:8]", "attributes": "cheater"}]
+        # Junk in the middle: everything after it still has to be counted.
+        database = {"players": [*good[:3], *junk, *good[3:]]}
+        previous = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in range(1, 7)])
+        removed = {f"[U:1:{n}]" for n in range(1, 7)}
+        self.assertEqual(sync_module._demotion_impact(database, removed, previous), (6, 6))
+
+    def test_an_entry_upstream_never_listed_midway_does_not_cut_the_count_short(self):
+        """The same for the skip that exonerates a hand-added cheater."""
+        database = {"players": [player(f"[U:1:{n}]", ["cheater"]) for n in (1, 2, 99, 3, 4)]}
+        previous = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in (1, 2, 3, 4)])
+        self.assertEqual(sync_module._demotion_impact(database, {"[U:1:1]", "[U:1:4]"}, previous), (2, 4))
+
     def test_exactly_fifty_removals_are_not_a_mass_removal(self):
         # Exactly 50 stays below the guard; the count must exceed 50.
         removed, update_snapshot, note, _ = self.plan(50, 100)
