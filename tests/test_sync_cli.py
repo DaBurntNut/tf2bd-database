@@ -1741,6 +1741,31 @@ class CliTests(unittest.TestCase):
         self.assertIn("duplicate steamid", stderr)
         self.assertEqual(self.database.read_text(encoding="utf-8"), before)
 
+    def test_a_broken_database_is_blamed_on_the_file_it_came_from(self):
+        """Two separate checks refuse a database that has problems: one on the
+        way in, one on the way out. Only the first names the file the problems
+        are in and says how many there are. Delete it and the run still stops
+        with exit code 2, but the message becomes "the synced playerlist is
+        invalid" -- which reads as though the bot corrupted the list rather
+        than found it already broken. Nothing pinned which message appears,
+        and nothing pinned the singular/plural count either.
+        """
+        for bad_ids, expected in (
+            (["NOT-A-STEAMID"], "has 1 problem, nothing was written"),
+            (["NOT-A-STEAMID", "ALSO-BAD"], "has 2 problems, nothing was written"),
+        ):
+            with self.subTest(problems=len(bad_ids)):
+                players = [player(bad, ["cheater"]) for bad in bad_ids]
+                players.append(player("[U:1:100]", ["suspicious"]))
+                self.database.write_text(dumps({"$schema": "x", "file_info": {}, "players": players}), encoding="utf-8")
+                before = self.database.read_text(encoding="utf-8")
+                code, _, stderr = self.run_cli("--source", str(self.source))
+                self.assertEqual(code, 2)
+                self.assertIn(expected, stderr)
+                # The outbound check must not be the one that speaks here.
+                self.assertNotIn("the synced playerlist is invalid", stderr)
+                self.assertEqual(self.database.read_text(encoding="utf-8"), before)
+
     def test_unknown_attribute_warns_but_does_not_block(self):
         self.database.write_text(
             dumps({"players": [player("[U:1:100]", ["suspicious", "futuretag"])]}), encoding="utf-8"

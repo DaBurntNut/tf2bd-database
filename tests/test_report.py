@@ -1376,6 +1376,20 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
             report,
         )
 
+    def test_a_snapshot_only_run_states_the_no_change_verdict_once(self):
+        """The no-change branch stops as soon as the removed-ID table is added.
+        Delete that stop and the report falls through to the closing summary,
+        so it announces that the database is unchanged twice: once above the
+        table and once below it. The table still renders either way, so rule 6
+        stays satisfied and nothing noticed the repetition.
+        """
+        report = render_report(self.info(removed_upstream=("[U:1:20]", "[U:1:3]"), snapshot_changed=True))
+        self.assertIn("**No database changes** (snapshot refresh only).", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
+        self.assertNotIn("nothing has changed", report)
+        # The table is the last thing in the report; no summary trails it.
+        self.assertTrue(report.rstrip().endswith("|"), report[-200:])
+
     def test_no_names_are_used_because_vorobey_stores_none(self):
         report = render_report(self.info(removed_upstream=("[U:1:2]",)))
         self.assertNotIn("Last known name", report)
