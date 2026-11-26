@@ -58,7 +58,7 @@ __all__ = [
 
 # Limit report size below GitHub's body cap; reduce row limits before hard truncation.
 MAX_CHANGE_TABLE_ROWS = 150
-MAX_REMOVED_TABLE_ROWS = 350
+MAX_REMOVED_TABLE_ROWS = 300
 # Bound closing-sentence SteamID lists to keep the summary readable.
 MAX_CLOSING_STEAMIDS = 150
 # Measure the shared report budget in UTF-8 bytes.
@@ -1001,11 +1001,10 @@ def _render_body(
 # (``_fit_body``) cuts text the tables could not give up.
 #
 # Shrinking the change table first would be the wrong trade: it would answer "we
-# removed 400 IDs upstream" in full while hiding which of your own entries were
+# removed 300 IDs upstream" in full while hiding which of your own entries were
 # deleted for it.
 _REMOVED_TABLE_FLOOR = 100
 _SHRINK_STEPS: tuple[tuple[int, int], ...] = (
-    (MAX_CHANGE_TABLE_ROWS, 300),
     (MAX_CHANGE_TABLE_ROWS, 200),
     (MAX_CHANGE_TABLE_ROWS, _REMOVED_TABLE_FLOOR),
     (100, _REMOVED_TABLE_FLOOR),

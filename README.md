@@ -77,7 +77,7 @@ in this database's own `proof` fields are never copied into the report; a
 demotion note quotes one only when that `[auto] automatically marked: Racist`
 line is the record that justifies a surviving `racist` tag.
 
-The removed-ID table lists up to 350 SteamIDs with profile and
+The removed-ID table lists up to 300 SteamIDs with profile and
 [SteamHistory](https://steamhistory.net/) links, then reports how many more were
 omitted. `snapshot/playerlist.vorobey-hackerpolice.json` is the previous
 byte-for-byte copy of Vorobey's list — the bot compares against it to know who
@@ -106,7 +106,7 @@ stays verifiable. A link whose credentials had to be redacted is shown as plain
 code instead, never as a clickable target.
 
 The report is kept below GitHub's body limit: each change table stops at 150 rows
-and the removed-ID table at 350, with an `… and N more` overflow note. If needed,
+and the removed-ID table at 300, with an `… and N more` overflow note. If needed,
 the report reduces those caps further -- shortening the removed-ID list before the
 change tables, so a busy run never hides what happened to this database in order to
 name more upstream removals -- and a last-resort 60 KB byte cap (well
