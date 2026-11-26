@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 import string
 import tempfile
@@ -12,6 +13,7 @@ from unittest import mock
 
 from _support import (
     HACKERPOLICE_PROOF,
+    frozen_clock,
     player,
 )
 
@@ -142,7 +144,7 @@ class ReportTests(unittest.TestCase):
 
         Two different names would then render identically in the review table,
         and Unicode tag characters are a known way to hide text outright. Only
-        the bidi set was neutralised, so these sailed into the pull request body.
+        the bidi set was neutralized, so these sailed into the pull request body.
         """
         for character in (
             "\u200b",  # Zero-width space.
@@ -175,7 +177,7 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("\x07", report)
         self.assertNotIn("\x08", report)
 
-    def test_c1_controls_in_names_are_neutralised(self):
+    def test_c1_controls_in_names_are_neutralized(self):
         """U+009B is the 8-bit CSI control, not a printable name character."""
         change = Change("[U:1:100]", "Good\u009b31mBAD", ("suspicious",), ("cheater",))
         report = render_report(self.info([change]))
@@ -373,14 +375,14 @@ class ReportTests(unittest.TestCase):
             "Proof link comes from the Vorobey hackerpolice list and is shown for review only.",
         )
 
-    def test_normalised_file_is_reported_instead_of_no_changes(self):
+    def test_normalized_file_is_reported_instead_of_no_changes(self):
         """The sync always writes entries in canonical form.
 
         A hand-appended entry is re-sorted without any tag changing: the file
         in the pull request differs, so the body must not claim "No changes".
         """
         report = render_report(self.info(database_changed=True))
-        self.assertIn("**No player changes** (the database file was normalised:", report)
+        self.assertIn("**No player changes** (the database file was normalized:", report)
         self.assertNotIn("**No changes.**", report)
         self.assertNotIn("**No database changes**", report)
 
@@ -389,9 +391,9 @@ class ReportTests(unittest.TestCase):
 
         # Dry-run wording must be conditional.
         dry = render_report(self.info(database_changed=True, snapshot_changed=True, dry_run=True))
-        self.assertIn("would be normalised", dry)
+        self.assertIn("would be normalized", dry)
         self.assertIn("the snapshot would be refreshed too", dry)
-        self.assertNotIn("was normalised", dry)
+        self.assertNotIn("was normalized", dry)
 
         # Snapshot-only runs retain their existing wording.
         snapshot_only = render_report(self.info(snapshot_changed=True))
@@ -402,36 +404,118 @@ class ReportTests(unittest.TestCase):
             self.info(
                 source_total=109,
                 previous_source_total=100,
+                source_ids=109,
+                previous_source_ids=100,
                 added_to_source=12,
                 removed_from_source=3,
                 snapshot_changed=True,
             )
         )
         self.assertIn(
-            "- Snapshot diff: **12 new SteamIDs added**, **3 SteamIDs removed** (100 → 109 entries; net +9 distinct SteamIDs)",
+            "- Snapshot diff: **12 new SteamIDs added**, **3 SteamIDs removed** (100 → 109 SteamIDs; net +9 distinct SteamIDs)",
             report,
         )
 
     def test_snapshot_diff_singular_and_negative_net(self):
         report = render_report(
-            self.info(source_total=99, previous_source_total=100, added_to_source=1, removed_from_source=2)
+            self.info(
+                source_total=99,
+                previous_source_total=100,
+                source_ids=99,
+                previous_source_ids=100,
+                added_to_source=1,
+                removed_from_source=2,
+            )
         )
         self.assertIn(
-            "**1 new SteamID added**, **2 SteamIDs removed** (100 → 99 entries; net -1 distinct SteamIDs)", report
+            "**1 new SteamID added**, **2 SteamIDs removed** (100 → 99 SteamIDs; net -1 distinct SteamID)", report
         )
 
     def test_the_net_change_agrees_with_the_distinct_ids_beside_it(self):
-        """Raw row totals are provenance; the net must follow the ID counts.
+        """The diff arrow counts distinct SteamIDs, so its subtraction holds.
 
-        Deriving the net from raw totals printed "1 added, 1 removed ... net -1"
-        when a duplicate row disappeared upstream: the counts and the total on
-        the same line contradicted each other.
+        Raw row totals stay in the provenance lines. Printing them inside the
+        diff made the line contradict itself whenever a row was a duplicate or
+        unusable: "1 added, 1 removed" beside "3 -> 2 entries" reads as net -1.
         """
         report = render_report(
-            self.info(source_total=2, previous_source_total=3, added_to_source=1, removed_from_source=1)
+            self.info(
+                source_total=2,
+                previous_source_total=3,
+                source_ids=2,
+                previous_source_ids=2,
+                added_to_source=1,
+                removed_from_source=1,
+            )
         )
         self.assertIn("**1 new SteamID added**, **1 SteamID removed**", report)
-        self.assertIn("(3 → 2 entries; no net change)", report)
+        self.assertIn("(2 → 2 SteamIDs; no net change)", report)
+        # The raw row total is still reported, just not inside the subtraction.
+        self.assertIn("- Previous snapshot: 3 entries", report)
+
+    def test_a_net_of_one_reads_as_a_singular_steamid(self):
+        """The net agrees with the singular/plural of the counts beside it."""
+        report = render_report(
+            self.info(
+                source_total=101,
+                previous_source_total=100,
+                source_ids=101,
+                previous_source_ids=100,
+                added_to_source=1,
+                removed_from_source=0,
+            )
+        )
+        self.assertIn("(100 → 101 SteamIDs; net +1 distinct SteamID)", report)
+        self.assertNotIn("net +1 distinct SteamIDs", report)
+
+    def test_every_count_in_the_header_agrees_with_its_own_noun(self):
+        """Randomized invariant testing found four counts bolted to a fixed noun.
+
+        Each one is a number the upstream file decides, so each one can be 1 on
+        a real day: a list that still holds a single row, a baseline captured
+        when it did, a list that collapsed to one usable SteamID, and a row
+        whose evidence overflowed by exactly one. All four published "1 ...s"
+        in the pull request body. They are checked together because they are
+        one defect in four places, and a test per site would have let the next
+        site be added without one.
+        """
+        singular = render_report(
+            self.info(
+                source_total=1,
+                previous_source_total=1,
+                previous_source_ids=33,
+                source_ids=1,
+                added_to_source=0,
+                removed_from_source=32,
+            )
+        )
+        self.assertIn("- Vorobey hackerpolice list (1 entry)", singular)
+        self.assertIn("- Previous snapshot: 1 entry;", singular)
+        self.assertIn("(33 → 1 SteamID; net -32 distinct SteamIDs)", singular)
+
+        plural_report = render_report(
+            self.info(
+                source_total=2,
+                previous_source_total=2,
+                previous_source_ids=33,
+                source_ids=2,
+                added_to_source=0,
+                removed_from_source=31,
+            )
+        )
+        self.assertIn("- Vorobey hackerpolice list (2 entries)", plural_report)
+        self.assertIn("- Previous snapshot: 2 entries;", plural_report)
+        self.assertIn("(33 → 2 SteamIDs; net -31 distinct SteamIDs)", plural_report)
+
+        # Zero takes the plural, as English does ("0 entries").
+        self.assertIn("- Vorobey hackerpolice list (0 entries)", render_report(self.info(source_total=0)))
+
+    def test_a_single_omitted_evidence_link_reads_as_one_entry(self):
+        links = tuple(f"https://discord.com/channels/1/2/{n}" for n in range(MAX_EVIDENCE_LINKS))
+        for omitted, expected in ((1, "and 1 more evidence entry"), (2, "and 2 more evidence entries")):
+            with self.subTest(omitted=omitted):
+                change = Change("[U:1:5]", "n", ("suspicious",), ("cheater",), links, evidence_omitted=omitted)
+                self.assertIn(expected, render_report(self.info([change])))
 
     def test_snapshot_diff_initial_snapshot_without_previous(self):
         report = render_report(self.info(added_to_source=10, snapshot_changed=True))
@@ -442,6 +526,8 @@ class ReportTests(unittest.TestCase):
             self.info(
                 source_total=13542,
                 previous_source_total=12345,
+                source_ids=13542,
+                previous_source_ids=12345,
                 added_to_source=1200,
                 removed_from_source=3,
                 removed_upstream=("[U:1:1]",),
@@ -451,7 +537,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Vorobey hackerpolice list (13,542 entries)", report)  # Raw row totals remain exact.
         self.assertIn("- Previous snapshot: 12,345 entries", report)
         self.assertIn("**1,200 new SteamIDs added**", report)
-        self.assertIn("(12,345 → 13,542 entries; net +1,197 distinct SteamIDs)", report)  # 1,200 added - 3 removed
+        self.assertIn("(12,345 → 13,542 SteamIDs; net +1,197 distinct SteamIDs)", report)  # 1,200 added - 3 removed
         self.assertIn("**1 SteamID removed from the Vorobey hackerpolice list", report)
 
     def test_fetch_url_cannot_smuggle_html_into_the_report(self):
@@ -595,19 +681,19 @@ class ReportTests(unittest.TestCase):
 
         A player name is attacker-controlled, so one containing a line
         terminator must not be able to end a table row early and start a new
-        one. Everything that ends a line is neutralised, not just \n and \r.
+        one. Everything that ends a line is neutralized, not just \n and \r.
         """
         name = "evil\u2028name\u2029other\x85nel\nlf\rcr\x0bvt\x0cff"
         change = Change("[U:1:1]", name, ("suspicious",), ("cheater",))
         report = render_report(self.info([change]))
         for terminator in ("\u2028", "\u2029", "\x85", "\x0b", "\x0c"):
             self.assertNotIn(terminator, report)
-        # No unneutralised line terminator may add a split line.
+        # No unneutralized line terminator may add a split line.
         self.assertEqual(len(report.rstrip("\n").split("\n")), len(report.splitlines()))
         row = next(line for line in report.split("\n") if line.startswith("| `[U:1:1]`"))
         self.assertIn("evil name other nel lf cr vt ff", row)
 
-    def test_a_backslash_cannot_neutralise_the_escape_that_follows_it(self):
+    def test_a_backslash_cannot_neutralize_the_escape_that_follows_it(self):
         """``_text`` must escape the backslash before anything else.
 
         "a\\`b" used to become "a\\\\`b": the doubled backslash is a literal
@@ -967,7 +1053,7 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(report_module._cell("a_b_c"), "a\\_b\\_c")
 
     def test_a_name_cannot_smuggle_an_html_entity_past_the_guards(self):
-        """The entity SPELLING defeated every character-level defence.
+        """The entity SPELLING defeated every character-level defense.
 
         ``&#x202E;`` is not a bidi character, so the bidi scrub let it through,
         and the renderer turned it into U+202E -- a right-to-left override in
@@ -1141,7 +1227,7 @@ class ReportTests(unittest.TestCase):
 
         The path is operator input and used to be the last way to overflow the
         body from inside the header. It is clipped now, so the header -- and
-        every line of it -- stays readable; ``_fit_body`` remains as defence in
+        every line of it -- stays readable; ``_fit_body`` remains as defense in
         depth and is tested directly (ReportBoundaryTests).
         """
         absurd = Path("/tmp/" + "d" * 100_000 + ".json")
@@ -1232,10 +1318,11 @@ class ReportTests(unittest.TestCase):
         """The reduced caps only kick in when the body really is too big."""
         changes = [Change(f"[U:1:{1000 + n}]", f"n{n}", ("suspicious",), ("cheater",)) for n in range(5)]
         info = self.info(changes, removed_upstream=("[U:1:9]",))
-        self.assertEqual(
-            render_report(info),
-            report_module._render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS),
-        )
+        with frozen_clock():
+            self.assertEqual(
+                render_report(info),
+                report_module._render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS),
+            )
         self.assertNotIn("more entries not shown here", render_report(info))
 
     def test_dry_run_note(self):
@@ -1288,6 +1375,20 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
             "| [SteamHistory](https://steamhistory.net/id/76561198229593388) |",
             report,
         )
+
+    def test_a_snapshot_only_run_states_the_no_change_verdict_once(self):
+        """The no-change branch stops as soon as the removed-ID table is added.
+        Delete that stop and the report falls through to the closing summary,
+        so it announces that the database is unchanged twice: once above the
+        table and once below it. The table still renders either way, so rule 6
+        stays satisfied and nothing noticed the repetition.
+        """
+        report = render_report(self.info(removed_upstream=("[U:1:20]", "[U:1:3]"), snapshot_changed=True))
+        self.assertIn("**No database changes** (snapshot refresh only).", report)
+        self.assertIn("| SteamID | Profile Link | SteamHistory |", report)
+        self.assertNotIn("nothing has changed", report)
+        # The table is the last thing in the report; no summary trails it.
+        self.assertTrue(report.rstrip().endswith("|"), report[-200:])
 
     def test_no_names_are_used_because_vorobey_stores_none(self):
         report = render_report(self.info(removed_upstream=("[U:1:2]",)))
@@ -1399,6 +1500,63 @@ class RemovedFromVorobeyTableTests(unittest.TestCase):
         steamids = [f"[U:1:{1000 + n}]" for n in range(MAX_REMOVED_TABLE_ROWS + 1)]
         report = render_report(self.info(removed_upstream=tuple(steamids)))
         self.assertIn("… and 1 more SteamID not shown here", report)
+
+    def test_an_over_budget_report_shortens_the_removed_list_before_the_change_table(self):
+        """A busy run must not hide this database's own changes to name more upstream IDs.
+
+        With a full change table AND more removed IDs than fit, something has to
+        give. The change table is the record of what happened HERE -- which
+        entries lost ``cheater``, which were deleted outright -- so it is kept
+        whole and the cheaper list of bare SteamIDs is shortened instead. The
+        earlier ladder shrank the change table first, which answered "400 IDs
+        disappeared upstream" in full while hiding the entries deleted for it.
+        """
+        changes = tuple(
+            Change(f"[U:1:{500000 + n}]", f"player{n}", ("cheater",), (), kind="demote")
+            for n in range(MAX_CHANGE_TABLE_ROWS)
+        )
+        removed = tuple(f"[U:1:{700000 + n}]" for n in range(MAX_REMOVED_TABLE_ROWS + 50))
+        report = render_report(self.info(changes=changes, removed_upstream=removed))
+
+        change_rows = [line for line in report.splitlines() if line.startswith("| `[U:1:5")]
+        removed_rows = [line for line in report.splitlines() if line.startswith("| `[U:1:7")]
+        self.assertEqual(len(change_rows), MAX_CHANGE_TABLE_ROWS, "the change table must survive intact")
+        # The removed list gave ground, but is still worth reading.
+        self.assertLess(len(removed_rows), MAX_REMOVED_TABLE_ROWS)
+        self.assertGreaterEqual(len(removed_rows), 100)
+        self.assertIn("more SteamIDs not shown here", report)
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
+
+    def test_the_shrink_ladder_never_makes_a_bigger_table_print_fewer_names(self):
+        """A rung the report can actually reach, for every table size on the way down.
+
+        The ladder is a descending list of row caps, so a coarse rung silently
+        punishes the larger table: with a 200 -> 100 jump, 200 removals beside a
+        full change table overflow at 200 rows and land on 100, while a 150-row
+        table renders first time. The bigger limit then prints FIFTY FEWER names
+        than the smaller one -- the opposite of what a limit means. Each rung
+        must therefore be reachable from the one above it.
+        """
+        removed_rungs = [removed for _, removed in report_module._SHRINK_STEPS]
+        self.assertEqual(removed_rungs, sorted(removed_rungs, reverse=True), "rungs must descend")
+        descent = sorted({MAX_REMOVED_TABLE_ROWS, *removed_rungs}, reverse=True)
+        for above, below in itertools.pairwise(descent):
+            if below < report_module._REMOVED_TABLE_FLOOR:
+                break
+            self.assertLessEqual(
+                above - below,
+                50,
+                f"the drop from {above} to {below} rows is coarse enough to lose names",
+            )
+
+    def test_a_quiet_report_names_every_removed_id_up_to_the_cap(self):
+        """Nothing is hidden until the cap itself is reached."""
+        removed = tuple(f"[U:1:{700000 + n}]" for n in range(MAX_REMOVED_TABLE_ROWS))
+        report = render_report(self.info(removed_upstream=removed))
+        rows = [line for line in report.splitlines() if line.startswith("| `[U:1:7")]
+        self.assertEqual(len(rows), MAX_REMOVED_TABLE_ROWS)
+        self.assertNotIn("not shown here", report)
+        self.assertLessEqual(len(report.encode("utf-8")), MAX_REPORT_BYTES)
 
     def test_an_unusable_steamid_never_crashes_the_table(self):
         report = render_report(self.info(removed_upstream=("nonsense",)))
@@ -1622,7 +1780,7 @@ class ReportBoundaryTests(unittest.TestCase):
     def test_multi_byte_names_cannot_overflow_the_byte_budget(self):
         """GitHub's limit is bytes: 30,000 Cyrillic characters are 60,000 bytes.
 
-        Measuring characters (the old behaviour) would have shipped a body
+        Measuring characters (the old behavior) would have shipped a body
         twice the allowed size for any database full of non-Latin names.
         """
         text = "\u044b" * (MAX_REPORT_BYTES + 1)
@@ -1813,9 +1971,110 @@ class CapBoundaryTests(unittest.TestCase):
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=1m30s", "https://youtu.be/DXQ5gEDIhzE?t=1m30s"),
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=1h2m3s", "https://youtu.be/DXQ5gEDIhzE?t=1h2m3s"),
             ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=90", "https://youtu.be/DXQ5gEDIhzE?t=90"),
-            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=90", "https://youtu.be/DXQ5gEDIhzE?start=90"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=90", "https://youtu.be/DXQ5gEDIhzE?t=90"),
             ("https://www.youtube.com/shorts/DXQ5gEDIhzE?t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
             ("https://www.youtube.com/embed/DXQ5gEDIhzE?t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._youtube_short_url(link), expected)
+
+    def test_a_timestamp_without_a_seconds_part_is_still_a_timestamp(self):
+        """YouTube reads t=5m as 5:00 and t=1h30m as 1:30:00.
+
+        These used to be dropped because the pattern demanded a trailing
+        seconds count, so a proof citing a moment in a long video silently
+        lost the moment and opened at 0:00 -- the one thing the rewrite
+        promises not to do.
+        """
+        for value, expected in (
+            ("2h", "https://youtu.be/DXQ5gEDIhzE?t=2h"),
+            ("5m", "https://youtu.be/DXQ5gEDIhzE?t=5m"),
+            ("1h30m", "https://youtu.be/DXQ5gEDIhzE?t=1h30m"),
+            ("1h2m", "https://youtu.be/DXQ5gEDIhzE?t=1h2m"),
+            ("1h30", "https://youtu.be/DXQ5gEDIhzE?t=1h30"),
+        ):
+            with self.subTest(value=value):
+                link = f"https://www.youtube.com/watch?v=DXQ5gEDIhzE&t={value}"
+                self.assertEqual(report_module._youtube_short_url(link), expected)
+
+    def test_a_value_that_is_not_a_time_is_never_pasted_into_the_link(self):
+        """Widening the accepted forms must not let arbitrary text through.
+
+        Each of these is rejected for its own reason: no digit at all, a unit
+        with no count, units out of order or repeated, the colon form YouTube
+        does not read, a sign or a decimal point, and an uppercase unit.
+        """
+        for value in (
+            "",
+            "h",
+            "m",
+            "s",
+            "hms",
+            "1:30",
+            "1m2h",
+            "1h1h1s",
+            "1s30m",
+            "-5",
+            "+5",
+            "1.5",
+            "1H30M",
+            "5S",
+            # A single unit in the wrong case: the pattern is case-sensitive
+            # because YouTube's is, and "1H" is not a time YouTube reads.
+            "1H",
+            "2M",
+            "3S",
+            "1 30",
+            "1h 30m",
+            "42s evil",
+            "1e3",
+            # Digits outside ASCII. re.ASCII keeps \d from matching these, so
+            # they can never reach the rewritten link as a percent-encoded
+            # blob that no player understands.
+            "\u0664\u0662",
+            "\uff14\uff12",
+            "\u0661h\u0663\u0660m",
+        ):
+            with self.subTest(value=value):
+                link = f"https://www.youtube.com/watch?v=DXQ5gEDIhzE&t={value}"
+                self.assertEqual(report_module._youtube_short_url(link), "https://youtu.be/DXQ5gEDIhzE")
+
+    def test_only_the_first_timestamp_survives(self):
+        """Two positions cannot both be the moment a proof means.
+
+        Passing every match through produced links like ``?t=42s&t=1m30s``,
+        which leaves the reader guessing which one YouTube honors and
+        contradicts the single timestamp this function promises.
+        """
+        for link, expected in (
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s&t=1m30s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=42s&start=90", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=90&t=42s", "https://youtu.be/DXQ5gEDIhzE?t=90"),
+            ("https://youtu.be/DXQ5gEDIhzE?t=5s&t=6s&t=7s", "https://youtu.be/DXQ5gEDIhzE?t=5s"),
+            # A junk value is skipped, not counted as the one timestamp.
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&t=abc&t=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(report_module._youtube_short_url(link), expected)
+        # A repeated key can no longer inflate the rewritten link.
+        flood = "https://www.youtube.com/watch?v=DXQ5gEDIhzE&" + "&".join(["t=1s"] * 40)
+        self.assertEqual(report_module._youtube_short_url(flood), "https://youtu.be/DXQ5gEDIhzE?t=1s")
+
+    def test_the_moment_is_always_written_back_as_t(self):
+        """``start`` is the embed player's spelling; the output is a short link.
+
+        An embed or live URL carries the moment as ``start``. Copying that
+        spelling onto youtu.be hands the reviewer a link that quietly opens at
+        0:00, because the short domain reads ``t``. Only the key changes; the
+        value is carried across untouched.
+        """
+        for link, expected in (
+            ("https://www.youtube.com/embed/DXQ5gEDIhzE?start=90", "https://youtu.be/DXQ5gEDIhzE?t=90"),
+            ("https://www.youtube.com/live/DXQ5gEDIhzE?start=5m", "https://youtu.be/DXQ5gEDIhzE?t=5m"),
+            ("https://www.youtube.com/watch?v=DXQ5gEDIhzE&start=1h2m3s", "https://youtu.be/DXQ5gEDIhzE?t=1h2m3s"),
+            ("https://youtu.be/DXQ5gEDIhzE?start=42s", "https://youtu.be/DXQ5gEDIhzE?t=42s"),
+            # The share tag still goes, and the moment still arrives as t.
+            ("https://youtu.be/DXQ5gEDIhzE?si=abc&start=326", "https://youtu.be/DXQ5gEDIhzE?t=326"),
         ):
             with self.subTest(link=link):
                 self.assertEqual(report_module._youtube_short_url(link), expected)
@@ -2009,11 +2268,14 @@ class CapBoundaryTests(unittest.TestCase):
             dry_run=False,
             changes=changes,
         )
-        full = render_report(info)
-        self.assertEqual(full.count("| `[U:1:"), 150)  # No entries were dropped.
-        budget = len(full.encode("utf-8"))
-        with mock.patch.object(report_module, "MAX_REPORT_BYTES", budget):
-            self.assertEqual(render_report(info), full)  # Exact fit: no shrink or truncation.
+        # Two renders are compared, and the header carries the wall-clock
+        # minute, so the clock has to hold still or this is a coin flip.
+        with frozen_clock():
+            full = render_report(info)
+            self.assertEqual(full.count("| `[U:1:"), 150)  # No entries were dropped.
+            budget = len(full.encode("utf-8"))
+            with mock.patch.object(report_module, "MAX_REPORT_BYTES", budget):
+                self.assertEqual(render_report(info), full)  # Exact fit: no shrink or truncation.
 
 
 class RenderMemoTests(unittest.TestCase):

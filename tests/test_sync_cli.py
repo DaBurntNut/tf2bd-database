@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -32,6 +33,7 @@ from _support import (
 )
 
 import playerlist as playerlist_module
+import policy as policy_module
 import report as report_module
 import sources
 import sync_vorobey_hackerpolice as sync_module
@@ -548,7 +550,7 @@ class ValidationLoggingTests(unittest.TestCase):
         self.assertIn("example.invalid", output)
         self.assertIn("REDACTED", output)
 
-    def test_omitted_validation_messages_are_summarised(self):
+    def test_omitted_validation_messages_are_summarized(self):
         result = playerlist_module.ValidationResult(
             errors=["invalid entry"],
             warnings=["unknown attribute"],
@@ -558,8 +560,28 @@ class ValidationLoggingTests(unittest.TestCase):
         with self.assertLogs(sync_module.LOGGER, level="WARNING") as captured:
             sync_module._log_validation(result, "database validation")
         output = "\n".join(captured.output)
-        self.assertIn("3 additional validation warning(s) omitted", output)
-        self.assertIn("database validation: 2 additional validation problem(s) omitted", output)
+        self.assertIn("3 additional validation warnings omitted", output)
+        self.assertIn("database validation: 2 additional validation problems omitted", output)
+
+    def test_a_single_omitted_validation_message_reads_as_one(self):
+        """These counts are written with the same plural helper as the report.
+
+        The log line used to read "1 additional validation warning(s) omitted"
+        for every count. The report stopped writing "(s)" long ago, so the two
+        halves of the same run disagreed about how to say the same thing.
+        """
+        result = playerlist_module.ValidationResult(
+            errors=["invalid entry"],
+            warnings=["unknown attribute"],
+            errors_omitted=1,
+            warnings_omitted=1,
+        )
+        with self.assertLogs(sync_module.LOGGER, level="WARNING") as captured:
+            sync_module._log_validation(result, "database validation")
+        output = "\n".join(captured.output)
+        self.assertIn("1 additional validation warning omitted", output)
+        self.assertIn("database validation: 1 additional validation problem omitted", output)
+        self.assertNotIn("(s)", output)
 
     def test_the_summary_is_flushed_before_the_outcome_is_logged(self):
         """A piped stdout is block-buffered while stderr is not.
@@ -1080,6 +1102,48 @@ class CliTests(unittest.TestCase):
             code = main(argv)
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def test_the_log_says_would_update_on_a_dry_run_and_updated_for_real(self):
+        """Two different words for the same run, and nothing pinned which one
+        appears. The bot could announce "Updated" having written nothing, or
+        claim a dry run while rewriting the database, with the suite green.
+        """
+        code, _, dry = self.run_cli("--source", str(self.source), "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("Dry run: would update 2 entries in", dry)
+        self.assertNotIn("Updated 2 entries in", dry)
+
+        code, _, real = self.run_cli("--source", str(self.source))
+        self.assertEqual(code, 0)
+        self.assertIn("Updated 2 entries in", real)
+        self.assertNotIn("Dry run", real)
+
+    def test_a_normalizing_run_says_rewrote_and_a_dry_one_says_would_rewrite(self):
+        """The same distinction on the no-tag-changes path, which has its own
+        wording and so needs its own case.
+        """
+        unsorted_database = dumps(
+            {
+                "$schema": "x",
+                "file_info": {},
+                "players": [
+                    player("[U:1:900]", ["cheater"]),  # Appended by hand, out of order.
+                    player("[U:1:100]", ["cheater"]),
+                ],
+            }
+        )
+        for dry_run, expected, forbidden in (
+            (True, "Dry run: would rewrite", "Rewrote"),
+            (False, "Rewrote", "Dry run"),
+        ):
+            with self.subTest(dry_run=dry_run):
+                self.database.write_text(unsorted_database, encoding="utf-8")
+                extra = ("--dry-run",) if dry_run else ()
+                code, _, stderr = self.run_cli("--source", str(self.source), "--demote", *extra)
+                self.assertEqual(code, 0)
+                self.assertIn("no tag changes: the file was normalized", stderr)
+                self.assertIn(expected, stderr)
+                self.assertNotIn(forbidden, stderr)
+
     def test_dry_run_does_not_write(self):
         original = self.database.read_text(encoding="utf-8")
         code, stdout, _ = self.run_cli("--source", str(self.source), "--dry-run", "--report", str(self.root / "r.md"))
@@ -1168,11 +1232,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(players["[U:1:500]"]["attributes"], ["cheater"])
         self.assertIn("Previous snapshot: 2 entries; 2 SteamIDs removed upstream", stdout)
         self.assertIn(
-            "- Snapshot diff: **2 new SteamIDs added**, **2 SteamIDs removed** (2 → 2 entries; no net change)",
+            "- Snapshot diff: **2 new SteamIDs added**, **2 SteamIDs removed** (2 → 2 SteamIDs; no net change)",
             stdout,
         )
 
-    def test_entry_totals_use_raw_rows_when_snapshot_contains_duplicate_ids(self):
+    def test_raw_rows_stay_in_provenance_and_the_diff_arrow_counts_distinct_ids(self):
         self.write_snapshot_fixture(
             hackerpolice_entry("[U:1:100]"),
             hackerpolice_entry("[U:1:100]"),
@@ -1181,9 +1245,10 @@ class CliTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli("--source", str(self.source))
         self.assertEqual(code, 0, stderr)
         self.assertIn("Previous snapshot: 3 entries; 0 SteamIDs removed upstream", stdout)
-        # The net is derived from distinct-ID additions/removals, so it cannot
-        # contradict the counts printed next to it when a duplicate row exists.
-        self.assertIn("(3 → 2 entries; no net change)", stdout)
+        # The arrow counts distinct SteamIDs, so it cannot contradict the
+        # added/removed counts beside it when a duplicate row exists: the two
+        # rows for [U:1:100] are one SteamID, so nothing changed at all.
+        self.assertIn("(2 → 2 SteamIDs; no net change)", stdout)
 
     def test_report_lists_every_removed_steamid_with_its_permalink(self):
         """Every ID gone from the list since the snapshot appears in the
@@ -1379,7 +1444,7 @@ class CliTests(unittest.TestCase):
 
     def test_snapshot_is_an_exact_byte_for_byte_copy_of_the_source(self):
         """The snapshot must be the original file verbatim, not a
-        re-serialisation: this source deliberately uses odd key order,
+        re-serialization: this source deliberately uses odd key order,
         spacing, unescaped Unicode and no trailing newline, and the snapshot
         must come out identical byte for byte."""
         raw = (
@@ -1518,9 +1583,9 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("Traceback", stderr)
 
     def test_hand_appended_entry_is_resorted_and_reported(self):
-        """A file out of SteamID order is normalised without any tag changing.
+        """A file out of SteamID order is normalized without any tag changing.
 
-        The old behaviour said "No database changes" while rewriting the file,
+        The old behavior said "No database changes" while rewriting the file,
         so a reviewer saw a diff with a body denying it.
         """
         self.database.write_text(
@@ -1543,8 +1608,8 @@ class CliTests(unittest.TestCase):
             [entry["steamid"] for entry in json.loads(self.database.read_text(encoding="utf-8"))["players"]],
             ["[U:1:100]", "[U:1:900]"],
         )
-        self.assertIn("**No player changes** (the database file was normalised", stdout)
-        self.assertIn("no tag changes: the file was normalised", stderr)
+        self.assertIn("**No player changes** (the database file was normalized", stdout)
+        self.assertIn("no tag changes: the file was normalized", stderr)
         self.assertNotIn("No changes.", stderr)
 
     def test_dry_run_never_writes_the_snapshot(self):
@@ -1623,7 +1688,7 @@ class CliTests(unittest.TestCase):
             sync_module._load_index(SimpleNamespace(source=["x"]))
         self.assertIn("no usable SteamIDs", str(caught.exception))
 
-    def test_a_cancelled_write_leaves_no_temp_file(self):
+    def test_a_canceled_write_leaves_no_temp_file(self):
         """Ctrl-C mid-write must not leave junk in the repository."""
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "playerlist.json"
@@ -1675,6 +1740,31 @@ class CliTests(unittest.TestCase):
         self.assertIn("not a usable playerlist", stderr)
         self.assertIn("duplicate steamid", stderr)
         self.assertEqual(self.database.read_text(encoding="utf-8"), before)
+
+    def test_a_broken_database_is_blamed_on_the_file_it_came_from(self):
+        """Two separate checks refuse a database that has problems: one on the
+        way in, one on the way out. Only the first names the file the problems
+        are in and says how many there are. Delete it and the run still stops
+        with exit code 2, but the message becomes "the synced playerlist is
+        invalid" -- which reads as though the bot corrupted the list rather
+        than found it already broken. Nothing pinned which message appears,
+        and nothing pinned the singular/plural count either.
+        """
+        for bad_ids, expected in (
+            (["NOT-A-STEAMID"], "has 1 problem, nothing was written"),
+            (["NOT-A-STEAMID", "ALSO-BAD"], "has 2 problems, nothing was written"),
+        ):
+            with self.subTest(problems=len(bad_ids)):
+                players = [player(bad, ["cheater"]) for bad in bad_ids]
+                players.append(player("[U:1:100]", ["suspicious"]))
+                self.database.write_text(dumps({"$schema": "x", "file_info": {}, "players": players}), encoding="utf-8")
+                before = self.database.read_text(encoding="utf-8")
+                code, _, stderr = self.run_cli("--source", str(self.source))
+                self.assertEqual(code, 2)
+                self.assertIn(expected, stderr)
+                # The outbound check must not be the one that speaks here.
+                self.assertNotIn("the synced playerlist is invalid", stderr)
+                self.assertEqual(self.database.read_text(encoding="utf-8"), before)
 
     def test_unknown_attribute_warns_but_does_not_block(self):
         self.database.write_text(
@@ -1728,6 +1818,30 @@ class CliTests(unittest.TestCase):
         # The failed run must leave the snapshot baseline unchanged.
         self.assertEqual(snapshot.read_bytes(), before)
 
+    def test_a_url_listed_first_does_not_excuse_a_later_source_from_the_check(self):
+        """Every source is checked, not just sources up to the first URL.
+
+        ``--source`` repeats to declare fallbacks, and the loop skips URLs
+        because only a local path can alias a local file. Skipping the ONE url
+        and skipping the REST OF THE LIST differ by a single word, and the
+        difference is silent: the fallback would quietly become the baseline
+        it is supposed to be compared against. Ordering the arguments this way
+        is what makes the loop prove it keeps going.
+        """
+        snapshot = self.write_snapshot_fixture(hackerpolice_entry("[U:1:300]"))
+        before = snapshot.read_bytes()
+        code, _, stderr = self.run_cli(
+            "--source",
+            "https://example.invalid/list.json",
+            "--source",
+            str(snapshot),
+            "--snapshot",
+            str(snapshot),
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--source must not be the same file as --snapshot", stderr)
+        self.assertEqual(snapshot.read_bytes(), before)
+
     def test_a_broken_snapshot_is_not_reported_as_a_broken_upstream_list(self):
         """The index builder serves two documents: the list AND the snapshot.
 
@@ -1777,6 +1891,31 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             [p.name for p in self.root.iterdir() if ".tmp" in p.name], []
         )  # Refuse before creating any output files.
+
+    def test_a_report_without_a_trailing_newline_gets_exactly_one(self):
+        """The line that adds the newline had never run in any test.
+
+        Today's renderer always ends with one, so the guard only earns its
+        keep if the renderer ever stops doing that -- which is exactly when
+        nobody would be looking. A report file with no final newline makes
+        `git diff` print "\\ No newline at end of file" on every bot commit.
+
+        The branch stayed invisible because it is written as a conditional
+        expression, and coverage does not count those as branches: the suite
+        reported 100% with this half never executed.
+        """
+        report_path = self.root / "report.md"
+        with mock.patch.object(sync_module, "render_report", return_value="no newline here"):
+            code, _, _ = self.run_cli("--source", str(self.source), "--report", str(report_path))
+        self.assertEqual(code, 0)
+        self.assertEqual(report_path.read_text(encoding="utf-8"), "no newline here\n")
+
+    def test_a_report_that_already_ends_in_a_newline_does_not_gain_another(self):
+        report_path = self.root / "report.md"
+        with mock.patch.object(sync_module, "render_report", return_value="ends already\n"):
+            code, _, _ = self.run_cli("--source", str(self.source), "--report", str(report_path))
+        self.assertEqual(code, 0)
+        self.assertEqual(report_path.read_text(encoding="utf-8"), "ends already\n")
 
     def test_missing_database_is_an_error(self):
         self.database.unlink()
@@ -2012,7 +2151,7 @@ class LifecycleTests(unittest.TestCase):
 class DocumentedLimitsTests(unittest.TestCase):
     """The caps are contract, not tuning knobs -- so pin the numbers.
 
-    Mutation testing found every one of these replaceable with a neighbouring
+    Mutation testing found every one of these replaceable with a neighboring
     value while the suite stayed green: ``CapBoundaryTests`` derives its sizes
     FROM the constant, so it proves the comparison is exact but cannot notice
     the constant itself moving. A one-digit typo in ``MAX_REPORT_BYTES`` would
@@ -2022,11 +2161,23 @@ class DocumentedLimitsTests(unittest.TestCase):
     """
 
     def test_the_documented_report_limits(self):
-        # Published behaviour: change tables stop at 150 rows, the removed-ID
-        # table at 100 rows, and the report body at 60,000 bytes.
+        # Published behavior: change tables stop at 150 rows, the removed-ID
+        # table at 300 rows, and the report body at 60,000 bytes.
         self.assertEqual(report_module.MAX_CHANGE_TABLE_ROWS, 150)
-        self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 100)
+        self.assertEqual(report_module.MAX_REMOVED_TABLE_ROWS, 300)
         self.assertEqual(report_module.MAX_REPORT_BYTES, 60_000)
+        # A removed-ID row costs ~151 bytes, so the table alone must leave the
+        # rest of the report somewhere to live. 400 rows (61,201 bytes) overflow
+        # the budget outright and drop the shrink ladder to the (1, 50) rung --
+        # a nominal cap of 400 would print FEWER names than a cap of 100. Even
+        # 350 fits only while the same run carries under ~34 other changes, so
+        # it buys a number the bot cannot keep. 300 holds with room to spare.
+        # Raising this without re-measuring the row cost makes reports worse.
+        self.assertLessEqual(
+            report_module.MAX_REMOVED_TABLE_ROWS * 151,
+            report_module.MAX_REPORT_BYTES * 4 // 5,
+            "the removed-ID table must fit the budget with room for the rest of the report",
+        )
 
     def test_the_display_caps(self):
         self.assertEqual(report_module.MAX_NAME_CHARS, 80)
@@ -2039,7 +2190,7 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.MAX_URL_DISPLAY_CHARS, 2048)
 
     def test_the_read_and_fetch_limits(self):
-        # Published behaviour: downloads allow 64 MiB, 30 seconds, and three attempts
+        # Published behavior: downloads allow 64 MiB, 30 seconds, and three attempts
         # before fallback; database and snapshot files share the 64 MiB limit.
         self.assertEqual(playerlist_module.MAX_FILE_BYTES, 64 * 1024 * 1024)
         self.assertEqual(sources.MAX_SOURCE_BYTES, 64 * 1024 * 1024)
@@ -2049,7 +2200,7 @@ class DocumentedLimitsTests(unittest.TestCase):
         self.assertEqual(sources.RETRY_BACKOFF_SECONDS, 2)
 
     def test_the_documented_guard_and_account_bounds(self):
-        # Published behaviour: the guard requires more than 50 IDs and more than 20% removal.
+        # Published behavior: the guard requires more than 50 IDs and more than 20% removal.
         self.assertEqual(sync_module.MASS_DEMOTION_MIN_IDS, 50)
         self.assertEqual(sync_module.MASS_DEMOTION_MAX_FRACTION, 0.2)
         # The second, database-relative guard: the snapshot dwarfs the database,
@@ -2059,6 +2210,55 @@ class DocumentedLimitsTests(unittest.TestCase):
         # Steam account IDs are 32-bit; instance identifiers use 20 bits.
         self.assertEqual(playerlist_module.MAX_ACCOUNT_ID, 2**32)
         self.assertEqual(playerlist_module.MAX_STEAMID_INSTANCE, 2**20)
+
+    def test_the_remaining_limits_that_no_other_test_pins(self):
+        """The last caps a full mutation run could still move unnoticed.
+
+        Each of these survived being replaced by a neighboring value while all
+        658 tests stayed green, for the reason this class exists: the tests
+        around them derive their sizes FROM the constant, so they prove the
+        comparison is exact and cannot see the number itself drift.
+        """
+        # How much of a malformed file is explained before the list is cut off,
+        # and how deep a diagnostic will decode to describe a nested value.
+        self.assertEqual(playerlist_module.MAX_VALIDATION_MESSAGES, 100)
+        self.assertEqual(playerlist_module._MAX_DIAGNOSTIC_DECODE_DEPTH, 8)
+        # A SteamID64 has 17 digits; 10 bounds the account part and keeps a
+        # hostile 4,300-digit number away from Python's int-parsing limit.
+        self.assertEqual(playerlist_module.MAX_ACCOUNT_ID_DIGITS, 10)
+        self.assertEqual(playerlist_module.MAX_JSON_INT_DIGITS, 4_300)
+        # Evidence shown per change, and the label naming the database.
+        self.assertEqual(policy_module.MAX_EVIDENCE_LINK_CHARS, 500)
+        self.assertEqual(report_module.MAX_DATABASE_LABEL_CHARS, 80)
+        self.assertEqual(report_module._MAX_EVIDENCE_STATUS_CACHE, 20_000)
+        # The floor the removed-ID table may shrink to, and the HTTP status the
+        # fetcher treats as "slow down" rather than "give up".
+        self.assertEqual(report_module._REMOVED_TABLE_FLOOR, 100)
+        self.assertEqual(sources.TOO_MANY_REQUESTS, 429)
+        # How many layers of encoding a nested URL is unwrapped through before
+        # the redactor fails closed. Raising it costs time on hostile input.
+        self.assertEqual(sources._MAX_NESTED_URL_DEPTH, 8)
+
+    def test_the_records_passed_between_stages_cannot_be_edited_in_place(self):
+        """Each stage hands the next a fact, not a mutable buffer.
+
+        A change record is built by the policy, read by the report and named in
+        the pull request; a source record is built once and reused per attempt.
+        Freezing them is what stops a later stage from quietly rewriting what an
+        earlier one decided, so the suite should notice if it is ever unfrozen.
+        """
+        change = policy_module.Change("[U:1:1]", "n", ("suspicious",), ("cheater",))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            change.steamid = "[U:1:2]"  # type: ignore[misc]
+        info = report_module.RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://example.invalid/list.json",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            info.dry_run = True  # type: ignore[misc]
 
 
 class InterruptTests(unittest.TestCase):

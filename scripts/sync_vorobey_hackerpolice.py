@@ -10,7 +10,7 @@ only demoted if it is in the previous snapshot (``--snapshot``, default
 current list. Cheaters this database added manually -- never listed by
 Vorobey at all -- are therefore never touched. When it is safe and the
 upstream bytes differ, the snapshot is refreshed with the RAW BYTES of the
-current file (an exact replica, never decoded/re-serialised) alongside the
+current file (an exact replica, never decoded/re-serialized) alongside the
 database. Pull-request mode proposes both together; manual direct-commit mode
 publishes both together on the default branch.
 
@@ -86,9 +86,9 @@ MASS_DEMOTION_MIN_IDS = 50
 MASS_DEMOTION_MAX_FRACTION = 0.2
 # Also veto when the removal would demote a large share of THIS database's own
 # demotable entries. The snapshot is an order of magnitude larger than the
-# database, so the snapshot-relative rule alone let a purge of every demotable
-# entry look like ~2% of the baseline and pass. Counts are deliberately not
-# quoted here: the snapshot advances every run, so any figure would go stale.
+# database, so a purge of every demotable entry is still a small fraction of
+# the snapshot, and the snapshot-relative rule alone would let it pass. No
+# figures are quoted here: both files grow every run, so any would go stale.
 MASS_DEMOTION_MAX_DATABASE_FRACTION = 0.25
 MASS_DEMOTION_MIN_DATABASE_IDS = 5
 
@@ -104,6 +104,7 @@ def _one_line_message(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser (also used by the tests as the CLI contract)."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -234,12 +235,21 @@ def _log_validation(result: ValidationResult, context: str) -> None:
     for warning in result.warnings:
         LOGGER.warning("%s", playerlist.display_raw(warning))
     if result.warnings_omitted:
-        LOGGER.warning("%s additional validation warning(s) omitted", result.warnings_omitted)
+        LOGGER.warning(
+            "%s additional validation %s omitted",
+            result.warnings_omitted,
+            plural(result.warnings_omitted, "warning", "warnings"),
+        )
     safe_context = display_path(context)
     for error in result.errors:
         LOGGER.error("%s: %s", safe_context, playerlist.display_raw(error))
     if result.errors_omitted:
-        LOGGER.error("%s: %s additional validation problem(s) omitted", safe_context, result.errors_omitted)
+        LOGGER.error(
+            "%s: %s additional validation %s omitted",
+            safe_context,
+            result.errors_omitted,
+            plural(result.errors_omitted, "problem", "problems"),
+        )
 
 
 def load_database(path: Path) -> tuple[PlayerList, str]:
@@ -256,20 +266,22 @@ def load_database(path: Path) -> tuple[PlayerList, str]:
     result = validate(database)
     _log_validation(result, f"{display_path(path)} is not a usable playerlist")
     if result.error_count:
-        raise SyncError(f"{display_path(path)} has {result.error_count} problem(s), nothing was written")
+        raise SyncError(
+            f"{display_path(path)} has {result.error_count} "
+            f"{plural(result.error_count, 'problem', 'problems')}, nothing was written"
+        )
     return database, original
 
 
 def _fsync_directory(directory: Path) -> None:
     """Best-effort fsync of a directory so a rename survives an OS crash."""
-    try:
+    # Directory fsync is best-effort; some platforms do not support it.
+    with contextlib.suppress(OSError):
         fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
-    except OSError:
-        pass  # Directory fsync is best-effort; some platforms do not support it.
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -322,10 +334,10 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
 
 
 def write_database(path: Path, rendered: str, original: str, *, dry_run: bool) -> bool:
-    """Write the serialised playerlist if it changed; returns whether it changed.
+    """Write the serialized playerlist if it changed; returns whether it changed.
 
     ``rendered`` is the text the caller already produced to decide what
-    changed, so the database is never serialised twice and what was compared
+    changed, so the database is never serialized twice and what was compared
     is exactly what is written.
     """
     modified = rendered != original
@@ -342,7 +354,7 @@ def write_snapshot(path: Path, raw: bytes, original: bytes | None, *, dry_run: b
     """Overwrite the snapshot with the source's RAW bytes; returns whether it changed.
 
     The bytes are written verbatim -- never decoded, parsed or
-    re-serialised -- so after an update the snapshot is an exact replica of
+    re-serialized -- so after an update the snapshot is an exact replica of
     the original upstream file, byte for byte.
     """
     changed = raw != original
@@ -354,16 +366,22 @@ def write_snapshot(path: Path, raw: bytes, original: bytes | None, *, dry_run: b
     return changed
 
 
-def _log_outcome(modified: bool, changes: list[Change], path: Path, *, dry_run: bool) -> None:
+def _log_outcome(changes: list[Change], path: Path, *, modified: bool, dry_run: bool) -> None:
+    """Log what the run did to the database, in the tense the run deserves.
+
+    The three outcomes are kept apart on purpose: nothing to do, a rewrite
+    that changed no tags, and a real set of changes. Each reads differently
+    under --dry-run, so a log line never claims a write that did not happen.
+    """
     count = len(changes)
     what = f"{count} {plural(count, 'entry', 'entries')}"
     if not modified:
         # Scope the no-change message to the database; the snapshot may still change.
         LOGGER.info("No database changes: nothing to update.")
     elif not changes:
-        # Report file-only normalisation separately from tag changes.
+        # Report file-only normalization separately from tag changes.
         LOGGER.info(
-            "%s %s (no tag changes: the file was normalised).",
+            "%s %s (no tag changes: the file was normalized).",
             "Dry run: would rewrite" if dry_run else "Rewrote",
             display_path(path),
         )
@@ -378,10 +396,68 @@ def _same_file(first: Path, second: Path) -> bool:
     try:
         if first.resolve() == second.resolve():
             return True
-        return first.exists() and second.exists() and os.path.samefile(first, second)
+        return first.exists() and second.exists() and first.samefile(second)
     except (OSError, ValueError, RuntimeError):
         # Treat path-resolution failures as non-aliases; later file operations report unusable paths.
         return False
+
+
+def _local_source_paths(args: argparse.Namespace) -> list[Path]:
+    """The ``--source`` values that name a file on disk rather than a URL."""
+    return [Path(source) for source in args.source or [] if not http_scheme(source)]
+
+
+def _reject_empty_paths(args: argparse.Namespace) -> None:
+    """Reject empty paths instead of silently meaning the current directory or no report."""
+    for flag, value in (("--database", args.database), ("--snapshot", args.snapshot), ("--report", args.report)):
+        if value == "":
+            raise SyncError(f"{flag} must not be empty")
+    if any(source == "" for source in args.source or []):
+        raise SyncError("--source must not be empty")
+
+
+def _reject_report_aliases(args: argparse.Namespace, database_path: Path, snapshot_path: Path) -> None:
+    """The report is written first, so an aliased report path would destroy its own input."""
+    if not args.report:
+        return
+    report_path = Path(args.report)
+    protected = [database_path, snapshot_path, *_local_source_paths(args)]
+    if any(_same_file(report_path, path) for path in protected):
+        raise SyncError("--report must not be the same file as --database, --snapshot, or a local --source")
+
+
+def _reject_source_aliases(args: argparse.Namespace, database_path: Path, snapshot_path: Path) -> None:
+    """Keep a local source from aliasing an input or output, especially the snapshot baseline."""
+    for source in args.source or []:
+        if http_scheme(source):
+            continue
+        for flag, other in (("--database", database_path), ("--snapshot", snapshot_path)):
+            if _same_file(Path(source), other):
+                raise SyncError(f"--source must not be the same file as {flag}")
+
+
+def _reject_github_output_aliases(args: argparse.Namespace, database_path: Path, snapshot_path: Path) -> None:
+    """Keep the Actions output file from aliasing any input or output of the run."""
+    github_output = os.environ.get("GITHUB_OUTPUT")
+    if not github_output:
+        return
+    protected = [("--database", database_path), ("--snapshot", snapshot_path)]
+    if args.report:
+        protected.append(("--report", Path(args.report)))
+    protected.extend(("--source", path) for path in _local_source_paths(args))
+    for flag, path in protected:
+        if _same_file(Path(github_output), path):
+            raise SyncError(f"GITHUB_OUTPUT must not be the same file as {flag}")
+
+
+def _require_output_directories(args: argparse.Namespace, snapshot_path: Path) -> None:
+    """Fail before any work when an output directory is missing -- always a typo."""
+    outputs = [("--snapshot", snapshot_path)]
+    if args.report:
+        outputs.append(("--report", Path(args.report)))
+    for flag, path in outputs:
+        if not path.parent.is_dir():
+            raise SyncError(f"{flag} directory does not exist: {display_path(path.parent)}")
 
 
 def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -394,50 +470,15 @@ def _guard_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     rewrite it; and an output path in a directory that does not exist is a
     typo, never a design case.
     """
-    # Reject empty paths instead of treating them as the current directory or ignoring the report.
-    for flag, value in (("--database", args.database), ("--snapshot", args.snapshot), ("--report", args.report)):
-        if value == "":
-            raise SyncError(f"{flag} must not be empty")
-    if any(source == "" for source in args.source or []):
-        raise SyncError("--source must not be empty")
-
+    _reject_empty_paths(args)
     database_path = Path(args.database)
     snapshot_path = Path(args.snapshot)
     if _same_file(snapshot_path, database_path):
         raise SyncError("--snapshot and --database must be different files")
-    if args.report:
-        report_path = Path(args.report)
-        protected = [database_path, snapshot_path]
-        protected += [Path(source) for source in args.source or [] if not http_scheme(source)]
-        if any(_same_file(report_path, path) for path in protected):
-            raise SyncError("--report must not be the same file as --database, --snapshot, or a local --source")
-    for source in args.source or []:
-        if http_scheme(source):
-            continue
-        # Prevent local sources from aliasing inputs or outputs, especially the snapshot baseline.
-        for flag, other in (("--database", database_path), ("--snapshot", snapshot_path)):
-            if _same_file(Path(source), other):
-                raise SyncError(f"--source must not be the same file as {flag}")
-
-    # Prevent GITHUB_OUTPUT from aliasing any input or output file.
-    github_output = os.environ.get("GITHUB_OUTPUT")
-    if github_output:
-        github_protected = [("--database", database_path), ("--snapshot", snapshot_path)]
-        if args.report:
-            github_protected.append(("--report", Path(args.report)))
-        github_protected.extend(("--source", Path(source)) for source in args.source or [] if not http_scheme(source))
-        for flag, path in github_protected:
-            if _same_file(Path(github_output), path):
-                raise SyncError(f"GITHUB_OUTPUT must not be the same file as {flag}")
-
-    # Fail early when an output directory is missing.
-    outputs = [("--snapshot", snapshot_path)]
-    if args.report:
-        outputs.append(("--report", Path(args.report)))
-    for flag, path in outputs:
-        if not path.parent.is_dir():
-            raise SyncError(f"{flag} directory does not exist: {display_path(path.parent)}")
-
+    _reject_report_aliases(args, database_path, snapshot_path)
+    _reject_source_aliases(args, database_path, snapshot_path)
+    _reject_github_output_aliases(args, database_path, snapshot_path)
+    _require_output_directories(args, snapshot_path)
     return database_path, snapshot_path
 
 
@@ -516,7 +557,7 @@ def _demotion_scale(to_demote: int, at_risk: int) -> str:
     if at_risk <= 0:
         return "no tracked cheaters to compare against"
     share = min(to_demote, at_risk) / at_risk
-    return f"{share:.0%} of the {at_risk:,} cheater(s) this database could lose"
+    return f"{share:.0%} of the {at_risk:,} {plural(at_risk, 'cheater', 'cheaters')} this database could lose"
 
 
 def _plan_demotion(
@@ -553,7 +594,7 @@ def _plan_demotion(
         else:
             removed = set(removed_upstream)
             LOGGER.info(
-                "%d SteamIDs removed upstream since the snapshot (%d entries).",
+                "%d SteamIDs removed upstream since the snapshot (%d SteamIDs).",
                 len(removed),
                 len(previous_index.by_steamid),
             )
@@ -574,7 +615,7 @@ def _plan_demotion(
                 len(removed), len(previous_index.by_steamid), *demotion_impact
             ):
                 demotion_note = (
-                    f"skipped - {len(removed):,} of {len(previous_index.by_steamid):,} snapshot entries "
+                    f"skipped - {len(removed):,} of {len(previous_index.by_steamid):,} snapshot SteamIDs "
                     f"disappeared upstream at once ({_demotion_scale(*demotion_impact)}), which looks "
                     "like an upstream problem, not real removals "
                     "(re-run with --allow-mass-demotion to force)"
@@ -617,7 +658,7 @@ def run(args: argparse.Namespace) -> int:
         removed_upstream = removed_steamids(previous_index, index)
         removed_count = len(removed_upstream)
         LOGGER.info(
-            "Snapshot diff vs. previous snapshot: %d SteamIDs added, %d removed (%d -> %d entries).",
+            "Snapshot diff vs. previous snapshot: %d SteamIDs added, %d removed (%d -> %d SteamIDs).",
             added_count,
             removed_count,
             len(previous_index.by_steamid),
@@ -654,6 +695,8 @@ def run(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             changes=tuple(changes),
             previous_source_total=previous_index.total if previous_index is not None else None,
+            source_ids=len(index.by_steamid),
+            previous_source_ids=len(previous_index.by_steamid) if previous_index is not None else 0,
             added_to_source=added_count,
             removed_from_source=removed_count,
             removed_upstream=tuple(removed_upstream),
@@ -700,7 +743,7 @@ def run(args: argparse.Namespace) -> int:
     # Write the database before advancing the snapshot; skipped demotions remain candidates.
     # Safe snapshot-only changes still refresh the baseline.
     write_database(database_path, rendered, original, dry_run=args.dry_run)
-    _log_outcome(modified, changes, database_path, dry_run=args.dry_run)
+    _log_outcome(changes, database_path, modified=modified, dry_run=args.dry_run)
     if update_snapshot:
         write_snapshot(snapshot_path, source_bytes, previous_bytes, dry_run=args.dry_run)
         if snapshot_changed:
@@ -724,6 +767,7 @@ def _force_utf8_streams() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the sync and return the process exit status."""
     _force_utf8_streams()
     args = build_parser().parse_args(argv)
 

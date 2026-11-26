@@ -1,5 +1,22 @@
 # Tooling config only; runtime scripts support Python 3.10+.
 
+# Versions of the tools configured below, so a tool's settings and its version
+# live in one file. Dependabot owns this table (see .github/dependabot.yml) and
+# proposes bumps weekly; each one has to pass these same checks before merging.
+# Not runtime dependencies -- the sync scripts use only the standard library.
+[dependency-groups]
+ci = [
+    "ruff==0.17.6",
+    "mypy==2.4.1",
+    "bandit==1.9.4",
+    # Held back deliberately: coverage 7.17.0 raised its floor to Python 3.11
+    # while the matrix still tests 3.10, and there is no 7.16.3, so 7.16.2 is
+    # the last installable release. dependabot.yml ignores >=7.17.0 for this
+    # reason; drop that ignore when the 3.10 leg retires.
+    "coverage==7.16.2",
+    "vulture==2.16",
+]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"
@@ -33,6 +50,17 @@ source = ["scripts"]
 # Keep coverage honest without demanding the impossible last few percent. The
 # suite currently sits at 100%; the floor exists so it cannot silently rot, not
 # so a contributor has to invent a test for an unreachable branch to pass CI.
+#
+# Read that 100% as "every line ran at least once", NOT as "every behavior is
+# checked". Two gaps it cannot see:
+#   * a conditional expression (``a if cond else b``) is one line with no
+#     branch arcs, so coverage reports it fully covered with one side never
+#     executed. There are 65 of them in scripts/. One -- the line that adds a
+#     missing trailing newline to the report -- had never run in any test
+#     while this file reported 100%.
+#   * running a line is not the same as asserting on what it did. A test can
+#     execute a limit check and never notice the limit itself changing.
+# Mutation testing is what finds both; coverage is a floor, not a verdict.
 fail_under = 95
 show_missing = true
 skip_covered = true

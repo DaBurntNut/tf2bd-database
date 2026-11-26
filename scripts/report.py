@@ -58,7 +58,7 @@ __all__ = [
 
 # Limit report size below GitHub's body cap; reduce row limits before hard truncation.
 MAX_CHANGE_TABLE_ROWS = 150
-MAX_REMOVED_TABLE_ROWS = 100
+MAX_REMOVED_TABLE_ROWS = 300
 # Bound closing-sentence SteamID lists to keep the summary readable.
 MAX_CLOSING_STEAMIDS = 150
 # Measure the shared report budget in UTF-8 bytes.
@@ -111,7 +111,7 @@ _ESCAPES = {
 }
 
 # Escape pipes because they terminate table cells.
-_CELL_ESCAPES = str.maketrans({**_ESCAPES, "|": "\\|"})
+_CELL_ESCAPES = str.maketrans(_ESCAPES | {"|": "\\|"})
 _TEXT_ESCAPES = str.maketrans(_ESCAPES)
 
 # Escape backslashes and pipes inside table code spans.
@@ -126,7 +126,7 @@ REMOVED_HEADER = ("SteamID", "Profile Link", "SteamHistory")
 DEFAULT_SNAPSHOT_LABEL = "snapshot/playerlist.vorobey-hackerpolice.json"
 
 
-# Neutralise controls and line separators before displaying untrusted text.
+# Neutralize controls and line separators before displaying untrusted text.
 _TEXT_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 # Replace bidi controls so displayed text cannot reorder adjacent content.
@@ -136,7 +136,7 @@ _BIDI_CONTROLS = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 _MEANINGFUL_JOINERS = frozenset(("\u200c", "\u200d"))
 
 
-def _neutralise(value: str) -> str:
+def _neutralize(value: str) -> str:
     """Make a value safe to put in front of a human or a terminal."""
     value = redact_urls_in_text(value)
     value = _TEXT_CONTROLS.sub(" ", value)
@@ -189,12 +189,12 @@ def _text(value: str, *, allow_autolinks: bool = False) -> str:
     clickable URI.
     """
     if allow_autolinks:
-        return _neutralise(value).translate(_TEXT_ESCAPES)
+        return _neutralize(value).translate(_TEXT_ESCAPES)
     return _data_text(value, in_table=False)
 
 
 def _code(value: str, *, in_table: bool = False) -> str:
-    """Make a string safe inside an inline code span (``…``).
+    r"""Make a string safe inside an inline code span (``…``).
 
     A code span is delimited by a run of backticks and can never contain a run
     that long, so the fence is grown past the longest run in the value: a value
@@ -207,7 +207,7 @@ def _code(value: str, *, in_table: bool = False) -> str:
     about (see ``_TABLE_CODE_ESCAPES``); running text does not need that, and
     escaping it there would display a Windows path as ``C:\\x``.
     """
-    text = _neutralise(value)
+    text = _neutralize(value)
     if in_table:
         text = text.translate(_TABLE_CODE_ESCAPES)
     longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
@@ -272,7 +272,7 @@ def _data_text(value: str, *, in_table: bool) -> str:
     ``_text(..., allow_autolinks=True)`` instead.
     """
     escaped = _CELL_ESCAPES if in_table else _TEXT_ESCAPES
-    value = _neutralise(value)
+    value = _neutralize(value)
     parts: list[str] = []
     position = 0
     for match in _AUTOLINK_IN_TEXT.finditer(value):
@@ -349,10 +349,14 @@ _YOUTUBE_ID_PATH = re.compile(r"^/(?:shorts|embed|live|v)/(?P<id>[A-Za-z0-9_-]+)
 _YOUTUBE_SHORT = re.compile(r"^https?://youtu\.be/(?P<id>[A-Za-z0-9_-]+)(?:\?(?P<query>[^#]*))?(?:#.*)?$", re.ASCII)
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]+$", re.ASCII)
 # Query keys that name a position in the video, and the forms YouTube accepts
-# for one ("42", "42s", "1m30s", "1h2m3s"). Anything else is not a timestamp and
-# is dropped rather than pasted into the link.
+# for one: bare seconds ("42"), any of the hour/minute/second units in that
+# order ("42s", "5m", "2h", "1h30m", "1m30s", "1h2m3s"), and a trailing count
+# with the "s" left off ("1h30"). At least one digit is required, so an empty
+# or unit-only value is not a timestamp; the colon form ("1:30") is not one
+# either, because YouTube does not accept it. Anything else is dropped rather
+# than pasted into the link.
 _YOUTUBE_TIMESTAMP_KEYS = frozenset({"t", "start"})
-_YOUTUBE_TIME = re.compile(r"^(?:\d+h)?(?:\d+m)?(?:\d+s?)$", re.ASCII)
+_YOUTUBE_TIME = re.compile(r"^(?=\d)(?:\d+h)?(?:\d+m)?(?:\d+s?)?$", re.ASCII)
 
 
 def _youtube_short_url(link: str) -> str | None:
@@ -366,7 +370,8 @@ def _youtube_short_url(link: str) -> str | None:
 
     ONE rule for every YouTube spelling, short or long: the result is
     ``youtu.be/<id>`` plus a timestamp if -- and only if -- the input carried a
-    real one (``t`` / ``start``, any form YouTube accepts). Every other query
+    real one (``t`` or ``start`` on the way in, any form YouTube accepts,
+    always written back as ``t``). Every other query
     parameter is dropped, including the ``si=`` share tag, so
     ``youtu.be/ID?si=abc`` and ``youtube.com/watch?v=ID&si=abc`` both become
     ``youtu.be/ID`` while ``youtu.be/ID?si=abc&t=326`` becomes
@@ -401,9 +406,20 @@ def _youtube_short_url(link: str) -> str | None:
                 video_id = by_path.group("id")
     if video_id is None or not _VIDEO_ID.match(video_id):
         return None
-    # Keep a real timestamp, in the order it appeared; drop everything else.
-    kept = [(key, value) for key, value in pairs if key in _YOUTUBE_TIMESTAMP_KEYS and _YOUTUBE_TIME.match(value)]
-    timestamp = "?" + urllib.parse.urlencode(kept) if kept else ""
+    # Keep the FIRST real timestamp and drop everything else, including any
+    # later one: two positions cannot both be the moment a proof means, and
+    # repeating the key would only make the reader guess which one counts.
+    #
+    # Always write it back as "t", whichever key it arrived under. The result
+    # is a youtu.be link, and "t" is the parameter that domain reads; "start"
+    # belongs to the embed player, so copying that spelling onto a short link
+    # would hand the reviewer a link that silently opens at 0:00. Rewriting
+    # the key is safe in the other direction too, because "t" is understood
+    # everywhere this function can emit.
+    moment = next(
+        (value for key, value in pairs if key in _YOUTUBE_TIMESTAMP_KEYS and _YOUTUBE_TIME.match(value)), None
+    )
+    timestamp = "?" + urllib.parse.urlencode([("t", moment)]) if moment is not None else ""
     return f"https://youtu.be/{video_id}{timestamp}"
 
 
@@ -447,7 +463,7 @@ def _evidence_link_status_cached(link: str) -> tuple[str, bool]:
 def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     """Proof column: real links where possible, escaped text otherwise.
 
-    Each link is labelled "proof" (or "proof 1", "proof 2" when there are
+    Each link is labeled "proof" (or "proof 1", "proof 2" when there are
     several) so it is obvious what clicking it opens; several are listed side
     by side rather than separated by an HTML ``<br>``, because the report never
     emits raw HTML -- a cell then renders the same in a pull request, in a job
@@ -485,7 +501,7 @@ def _evidence_cell(links: Sequence[str], omitted: int = 0) -> str:
     hidden = max(0, len(links) - len(shown)) + max(0, omitted)
     if hidden:
         # Keep the overflow note plain; it counts evidence links not shown.
-        cell += f", and {_count(hidden)} more evidence entries"
+        cell += f", and {_count(hidden)} more evidence {plural(hidden, 'entry', 'entries')}"
     return cell
 
 
@@ -689,6 +705,10 @@ class RunInfo:
     changes: tuple[Change, ...] = ()
     # Snapshot provenance and reasons a requested demotion was skipped.
     previous_source_total: int | None = None  # Raw entries in the previous snapshot.
+    # Distinct usable IDs either side of the diff. The snapshot-diff arrow counts
+    # these, not the raw entry totals, so its subtraction always matches the net.
+    source_ids: int = 0
+    previous_source_ids: int = 0
     added_to_source: int = 0  # Distinct usable IDs added upstream.
     removed_from_source: int = 0  # Distinct usable IDs removed upstream.
     # IDs missing upstream since the previous snapshot, even when demotion is skipped.
@@ -698,7 +718,7 @@ class RunInfo:
     snapshot_note: str | None = None
     # Include snapshot-only changes in the report status.
     snapshot_changed: bool = False
-    # Distinguish file-only normalisation from no database changes.
+    # Distinguish file-only normalization from no database changes.
     database_changed: bool = False
     # Report the snapshot path actually used.
     snapshot_path: Path | None = None
@@ -708,7 +728,7 @@ class RunInfo:
         """Friendly name of the database, derived from its file name.
 
         ``playerlist.garou3299.json`` becomes ``Garou3299``: the owner part of
-        the usual ``playerlist.<owner>.json`` shape, capitalised. Any other
+        the usual ``playerlist.<owner>.json`` shape, capitalized. Any other
         file name is used as it is (``mylist.json`` becomes ``Mylist``), so
         the headline always names the file the run actually writes and no
         repository name is hardcoded here.
@@ -721,23 +741,22 @@ class RunInfo:
 
 
 def _net_change_text(added: int, removed: int) -> str:
-    """Describe the net change in DISTINCT SteamIDs.
+    """Describe the net change in distinct SteamIDs.
 
-    The entry totals either side of it count raw rows (including duplicates),
-    while added/removed count distinct usable IDs -- so deriving the net from
-    the two raw totals made the line contradict itself whenever the upstream
-    file contained a duplicate row or an unusable one.
+    The totals printed beside this count distinct usable SteamIDs on both sides,
+    so the subtraction a reader performs always matches this net: for sets,
+    ``len(current) - len(previous)`` is exactly ``added - removed``.
     """
     delta = added - removed
-    # Name the unit. The entry totals printed beside this are raw rows, so a bare
-    # "net +13" next to "6,223 -> 6,237 entries" reads like arithmetic that does
-    # not add up whenever a row is a duplicate or unusable.
-    return "no net change" if delta == 0 else f"net {delta:+,d} distinct SteamIDs"
+    if delta == 0:
+        return "no net change"
+    # Agree with the singular/plural of the counts beside it: "net +1 distinct SteamID".
+    return f"net {delta:+,d} distinct {plural(abs(delta), 'SteamID', 'SteamIDs')}"
 
 
 def _header_lines(info: RunInfo) -> list[str]:
     """The ``- Key: value`` bullet block at the top of the report."""
-    source_note = f"{_count(info.source_total)} entries"
+    source_note = f"{_count(info.source_total)} {plural(info.source_total, 'entry', 'entries')}"
     if info.source_skipped:
         source_note += f", {_count(info.source_skipped)} unusable"
     source = redact_urls_in_text(info.source)
@@ -754,10 +773,14 @@ def _header_lines(info: RunInfo) -> list[str]:
     if info.dry_run:
         lines.append("- Mode: **dry run** (no database or snapshot written)")
     if info.previous_source_total is not None:
-        # Entry totals are raw rows (duplicates included) for provenance only;
-        # added/removed, and the net derived from them, count DISTINCT IDs.
+        # The entry total below is raw rows (duplicates included) and is
+        # provenance only: a duplicated upstream row stays visible there.
+        # Everything in the diff line after it -- added, removed, BOTH sides
+        # of the arrow, and the net -- counts distinct usable SteamIDs, so the
+        # subtraction a reader performs on the arrow always matches the net.
         lines.append(
-            f"- Previous snapshot: {_count(info.previous_source_total)} entries; "
+            f"- Previous snapshot: {_count(info.previous_source_total)} "
+            f"{plural(info.previous_source_total, 'entry', 'entries')}; "
             f"{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} "
             "removed upstream since then (only those are demotion candidates)"
         )
@@ -765,7 +788,8 @@ def _header_lines(info: RunInfo) -> list[str]:
             f"- Snapshot diff: **{_count(info.added_to_source)} new "
             f"{plural(info.added_to_source, 'SteamID', 'SteamIDs')} added**, "
             f"**{_count(info.removed_from_source)} {plural(info.removed_from_source, 'SteamID', 'SteamIDs')} removed** "
-            f"({_count(info.previous_source_total)} → {_count(info.source_total)} entries; "
+            f"({_count(info.previous_source_ids)} → {_count(info.source_ids)} "
+            f"{plural(info.source_ids, 'SteamID', 'SteamIDs')}; "
             f"{_net_change_text(info.added_to_source, info.removed_from_source)})"
         )
     elif info.snapshot_changed:
@@ -780,6 +804,15 @@ def _header_lines(info: RunInfo) -> list[str]:
         lines.append(f"- Demotion: **{_text(info.demotion_note)}**")
     if info.snapshot_note:
         # Snapshot notes contain code-authored Markdown; preserve their formatting.
+        #
+        # Deliberately NOT escaped through _text() the way the demotion note above
+        # is, and that asymmetry is intentional: a demotion note interpolates a
+        # filesystem path (data), while every snapshot note is assembled from fixed
+        # wording plus integers in _plan_demotion -- it never carries upstream text,
+        # so there is nothing here to neutralize. Escaping it would publish a
+        # literal "\*\*not refreshed\*\*" and "\`--demote\`" instead of bold text
+        # and a code span. If a snapshot note ever starts embedding a value that
+        # came from the network, escape that value at the point it is built.
         lines.append(f"- Snapshot: {info.snapshot_note}")
     elif info.snapshot_changed:
         verb = "would be updated" if info.dry_run else "updated"
@@ -920,8 +953,8 @@ def _render_body(
 
     if not promotions and not demotions:
         if info.database_changed:
-            # Describe file-only normalisation accurately instead of claiming no changes.
-            verb = "would be normalised" if info.dry_run else "was normalised"
+            # Describe file-only normalization accurately instead of claiming no changes.
+            verb = "would be normalized" if info.dry_run else "was normalized"
             detail = "entries re-sorted, formatting restored"
             if info.snapshot_changed:
                 refreshed = "would be refreshed" if info.dry_run else "was refreshed"
@@ -966,16 +999,37 @@ def _render_body(
     return "\n".join(lines)
 
 
-# Row caps tried in order when the body is over budget. Change-table rows shrink
-# first because they carry the review value; the removed-ID list is next, and the
-# last resort (``_fit_body``) only cuts text the tables could not give up.
+# Row caps tried in order when the body is over budget.
+#
+# The removed-ID list gives ground first, but only down to _REMOVED_TABLE_FLOOR.
+# A long list of bare SteamIDs is the cheapest thing to shorten -- every row
+# costs the same and says the same kind of thing -- whereas the change table is
+# the review record of what happened to THIS database, so it is kept whole for
+# as long as possible. Once the removed list is down to its floor, change rows
+# shrink, and only then does the removed list give up the rest; the last resort
+# (``_fit_body``) cuts text the tables could not give up.
+#
+# Shrinking the change table first would be the wrong trade: it would answer "we
+# removed 300 IDs upstream" in full while hiding which of your own entries were
+# deleted for it.
+#
+# The removed-list rungs descend in even steps rather than halving. Coarse rungs
+# make a SMALLER cap print MORE names: with a 200 -> 100 jump, a run of 200
+# removals and 150 changes overflows at 200 rows and lands on 100, while a cap of
+# 150 renders all 150 first time. Even steps keep a larger cap from ever losing
+# to a smaller one.
+_REMOVED_TABLE_FLOOR = 100
 _SHRINK_STEPS: tuple[tuple[int, int], ...] = (
-    (100, MAX_REMOVED_TABLE_ROWS),
-    (50, MAX_REMOVED_TABLE_ROWS),
-    (25, MAX_REMOVED_TABLE_ROWS),
-    (10, MAX_REMOVED_TABLE_ROWS),
-    (5, MAX_REMOVED_TABLE_ROWS),
-    (1, MAX_REMOVED_TABLE_ROWS),
+    (MAX_CHANGE_TABLE_ROWS, 250),
+    (MAX_CHANGE_TABLE_ROWS, 200),
+    (MAX_CHANGE_TABLE_ROWS, 150),
+    (MAX_CHANGE_TABLE_ROWS, _REMOVED_TABLE_FLOOR),
+    (100, _REMOVED_TABLE_FLOOR),
+    (50, _REMOVED_TABLE_FLOOR),
+    (25, _REMOVED_TABLE_FLOOR),
+    (10, _REMOVED_TABLE_FLOOR),
+    (5, _REMOVED_TABLE_FLOOR),
+    (1, _REMOVED_TABLE_FLOOR),
     (1, 50),
     (1, 10),
     (1, 1),

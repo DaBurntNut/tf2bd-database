@@ -53,6 +53,29 @@ class NormalizeSteamIdTests(unittest.TestCase):
             self.assertIsNone(normalize_steamid(probe), probe)
         self.assertIsNone(playerlist_module._bounded_int("²"))  # Defensive guard; normal input cannot reach this case.
 
+    def test_account_id_one_is_the_lowest_usable_steamid(self):
+        """The test above pins the id just below the range; this pins the first
+        id inside it, in every notation. Without it, narrowing either range
+        check to ``1 < account`` passes the entire suite while quietly dropping
+        a real player from the list.
+        """
+        from playerlist import STEAMID64_BASE
+
+        for probe in (
+            1,
+            "1",
+            "0000000001",
+            "[U:1:1]",
+            "U:1:1",
+            "[U:1:1:0]",
+            "STEAM_0:1:0",
+            STEAMID64_BASE + 1,
+            str(STEAMID64_BASE + 1),
+            f"https://steamcommunity.com/profiles/{STEAMID64_BASE + 1}",
+        ):
+            with self.subTest(probe=probe):
+                self.assertEqual(normalize_steamid(probe), "[U:1:1]")
+
     def test_non_ascii_digits_are_rejected_not_crashed(self):
         """Regression: "²".isdigit() is True but int("²") raises, so a single
         corrupted SteamID used to crash the whole run; "١٢٣" was silently
@@ -252,7 +275,7 @@ class SortPlayersTests(unittest.TestCase):
         self.assertEqual([player["steamid"] for player in sort_players(players)], ["[U:1:7]", "bad", "worse"])
 
 
-class SerialisationTests(unittest.TestCase):
+class SerializationTests(unittest.TestCase):
     def test_round_trip_is_byte_identical(self):
         database = {
             "$schema": "https://example.invalid/schema.json",
@@ -350,7 +373,7 @@ class StrictJsonTests(unittest.TestCase):
         # Byte input is also accepted.
         self.assertEqual(strict_json_loads(b'{"players": []}'), {"players": []})
 
-    def test_serialising_a_non_finite_number_is_refused(self):
+    def test_serializing_a_non_finite_number_is_refused(self):
         """Belt and braces: even a future code path cannot write NaN to disk."""
         with self.assertRaises(ValueError):
             dumps({"players": [{"time": float("nan")}]})
@@ -506,13 +529,13 @@ class DisplayPathTests(unittest.TestCase):
         # Nested escapes deeper than the decode budget: no guess, but no plain
         # name either, so the value is left alone rather than mis-parsed.
         deep = "%" + "25" * (playerlist_module._MAX_DIAGNOSTIC_DECODE_DEPTH + 4) + "74oken"
-        self.assertIsNone(playerlist_module._normalised_field_name(deep))
+        self.assertIsNone(playerlist_module._normalized_field_name(deep))
         # And a name that decodes to something that is not a field name at all.
-        self.assertIsNone(playerlist_module._normalised_field_name("tok%3Aen"))
-        self.assertIsNone(playerlist_module._normalised_field_name("a/b"))
+        self.assertIsNone(playerlist_module._normalized_field_name("tok%3Aen"))
+        self.assertIsNone(playerlist_module._normalized_field_name("a/b"))
         # Plain names still decode to themselves.
-        self.assertEqual(playerlist_module._normalised_field_name("access_token"), "access_token")
-        self.assertEqual(playerlist_module._normalised_field_name("to%0Aken"), "token")
+        self.assertEqual(playerlist_module._normalized_field_name("access_token"), "access_token")
+        self.assertEqual(playerlist_module._normalized_field_name("to%0Aken"), "token")
 
     def test_an_encoded_benign_key_is_left_alone(self):
         for value in ("?q=hello", "?ref=ma%69n", "/a%20b/list.json"):
@@ -529,6 +552,64 @@ class DisplayPathTests(unittest.TestCase):
                 shown = display_path(value)
                 self.assertNotIn(secret, shown)
                 self.assertIn("REDACTED", shown)
+
+    def test_a_quoted_secret_is_redacted_whole_even_when_it_holds_a_delimiter(self):
+        """A quoted value runs to its closing quote, not to the first space or
+        comma inside it. Scanning it as though it were unquoted would stop at
+        the delimiter and leave the tail of the secret -- and a stray quote --
+        in the message.
+        """
+        for value, expected in (
+            ('password="a b"', "password=REDACTED"),
+            ("token='a,b'", "token=REDACTED"),
+            ('secret="a;b"', "secret=REDACTED"),
+            ('api_key="a&b"', "api_key=REDACTED"),
+            ('password="a\tb"', "password=REDACTED"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(display_path(value), expected)
+
+    def test_a_backslash_escape_does_not_end_a_quoted_secret_early(self):
+        """An escaped quote is part of the value; an escaped backslash is not an
+        escape for the quote that follows it. Getting either wrong ends the
+        value at the wrong character and prints the rest of the secret.
+        """
+        for value, expected in (
+            ('token="a\\"b c"', "token=REDACTED"),
+            ('key:"a\\\\".', "key:REDACTED."),
+            ("token='\\\\'&z=1", "token=REDACTED&z=1"),
+            ('api_key="a\\\\\\\\"', "api_key=REDACTED"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(display_path(value), expected)
+
+    def test_an_unterminated_quoted_secret_is_redacted_to_the_end(self):
+        """A value whose quote never closes runs to the end of the text, and it
+        stays a QUOTED span: the trailing-punctuation rule that would hand back
+        a final ``.`` or ``!`` applies to bare values only. Treating the span as
+        bare here would print the last character of the secret.
+        """
+        for value, expected in (
+            ('key:"abc.', "key:REDACTED"),
+            ('token="secret!', "token=REDACTED"),
+            ('password="a b.', "password=REDACTED"),
+            ("api_key='x,", "api_key=REDACTED"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(display_path(value), expected)
+
+    def test_an_unquoted_secret_ends_at_the_delimiter_and_keeps_the_rest(self):
+        """The counterpart to the quoted cases: a bare value stops at the first
+        delimiter, and whatever follows it is ordinary text that must survive.
+        """
+        for value, expected in (
+            ("api_key=a)b more", "api_key=REDACTED more"),
+            ("token=a,b", "token=REDACTED,b"),
+            ('token="x".', "token=REDACTED."),
+            ("password:''.", "password:REDACTED."),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(display_path(value), expected)
 
     def test_ordinary_english_after_bearer_or_basic_is_not_redacted(self):
         # These words are ordinary English, and this redactor runs over player
@@ -593,6 +674,62 @@ class DisplayPathTests(unittest.TestCase):
                 if secret:
                     self.assertNotIn(secret, shown)
 
+    def test_a_credential_name_spelled_as_character_references_is_still_matched(self):
+        """``&#116;&#111;&#107;&#101;&#110;`` is ``token``, and matched no field name.
+
+        Percent-encoding of the same trick was already decoded before matching.
+        A database value carrying this reached the console -- and so a public
+        job log -- with the secret intact.
+        """
+        secret = "ENTITY_NAME_SECRET"
+        for value in (
+            f"https://h.invalid/p?&#116;&#111;&#107;&#101;&#110;={secret}",
+            f"https://h.invalid/p?&#x74;&#x6f;&#x6b;&#x65;&#x6e;={secret}",
+            f"https://h.invalid/p?&amp;#116;&amp;#111;&amp;#107;&amp;#101;&amp;#110;={secret}",
+        ):
+            with self.subTest(value=value):
+                shown = redact_diagnostic_text(value)
+                self.assertNotIn(secret, shown)
+                self.assertIn("REDACTED", shown)
+
+    def test_character_references_in_ordinary_text_are_left_as_the_author_wrote_them(self):
+        """Only a reference that *hides a credential* may change the spelling."""
+        for value in ("a &amp; b", "Tom &lt;3", "see &#9731; snowman", "&amp;&amp;&amp;"):
+            with self.subTest(value=value):
+                self.assertEqual(redact_diagnostic_text(value), value)
+
+    def test_decoding_stops_at_the_depth_limit_without_rewriting_harmless_text(self):
+        """``&amp;amp;...`` peels one layer per pass and never reveals a secret.
+
+        The decode loop has to end somewhere; when it ends by exhausting the
+        limit rather than by settling, the text the author wrote is what gets
+        printed -- there is no credential here to justify a different spelling.
+        """
+        nested = "&" + "amp;" * (playerlist_module._MAX_DIAGNOSTIC_DECODE_DEPTH + 4) + "x"
+        self.assertEqual(redact_diagnostic_text(nested), nested)
+
+    def test_a_blank_in_userinfo_cannot_hide_a_password_from_a_diagnostic(self):
+        """A blank ends the single-token scan before its ``@``; the span must still go.
+
+        This is the diagnostic twin of ``sources._SPLIT_USERINFO_IN_TEXT``: an
+        unusable database value is previewed into the log, so the same shapes
+        have to be caught here.
+        """
+        secret = "DIAGNOSTIC_BLANK_USERINFO_SECRET"
+        for blank in (" ", "\t", "\n", "\r"):
+            for template in (
+                f"https://u x:{secret}@h.invalid/p",
+                f"https:u x:{secret}@h.invalid/p",
+                f"//u x:{secret}@h.invalid/p",
+                f"https://u x%3a{secret}%40h.invalid/p",
+                f"https://u x:{secret}%2540h.invalid/p",
+            ):
+                value = template.replace(" ", blank)
+                with self.subTest(value=value):
+                    shown = redact_diagnostic_text(value)
+                    self.assertNotIn(secret, shown)
+                    self.assertIn("REDACTED", shown)
+
     def test_a_path_that_is_not_a_string_still_works(self):
         self.assertEqual(display_path(Path("/tmp/x.json")), "/tmp/x.json")
 
@@ -639,7 +776,7 @@ class ValidateTests(unittest.TestCase):
             {
                 "players": [
                     {"steamid": "x\n### fake heading\x1b[32m", "attributes": []},
-                    {"steamid": "[U:1:2]", "attributes": ["scammer\nINFO: all good\x1b[0m"]},
+                    {"steamid": "[U:1:2]", "attributes": ["not-a-real-attribute\nINFO: all good\x1b[0m"]},
                 ]
             }
         )
@@ -737,9 +874,164 @@ class ValidateTests(unittest.TestCase):
                 self.assertIn("has no attributes", result.errors[0])
 
     def test_unknown_attribute_is_only_a_warning(self):
-        result = validate({"players": [{"steamid": "[U:1:1]", "attributes": ["scammer"]}]})
+        # Any string that is not one of KNOWN_ATTRIBUTES will do; it is spelled
+        # out here so nobody mistakes it for a tag this project recognises.
+        result = validate({"players": [{"steamid": "[U:1:1]", "attributes": ["not-a-real-attribute"]}]})
         self.assertEqual(result.errors, [])
         self.assertEqual(len(result.warnings), 1)
+
+
+class DeclaredSchemaTests(unittest.TestCase):
+    """The playerlist files name a TF2BD schema; warn where they do not meet it.
+
+    ``normalize_steamid`` reads legacy and SteamID64 spellings on purpose, so
+    an upstream list in any format can be matched. A database that *stores*
+    one of those spellings still loads here but fails validation in an editor
+    pointed at the schema the file itself declares. Every check below is a
+    warning: none of them stops a sync.
+    """
+
+    def _only_warnings(self, entry):
+        result = validate({"players": [entry]})
+        self.assertEqual(result.errors, [], "a shape issue must never block a sync")
+        return result.warnings
+
+    def test_a_steamid_spelling_the_schema_rejects_is_flagged(self):
+        for spelling in (
+            "STEAM_0:1:123",
+            "STEAM_1:0:456",
+            "76561197960531246",
+            "https://steamcommunity.com/profiles/76561197960531246",
+            "U:1:123",
+        ):
+            with self.subTest(steamid=spelling):
+                warnings = self._only_warnings({"steamid": spelling, "attributes": ["cheater"]})
+                self.assertTrue(
+                    any("declared schema rejects" in w for w in warnings),
+                    f"{spelling} is stored in a form the schema forbids: {warnings}",
+                )
+
+    def test_the_canonical_spellings_are_not_flagged(self):
+        for spelling in ("[U:1:123]", "[U:1:123:2]", 76561197960531246):
+            with self.subTest(steamid=spelling):
+                self.assertEqual(self._only_warnings({"steamid": spelling, "attributes": ["cheater"]}), [])
+
+    def test_a_non_player_account_type_stays_a_hard_error(self):
+        """Here the tool is deliberately stricter than the schema it declares.
+
+        The schema's SteamID pattern accepts any letter, so ``[G:1:4]`` (a
+        group) and ``[A:1:4]`` (an anonymous account) satisfy it. Neither is a
+        player, so neither belongs in a playerlist, and the tool cannot reason
+        about an entry it cannot resolve to a person: that is an error that
+        stops the run, not a cosmetic warning.
+        """
+        for spelling in ("[A:1:123]", "[G:1:123]", "[C:1:123]", "[P:1:123]"):
+            with self.subTest(steamid=spelling):
+                result = validate({"players": [{"steamid": spelling, "attributes": ["cheater"]}]})
+                self.assertEqual(len(result.errors), 1, result.errors)
+                self.assertIn("unusable steamid", result.errors[0])
+
+    def test_an_unusable_steamid_is_one_complaint_not_two(self):
+        """The error already names the field; a spelling warning adds nothing.
+
+        One problem per field is the rule the rest of the validator follows.
+        """
+        for spelling in ("not-a-steamid", "", "-5", "[G:1:123]", 0, {"a": 1}, []):
+            with self.subTest(steamid=spelling):
+                result = validate({"players": [{"steamid": spelling, "attributes": ["cheater"]}]})
+                self.assertEqual(len(result.errors), 1, result.errors)
+                self.assertEqual(result.warnings, [], "the error already covers this field")
+
+    def test_a_steamid_warning_names_the_canonical_form_to_use(self):
+        (warning,) = self._only_warnings({"steamid": "STEAM_0:1:123", "attributes": ["cheater"]})
+        self.assertIn("expected [U:1:247]", warning)
+
+    def test_last_seen_must_carry_an_integer_time(self):
+        for last_seen in ({"player_name": "x"}, {"time": "1"}, {"time": 1.5}, {"time": True}, {"time": None}):
+            with self.subTest(last_seen=last_seen):
+                warnings = self._only_warnings(
+                    {"steamid": "[U:1:1]", "attributes": ["cheater"], "last_seen": last_seen}
+                )
+                self.assertTrue(any("integer 'time'" in w for w in warnings), warnings)
+
+    def test_a_well_formed_last_seen_is_silent(self):
+        for last_seen in ({"time": 1}, {"time": 1, "player_name": "x"}, {"time": 0}):
+            with self.subTest(last_seen=last_seen):
+                self.assertEqual(
+                    self._only_warnings({"steamid": "[U:1:1]", "attributes": ["cheater"], "last_seen": last_seen}),
+                    [],
+                )
+
+    def test_a_non_string_player_name_is_flagged_but_still_renders(self):
+        """The report prints whatever is there; the schema still wants a string."""
+        for value in (7, None, ["x"], {"a": 1}, True):
+            with self.subTest(player_name=value):
+                entry = {
+                    "steamid": "[U:1:1]",
+                    "attributes": ["cheater"],
+                    "last_seen": {"time": 1, "player_name": value},
+                }
+                warnings = self._only_warnings(entry)
+                self.assertTrue(any("non-string 'last_seen.player_name'" in w for w in warnings), warnings)
+                playerlist_module.player_name(entry)
+
+    def test_unexpected_keys_are_named(self):
+        warnings = self._only_warnings(
+            {"steamid": "[U:1:1]", "attributes": ["cheater"], "notes": "x", "last_seen": {"time": 1, "zz": 2}}
+        )
+        self.assertTrue(any("unexpected key: 'notes'" in w for w in warnings), warnings)
+        self.assertTrue(any("unexpected 'last_seen' key: 'zz'" in w for w in warnings), warnings)
+
+    def test_a_missing_last_seen_is_fine(self):
+        """It is optional in the schema, and most of a hand-built list omits it."""
+        self.assertEqual(self._only_warnings({"steamid": "[U:1:1]", "attributes": ["cheater"]}), [])
+
+    def test_a_malformed_last_seen_does_not_also_crash_the_name_lookup(self):
+        for last_seen in ("nope", 7, None, []):
+            with self.subTest(last_seen=last_seen):
+                entry = {"steamid": "[U:1:1]", "attributes": ["cheater"], "last_seen": last_seen}
+                self.assertTrue(self._only_warnings(entry))
+                self.assertEqual(playerlist_module.player_name(entry), "")
+
+
+class ShippedDataMatchesItsDeclaredSchemaTests(unittest.TestCase):
+    """The file the bot writes must satisfy the schema it points at.
+
+    The bot only ever rewrites ``attributes``, so a violation here means a
+    hand edit introduced one. Catching it in CI is the whole point: the
+    maintainer's editor would show it, but a commit need not go through one.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    # Only the file the bot actually syncs. The other lists in this repository
+    # are the maintainer's to edit freely; nothing here may fail because of one.
+    DATABASE = "playerlist.garou3299.json"
+    SCHEMA_URL = "https://raw.githubusercontent.com/PazerOP/tf2_bot_detector/master/schemas/v3/playerlist.schema.json"
+    # The v3 playerlist schema sets additionalProperties:false at the top level.
+    TOP_LEVEL_KEYS = frozenset({"$schema", "file_info", "players"})
+
+    def _load(self):
+        return json.loads((self.ROOT / self.DATABASE).read_text(encoding="utf-8"))
+
+    def test_the_database_declares_the_schema_it_is_written_against(self):
+        """``$schema`` is required, and it is what makes the file self-describing.
+
+        ``validate()`` cannot own this rule: nearly every fixture in this suite
+        is a bare ``{"players": [...]}``, and warning there would be noise in
+        636 tests to catch one edit to one real file. Guard the real file.
+        """
+        self.assertEqual(self._load().get("$schema"), self.SCHEMA_URL)
+
+    def test_the_database_carries_no_top_level_key_the_schema_forbids(self):
+        self.assertEqual(set(self._load()) - self.TOP_LEVEL_KEYS, set())
+
+    def test_the_database_has_a_players_array(self):
+        self.assertIsInstance(self._load().get("players"), list)
+
+    def test_the_synced_database_has_no_schema_warnings_at_all(self):
+        result = validate(self._load())
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.warnings, [], "the file declares a schema it no longer matches")
 
 
 if __name__ == "__main__":

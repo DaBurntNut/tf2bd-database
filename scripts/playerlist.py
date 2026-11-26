@@ -1,6 +1,6 @@
 """TF2BD playerlist file format helpers.
 
-Handles SteamID normalisation, reading/writing playerlist JSON, validation,
+Handles SteamID normalization, reading/writing playerlist JSON, validation,
 sorting and attribute ordering. Nothing here knows about the Vorobey
 hackerpolice list.
 """
@@ -14,6 +14,7 @@ import math
 import os
 import re
 import stat
+import unicodedata
 import urllib.parse
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -53,17 +54,54 @@ _PROFILE_URL_RE = re.compile(
 
 # Bound untrusted values included in validation messages.
 MAX_SHOWN_VALUE_CHARS = 120
-# Bound integer formatting before building diagnostic previews.
+# Bound integer formatting before building diagnostic previews: converting a
+# very large int to decimal costs quadratic time, so one is described rather
+# than rendered. Four bits per character over-estimates the ~3.32 a decimal
+# digit really needs, which keeps the guard on the safe side -- no value that
+# could fit the preview is rejected by it.
 _MAX_SHOWN_INT_BITS = MAX_SHOWN_VALUE_CHARS * 4
 MAX_VALIDATION_MESSAGES = 100
 
+# CPython refuses to build an int from more than 4,300 digits by default; cap
+# the text before ``int()`` so the limit is ours and not a version-dependent
+# ValueError. See sys.set_int_max_str_digits.
+MAX_JSON_INT_DIGITS = 4_300
+# A Steam account id is a 32-bit value, so it never needs more than 10 digits.
+MAX_ACCOUNT_ID_DIGITS = 10
+# Below this length a mixed-case blob is an ordinary word, not a credential.
+MIN_OPAQUE_CREDENTIAL_CHARS = 12
+
+# The playerlist files declare the TF2BD v3 schema, and that schema is stricter
+# about shape than this tool needs to be about meaning. normalize_steamid
+# deliberately reads legacy and SteamID64 spellings so an upstream list in any
+# format can be matched, but a file that *stores* one of those spellings is
+# rejected by the editor validating against the declared schema. Warn, never
+# fail: the sync itself works fine either way.
+SCHEMA_STEAMID = re.compile(r"\[[A-Za-z]:\d:\d+(?::\d+)?\]")
+SCHEMA_LAST_SEEN_KEYS = frozenset({"player_name", "time"})
+SCHEMA_ENTRY_KEYS = frozenset({"attributes", "last_seen", "proof", "steamid"})
+
+# Substrings that make a field or query-parameter name look like a credential.
+#
+# This is the single vocabulary both redactors share: ``sources`` applies it to
+# URL query names and this module applies it to free-form diagnostic text. Two
+# hand-maintained copies drifted apart once already (``key``, ``pass`` and
+# ``passphrase`` were redacted in URLs but printed in diagnostics), so the list
+# lives here, in the module both importers depend on.
+#
+# Matching is deliberately by substring, so ``pass`` also covers ``password``,
+# ``passwd`` and ``passphrase``, and ``key`` covers ``api_key``, ``ssh-key`` and
+# ``appkey``. That over-matches ordinary words such as ``monkey``: a redundant
+# ``REDACTED`` costs nothing, while a missed credential cannot be recalled once
+# it is in a public log.
+CREDENTIAL_NAME_MARKERS = (
+    r"token|secret|pass|pwd|auth|credential|session|sid|cookie|csrf|xsrf|code|sig|key|"
+    r"jwt|bearer|hmac|nonce|state|ticket|otp|mfa|assertion|saml|x-amz|x-goog"
+)
+
 # Diagnostics can contain free-form values, not just URLs. Redact common
 # credential fields and authorization headers even when they appear in prose.
-_DIAGNOSTIC_SECRET_MARKER = re.compile(
-    r"token|secret|password|passwd|pwd|auth|credential|session|sid|cookie|csrf|xsrf|code|sig|"
-    r"api[_-]?key|private[_-]?key|access[_-]?key|jwt|bearer|signature|hmac|nonce|state|ticket|otp|mfa",
-    re.IGNORECASE | re.ASCII,
-)
+_DIAGNOSTIC_SECRET_MARKER = re.compile(CREDENTIAL_NAME_MARKERS, re.IGNORECASE | re.ASCII)
 _DIAGNOSTIC_FIELD_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
 _DIAGNOSTIC_VALUE_DELIMITERS = frozenset(",;&\r\n\t ")
 _AUTHORIZATION_HEADER = re.compile(r"(?i)(?P<header>\b(?:proxy-)?authorization\s*:\s*)[^\r\n]*", re.ASCII)
@@ -79,7 +117,18 @@ _CREDENTIAL_CHARS = re.compile(r"[0-9_\-./+=:~]", re.ASCII)
 # Also sanitize URL userinfo when the generic path formatter is used directly.
 _URL_USERINFO_PREFIX = re.compile(r"(?:https?:/{0,4}|//)", re.IGNORECASE | re.ASCII)
 _URL_USERINFO_IN_TEXT = re.compile(
-    r"(?P<prefix>(?:https?:/{0,4}|//))[^/\s?#<>\"'`@]*@",
+    r"(?P<prefix>(?:https?:/{0,4}|//))[^/\s?#<>\"'`@]*(?:@|%(?:25)*40)",
+    re.IGNORECASE | re.ASCII,
+)
+# The pattern above reads a URL as one token, so a blank inside the userinfo
+# ends the run before the ``@`` and the credential survives -- the same hole
+# ``sources._SPLIT_USERINFO_IN_TEXT`` closes for prose, reached here through
+# the diagnostic preview of an unusable database value (which lands in a
+# public job log). The run before the break character must itself exclude
+# break characters: letting a blank match either the class or the repeat
+# costs cubic time on a long run with no closing ``@``.
+_SPLIT_USERINFO_IN_DIAGNOSTIC = re.compile(
+    r"(?P<prefix>(?:https?:/{0,4}|//))[^/@?#<>\"'`\s]*[<>\"'`\s][^/@?#]*(?:@|%(?:25)*40)",
     re.IGNORECASE | re.ASCII,
 )
 # Identify nested percent-encoded URL schemes before they are clipped out of view.
@@ -88,8 +137,6 @@ _PERCENT_ESCAPE_IN_TEXT = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
 _PERCENT_ESCAPE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
 # Field names keep plain characters plus percent escapes and HTML references.
 _FIELD_NAME_CHARS = re.compile(r"[A-Za-z0-9_.%-]+", re.ASCII)
-# Control and zero-width characters that servers ignore when matching a name.
-_INVISIBLE_IN_FIELD_NAME = re.compile("[\x00-\x20\x7f-\x9f\u200b-\u200f\u2028-\u202f\u2060\ufeff]", re.ASCII)
 # A query-style pair anywhere in free text: find the name, then its value.
 _QUERY_PAIR_IN_TEXT = re.compile(r"[?&#;](?P<name>[^\s=&?#;]+)=(?P<value>[^\s&;#]*)", re.ASCII)
 _MAX_DIAGNOSTIC_DECODE_DEPTH = 8
@@ -97,13 +144,32 @@ _MAX_DIAGNOSTIC_DECODE_DEPTH = 8
 SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
 
-def _normalised_field_name(name: str) -> str | None:
+def fold_name_for_matching(name: str) -> str:
+    """Fold a field or query-parameter name to the spelling a matcher should see.
+
+    Compatibility normalization first, so full-width and look-alike spellings
+    (``\uff54oken``, ``\u212aey``, ``\u017fecret``) collapse onto the ASCII letters they
+    imitate, then every control, format and separator character is dropped -
+    by Unicode category, so a newly assigned invisible character is covered
+    the day it exists rather than whenever the list is next updated. An
+    enumerated list of such characters used to be maintained by hand and
+    omitted U+00AD SOFT HYPHEN, so ``to<shy>ken=`` walked straight past the
+    diagnostic redactor while the same name was caught inside a URL.
+
+    Shared with ``sources`` so a name cannot be sensitive in a URL and
+    harmless in a diagnostic.
+    """
+    folded = unicodedata.normalize("NFKC", name)
+    return "".join(char for char in folded if unicodedata.category(char)[0] not in {"C", "Z"}).casefold()
+
+
+def _normalized_field_name(name: str) -> str | None:
     """Decode an obfuscated field name, or ``None`` if it is not a plain name.
 
     A query key can percent-encode its separator (``to%0Aken``), use HTML
     character references, or carry invisible characters a server strips before
     looking the credential up. Redaction has to be at least as permissive as
-    that normalisation, or the encoded spelling quietly walks past it.
+    that normalization, or the encoded spelling quietly walks past it.
     """
     decoded = name
     for _ in range(_MAX_DIAGNOSTIC_DECODE_DEPTH):
@@ -115,7 +181,7 @@ def _normalised_field_name(name: str) -> str | None:
         # Still decoding at the depth limit. Fail closed rather than match on a
         # spelling that is not the one a server would end up with.
         return None
-    decoded = _INVISIBLE_IN_FIELD_NAME.sub("", decoded)
+    decoded = fold_name_for_matching(decoded)
     if not _FIELD_NAME_CHARS.fullmatch(decoded):
         # It decodes to something that is not a field name any more (an embedded
         # URL, say). Fail closed instead of guessing what a server would do.
@@ -129,8 +195,72 @@ def _is_secret_field_name(name: str) -> bool:
         return False
     if _DIAGNOSTIC_SECRET_MARKER.search(name) is not None:
         return True
-    normalised = _normalised_field_name(name)
-    return normalised is not None and _DIAGNOSTIC_SECRET_MARKER.search(normalised) is not None
+    normalized = _normalized_field_name(name)
+    return normalized is not None and _DIAGNOSTIC_SECRET_MARKER.search(normalized) is not None
+
+
+def _names_a_secret_before(value: str, separator: int) -> bool:
+    """True when the field name ending at ``separator`` is a credential name.
+
+    Reads backwards over any blanks, one optional quote, then the run of
+    characters a field name may use, so ``"api_key" : x`` is recognised as
+    readily as ``api_key=x``.
+    """
+    key_end = separator
+    while key_end and value[key_end - 1].isspace():
+        key_end -= 1
+    if key_end and value[key_end - 1] in "'\"":
+        key_end -= 1
+    key_start = key_end
+    while key_start and value[key_start - 1] in _DIAGNOSTIC_FIELD_CHARS:
+        key_start -= 1
+    return _is_secret_field_name(value[key_start:key_end])
+
+
+def _unquoted_value_end(value: str, start: int) -> int:
+    """Index just past a bare value: everything up to the next delimiter."""
+    end = start
+    while end < len(value) and value[end] not in _DIAGNOSTIC_VALUE_DELIMITERS:
+        end += 1
+    return end
+
+
+def _quoted_value_end(value: str, start: int, quote: str) -> int:
+    """Index just past a quoted value, honouring backslash escapes."""
+    end = start + 1
+    escaped = False
+    while end < len(value):
+        char = value[end]
+        end += 1
+        if char == quote and not escaped:
+            break
+        escaped = char == "\\" and not escaped
+        if char != "\\":
+            escaped = False
+    return end
+
+
+def _secret_value_span(value: str, separator: int) -> tuple[int, int, bool] | None:
+    """Locate the value after ``separator`` as ``(start, end, quoted)``.
+
+    ``None`` means there is no value to redact -- the text ended, or the next
+    character already delimits the next field.
+    """
+    start = separator + 1
+    while start < len(value) and value[start].isspace():
+        start += 1
+    if start == len(value) or value[start] in _DIAGNOSTIC_VALUE_DELIMITERS:
+        return None
+    quote = value[start] if value[start] in "'\"" else ""
+    if not quote:
+        return start, _unquoted_value_end(value, start), False
+    end = _quoted_value_end(value, start, quote)
+    if end - start == 2:
+        # An empty quoted body, as in ``password=''SECRET``. Redacting the
+        # empty body would leave the secret itself in the message, so treat
+        # the pair as unquoted and take everything up to the delimiter.
+        return start, _unquoted_value_end(value, start), False
+    return start, end, True
 
 
 def _redact_diagnostic_secret_pairs(value: str) -> str:
@@ -139,57 +269,18 @@ def _redact_diagnostic_secret_pairs(value: str) -> str:
     copied_through = 0
     separator = 0
     while separator < len(value):
-        if value[separator] not in "=:":
+        if value[separator] not in "=:" or not _names_a_secret_before(value, separator):
             separator += 1
             continue
-
-        key_end = separator
-        while key_end and value[key_end - 1].isspace():
-            key_end -= 1
-        quote = value[key_end - 1] if key_end and value[key_end - 1] in "'\"" else ""
-        if quote:
-            key_end -= 1
-        key_start = key_end
-        while key_start and value[key_start - 1] in _DIAGNOSTIC_FIELD_CHARS:
-            key_start -= 1
-        if not _is_secret_field_name(value[key_start:key_end]):
+        span = _secret_value_span(value, separator)
+        if span is None:
             separator += 1
             continue
-        value_start = separator + 1
-        while value_start < len(value) and value[value_start].isspace():
-            value_start += 1
-        if value_start == len(value) or value[value_start] in _DIAGNOSTIC_VALUE_DELIMITERS:
-            separator += 1
-            continue
+        value_start, value_end, quoted = span
 
-        value_end = value_start
-        value_quote = value[value_start] if value[value_start] in "'\"" else ""
-        if value_quote:
-            value_end += 1
-            escaped = False
-            while value_end < len(value):
-                char = value[value_end]
-                value_end += 1
-                if char == value_quote and not escaped:
-                    break
-                escaped = char == "\\" and not escaped
-                if char != "\\":
-                    escaped = False
-            if value_end - value_start == 2:
-                # An empty quoted body, as in ``password=''SECRET``. Redacting the
-                # empty body would leave the secret itself in the message, so treat
-                # the pair as unquoted and take everything up to the delimiter.
-                value_quote = ""
-                value_end = value_start
-                while value_end < len(value) and value[value_end] not in _DIAGNOSTIC_VALUE_DELIMITERS:
-                    value_end += 1
-        else:
-            while value_end < len(value) and value[value_end] not in _DIAGNOSTIC_VALUE_DELIMITERS:
-                value_end += 1
-
-        raw_value = value[value_start:value_end]
         trailing = ""
-        if not value_quote:
+        if not quoted:
+            raw_value = value[value_start:value_end]
             unpunctuated = raw_value.rstrip(".,:!?)]}>")
             if unpunctuated:
                 trailing = raw_value[len(unpunctuated) :]
@@ -233,7 +324,7 @@ def _looks_like_credential(token: str, separator: str) -> bool:
     Both words are ordinary English (``Bearer of bad news``, ``Basic
     Instinct``), and this redactor runs over player names on their way into the
     published report, so redacting unconditionally would rename innocent
-    players in the output. A credential is recognised by its shape instead:
+    players in the output. A credential is recognized by its shape instead:
 
     - an explicit separator (``Bearer = ...``, ``Bearer: ...``) always wins,
       because prose does not write one there;
@@ -247,7 +338,11 @@ def _looks_like_credential(token: str, separator: str) -> bool:
         return True
     # No digits or punctuation: only a long mixed-case blob is a credential. An
     # ordinary word ("of", "Instinct", "King") has neither.
-    return len(token) >= 12 and any(c.isupper() for c in token) and any(c.islower() for c in token)
+    return (
+        len(token) >= MIN_OPAQUE_CREDENTIAL_CHARS
+        and any(c.isupper() for c in token)
+        and any(c.islower() for c in token)
+    )
 
 
 def _redact_bearer_match(match: re.Match[str]) -> str:
@@ -258,12 +353,41 @@ def _redact_bearer_match(match: re.Match[str]) -> str:
     return f"{match.group('scheme')} REDACTED"
 
 
-def redact_diagnostic_text(value: str) -> str:
-    """Redact common bare secrets, authorization headers, and URL userinfo."""
+def _redact_literal_diagnostic_text(value: str) -> str:
+    """Redact the text exactly as written, without decoding any spelling of it."""
     value = _AUTHORIZATION_HEADER.sub(r"\g<header>REDACTED", value)
     value = _BEARER_CREDENTIAL.sub(_redact_bearer_match, value)
+    # Drop a blank-split userinfo span whole before the single-token pattern runs.
+    value = _SPLIT_USERINFO_IN_DIAGNOSTIC.sub(r"\g<prefix>REDACTED@", value)
     value = _URL_USERINFO_IN_TEXT.sub(r"\g<prefix>REDACTED@", value)
     return _redact_encoded_query_pairs(_redact_diagnostic_secret_pairs(value))
+
+
+def redact_diagnostic_text(value: str) -> str:
+    """Redact common bare secrets, authorization headers, and URL userinfo.
+
+    A credential's *field name* can be spelled with HTML character references
+    (``&#116;&#111;&#107;&#101;&#110;=SECRET``), which matches no field name
+    this module knows -- so the secret was printed verbatim into diagnostics,
+    and from there into a public job log. Percent-encoding of the same trick
+    was already decoded before matching; character references now are too.
+
+    Each decoded layer is inspected in turn and the first one that reveals a
+    credential wins, because decoding can expose a different secret at each
+    level. Text whose decoded view needs no redaction keeps the spelling the
+    caller wrote: a benign ``&amp;`` in a player name is not rewritten.
+    """
+    shown = _redact_literal_diagnostic_text(value)
+    decoded = value
+    for _ in range(_MAX_DIAGNOSTIC_DECODE_DEPTH):
+        step = html.unescape(decoded)
+        if step == decoded:
+            break
+        decoded = step
+        from_entities = _redact_literal_diagnostic_text(decoded)
+        if from_entities != decoded:
+            return from_entities
+    return shown
 
 
 def _redact_diagnostic_preview(value: str, limit: int) -> str:
@@ -463,9 +587,39 @@ def _bounded_int(digits: str) -> int | None:
     if not (digits.isascii() and digits.isdigit()):
         return None
     significant = digits.lstrip("0") or "0"
-    if len(significant) > 10:
+    if len(significant) > MAX_ACCOUNT_ID_DIGITS:
         return None
     return int(significant)
+
+
+def _canonical_account(account: int | None) -> str | None:
+    """Format an account id, rejecting zero and anything outside the 32-bit range."""
+    if account is None or not 0 < account < MAX_ACCOUNT_ID:
+        return None
+    return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+
+
+def _canonical_from_int(value: int) -> str | None:
+    """A bare integer is an account id when it is in range, and a SteamID64 otherwise."""
+    account = value if 0 < value < MAX_ACCOUNT_ID else _account_from_steamid64(value)
+    return _canonical_account(account)
+
+
+def _canonical_from_instance(match: re.Match[str]) -> str | None:
+    """``[U:1:account:instance]`` -- the instance field is 20 bits wide."""
+    instance = _bounded_int(match.group(2))
+    if instance is None or instance >= MAX_STEAMID_INSTANCE:
+        return None
+    return _canonical_account(_bounded_int(match.group(1)))
+
+
+def _canonical_from_steam2(match: re.Match[str]) -> str | None:
+    """``STEAM_X:Y:Z`` encodes the account id as ``2 * Z + Y``."""
+    auth_server, account_half = match.groups()
+    half = _bounded_int(account_half)
+    if half is None:
+        return None
+    return _canonical_account(half * 2 + int(auth_server))
 
 
 def normalize_steamid(value: Any) -> str | None:
@@ -478,11 +632,8 @@ def normalize_steamid(value: Any) -> str | None:
     """
     if isinstance(value, bool):  # bool is an int subclass, but not a SteamID.
         return None
-
     if isinstance(value, int):
-        account = value if 0 < value < MAX_ACCOUNT_ID else _account_from_steamid64(value)
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
-
+        return _canonical_from_int(value)
     if not isinstance(value, str):
         return None
 
@@ -490,49 +641,30 @@ def normalize_steamid(value: Any) -> str | None:
     for pattern in (_U_RE, _U_BARE_RE):
         match = pattern.match(text)
         if match:
-            account = _bounded_int(match.group(1))
-            # Reject zero and values outside the 32-bit account-ID range.
-            if account is None or not 0 < account < MAX_ACCOUNT_ID:
-                return None
-            return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+            return _canonical_account(_bounded_int(match.group(1)))
 
     match = _U_INSTANCE_RE.match(text)
     if match:
-        account = _bounded_int(match.group(1))
-        instance = _bounded_int(match.group(2))
-        # The instance field is 20 bits; reject out-of-range values before canonicalizing.
-        if account is None or not 0 < account < MAX_ACCOUNT_ID or instance is None or instance >= MAX_STEAMID_INSTANCE:
-            return None
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+        return _canonical_from_instance(match)
 
     match = _STEAM2_RE.match(text)
     if match:
-        # STEAM_X:Y:Z encodes the account ID as 2 * Z + Y.
-        auth_server, account_half = match.groups()
-        half = _bounded_int(account_half)
-        if half is None:
-            return None
-        account = half * 2 + int(auth_server)
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if 0 < account < MAX_ACCOUNT_ID else None
+        return _canonical_from_steam2(match)
 
     if _STEAMID64_RE.match(text):
-        account = _account_from_steamid64(int(text))
-        if account is not None:
-            return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+        canonical = _canonical_account(_account_from_steamid64(int(text)))
+        # Not a return: a 17-digit string below the SteamID64 base is not a
+        # SteamID64 at all, and may still be a zero-padded account id below.
+        if canonical is not None:
+            return canonical
 
     if text.isascii() and text.isdigit():
-        # Accept bare account IDs as strings as well as integers. A 17-digit
-        # string below the SteamID64 base reaches here and may be a zero-padded
-        # account ID, which the range check below still has to validate.
-        account = _bounded_int(text)
-        if account is None or not 0 < account < MAX_ACCOUNT_ID:
-            return None
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}"
+        # Accept bare account IDs as strings as well as integers.
+        return _canonical_account(_bounded_int(text))
 
     match = _PROFILE_URL_RE.fullmatch(text)
     if match:
-        account = _account_from_steamid64(int(match.group(1)))
-        return f"{CANONICAL_PREFIX}{account}{CANONICAL_SUFFIX}" if account else None
+        return _canonical_account(_account_from_steamid64(int(match.group(1))))
 
     return None
 
@@ -596,7 +728,10 @@ def player_name(player: Player) -> str:
 
 
 def _player_sort_key(player: Player) -> tuple[bool, int]:
-    # Invalid entries sort last; stable sorting preserves their input order.
+    """Order players by account id, with unreadable entries kept last.
+
+    Invalid entries sort last; stable sorting preserves their input order.
+    """
     account = account_id(player.get("steamid")) if isinstance(player, dict) else None
     return (account is None, account or 0)
 
@@ -620,10 +755,10 @@ def order_attributes(attributes: Iterable[str]) -> list[str]:
 
 
 def dumps(database: PlayerList) -> str:
-    """Serialise a playerlist exactly like the committed file.
+    """Serialize a playerlist exactly like the committed file.
 
     Tab indentation, alphabetically sorted keys, ASCII escapes and a trailing
-    newline: re-serialising an untouched file produces byte-identical output.
+    newline: re-serializing an untouched file produces byte-identical output.
     """
     return json.dumps(database, indent="\t", sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
 
@@ -656,8 +791,8 @@ def _reject_out_of_range_float(text: str) -> float:
 
 def _parse_json_int(text: str) -> int:
     """Parse a JSON integer with a fixed digit cap across supported Python versions."""
-    digits = text[1:] if text.startswith("-") else text
-    if len(digits) > 4_300:
+    digits = text.removeprefix("-")
+    if len(digits) > MAX_JSON_INT_DIGITS:
         raise _StrictJSONError(f"{_shown(text)} is out of range for a JSON integer")
     return int(text)
 
@@ -746,12 +881,14 @@ class ValidationResult:
     warnings_omitted: int = 0
 
     def add_error(self, message: str) -> None:
+        """Record an error, counting rather than keeping it past the cap."""
         if len(self.errors) < MAX_VALIDATION_MESSAGES:
             self.errors.append(message)
         else:
             self.errors_omitted += 1
 
     def add_warning(self, message: str) -> None:
+        """Record a warning, counting rather than keeping it past the cap."""
         if len(self.warnings) < MAX_VALIDATION_MESSAGES:
             self.warnings.append(message)
         else:
@@ -759,14 +896,63 @@ class ValidationResult:
 
     @property
     def error_count(self) -> int:
+        """Every error seen, including those dropped at the cap."""
         return len(self.errors) + self.errors_omitted
 
     @property
     def warning_count(self) -> int:
+        """Every warning seen, including those dropped at the cap."""
         return len(self.warnings) + self.warnings_omitted
 
     def __bool__(self) -> bool:
+        """True when nothing blocked the file from being used."""
         return not self.errors and self.errors_omitted == 0
+
+
+def _check_declared_schema(result: ValidationResult, position: int, shown: str, player: Player) -> None:
+    """Warn about shapes the declared TF2BD schema rejects but this tool tolerates.
+
+    These are warnings on purpose. None of them stops a sync - the tool reads a
+    legacy SteamID spelling perfectly well, and a missing ``last_seen.time``
+    only costs a player name in the report - but each one makes the file fail
+    validation in an editor, and the file names that schema itself.
+    """
+    steamid = player.get("steamid")
+    canonical = normalize_steamid(steamid)
+    # Only a *resolvable* id stored in the wrong spelling is worth saying. An
+    # unresolvable one already produced an error naming the same field, and one
+    # problem per field is the rule everywhere else in here.
+    if canonical is not None and isinstance(steamid, str) and not SCHEMA_STEAMID.fullmatch(steamid):
+        result.add_warning(
+            f"players[{position}] ({shown}) stores a steamid the declared schema rejects, expected {canonical}"
+        )
+
+    unexpected_entry = sorted(set(player) - SCHEMA_ENTRY_KEYS)
+    if unexpected_entry:
+        shown_keys = ", ".join(_shown(key) for key in unexpected_entry[:3])
+        label = "key" if len(unexpected_entry) == 1 else "keys"
+        result.add_warning(f"players[{position}] ({shown}) has unexpected {label}: {shown_keys}")
+
+    if "last_seen" not in player:
+        return
+    last_seen = player.get("last_seen")
+    if not isinstance(last_seen, dict):
+        result.add_warning(f"players[{position}] ({shown}) has a 'last_seen' that is not an object")
+        return
+    moment = last_seen.get("time")
+    # bool is an int subclass; "time": true is not a timestamp.
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        result.add_warning(
+            f"players[{position}] ({shown}) has a 'last_seen' without an integer 'time', which the schema requires"
+        )
+    name = last_seen.get("player_name")
+    if "player_name" in last_seen and not isinstance(name, str):
+        result.add_warning(f"players[{position}] ({shown}) has a non-string 'last_seen.player_name'")
+    unexpected = sorted(set(last_seen) - SCHEMA_LAST_SEEN_KEYS)
+    if unexpected:
+        shown_keys = ", ".join(_shown(key) for key in unexpected[:3])
+        label = "key" if len(unexpected) == 1 else "keys"
+        result.add_warning(f"players[{position}] ({shown}) has unexpected 'last_seen' {label}: {shown_keys}")
 
 
 def validate(database: PlayerList) -> ValidationResult:
@@ -816,5 +1002,7 @@ def validate(database: PlayerList) -> ValidationResult:
         proof = player.get("proof")
         if "proof" in player and (not isinstance(proof, list) or not all(isinstance(item, str) for item in proof)):
             result.add_error(f"players[{position}] ({shown}) has a malformed 'proof' (must be an array of strings)")
+
+        _check_declared_schema(result, position, shown, player)
 
     return result

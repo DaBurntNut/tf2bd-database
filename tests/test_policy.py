@@ -86,6 +86,29 @@ class MassDemotionGuardTests(unittest.TestCase):
         self.assertTrue(update_snapshot)
         self.assertIsNone(note)
 
+    def test_the_database_floor_is_exact_at_five_entries(self):
+        """The floor is "at least 5", and only the floor may decide this case.
+
+        The small-purge test above holds the FRACTION below its threshold as
+        well, so it answers the same way whichever comparison the floor uses:
+        mutation testing replaced ``>=`` with ``>`` there and the whole suite
+        stayed green, which is how a guard that no longer fires at exactly its
+        documented floor would ship. Here the fraction is far above 25% in
+        both rows, so the floor is the only thing that can change the verdict.
+        """
+        self.assertFalse(sync_module._looks_like_mass_removal(4, 5574, 4, 8))
+        self.assertTrue(sync_module._looks_like_mass_removal(5, 5574, 5, 8))
+
+        # The same boundary through the planner the CLI actually calls.
+        _, update_snapshot, note, _ = self.plan(4, 5574, impact=(4, 8))
+        self.assertTrue(update_snapshot)
+        self.assertIsNone(note)
+
+        removed, update_snapshot, note, _ = self.plan(5, 5574, impact=(5, 8))
+        self.assertEqual(removed, set())
+        self.assertFalse(update_snapshot)
+        self.assertIn("looks like an upstream problem", note)
+
     def test_the_database_guard_needs_something_to_guard(self):
         # With no demotable entries there is nothing to protect, so the
         # database-relative rule stays quiet and only the snapshot rule applies.
@@ -93,10 +116,16 @@ class MassDemotionGuardTests(unittest.TestCase):
         self.assertTrue(sync_module._looks_like_mass_removal(2000, 5574, 0, 0))
 
     def test_the_guard_reports_how_much_of_the_database_is_at_stake(self):
-        self.assertIn("26% of the 108 cheater(s)", sync_module._demotion_scale(28, 108))
+        self.assertIn("26% of the 108 cheaters", sync_module._demotion_scale(28, 108))
         self.assertIn("no tracked cheaters", sync_module._demotion_scale(9, 0))
         # Never claim more than the whole database.
         self.assertIn("100%", sync_module._demotion_scale(500, 108))
+
+    def test_the_guard_says_cheater_not_cheaters_for_a_single_entry(self):
+        # This note is published in the pull request body, so it uses the same
+        # plural helper as the rest of the report instead of writing "cheater(s)".
+        self.assertIn("100% of the 1 cheater this database could lose", sync_module._demotion_scale(1, 1))
+        self.assertIn("50% of the 2 cheaters this database could lose", sync_module._demotion_scale(1, 2))
 
     def test_removals_beyond_the_demotable_count_are_still_measured(self):
         # More removals than demotable entries cannot happen in a real run (sync
@@ -113,6 +142,7 @@ class MassDemotionGuardTests(unittest.TestCase):
                 player("[U:1:1]", ["cheater"]),  # in previous snapshot -> at risk
                 player("[U:1:2]", ["cheater"]),  # never known to upstream -> exonerated
                 player("[U:1:3]", ["racist"]),  # no cheater tag -> untouched
+                player("[U:1:9]", ["racist"]),  # no cheater tag, but IS in the snapshot -> still untouched
                 player("[U:1:4]", ["cheater", "racist"]),  # in snapshot -> at risk
                 {"attributes": ["cheater"]},  # unusable SteamID -> skipped
                 {"steamid": "[U:1:5]", "attributes": "cheater"},  # malformed attributes
@@ -141,6 +171,30 @@ class MassDemotionGuardTests(unittest.TestCase):
     def test_the_impact_tolerates_a_malformed_database(self):
         self.assertEqual(sync_module._demotion_impact({"players": "nope"}, {"[U:1:1]"}, index_of()), (0, 0))
 
+    def test_a_malformed_entry_midway_does_not_cut_the_count_short(self):
+        """One bad entry must be stepped over, not treated as the end of the list.
+
+        This count is what the mass-demotion guard divides by: understating it
+        understates the blast radius, so a purge that should be vetoed is
+        waved through. Entries the bot skips -- a non-dict row, a missing
+        SteamID, malformed attributes -- have to be skipped INDIVIDUALLY. The
+        existing coverage put the junk last, where abandoning the loop and
+        stepping over it produce the same answer.
+        """
+        good = [player(f"[U:1:{n}]", ["cheater"]) for n in range(1, 7)]
+        junk = ["not an entry", {"attributes": ["cheater"]}, {"steamid": "[U:1:8]", "attributes": "cheater"}]
+        # Junk in the middle: everything after it still has to be counted.
+        database = {"players": [*good[:3], *junk, *good[3:]]}
+        previous = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in range(1, 7)])
+        removed = {f"[U:1:{n}]" for n in range(1, 7)}
+        self.assertEqual(sync_module._demotion_impact(database, removed, previous), (6, 6))
+
+    def test_an_entry_upstream_never_listed_midway_does_not_cut_the_count_short(self):
+        """The same for the skip that exonerates a hand-added cheater."""
+        database = {"players": [player(f"[U:1:{n}]", ["cheater"]) for n in (1, 2, 99, 3, 4)]}
+        previous = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in (1, 2, 3, 4)])
+        self.assertEqual(sync_module._demotion_impact(database, {"[U:1:1]", "[U:1:4]"}, previous), (2, 4))
+
     def test_exactly_fifty_removals_are_not_a_mass_removal(self):
         # Exactly 50 stays below the guard; the count must exceed 50.
         removed, update_snapshot, note, _ = self.plan(50, 100)
@@ -154,6 +208,14 @@ class MassDemotionGuardTests(unittest.TestCase):
         self.assertFalse(update_snapshot)
         self.assertIn("disappeared upstream at once", note)
         self.assertIn("not refreshed", snapshot_note)
+
+    def test_the_guard_counts_snapshot_steamids_not_raw_entries(self):
+        # Both figures come from the snapshot's DISTINCT usable SteamIDs, so the
+        # note must not call them "entries" -- that word means raw rows (which
+        # include duplicates and unusable ones) everywhere else in the report.
+        _, _, note, _ = self.plan(51, 100)
+        self.assertIn("51 of 100 snapshot SteamIDs", note)
+        self.assertNotIn("snapshot entries", note)
 
     def test_many_removals_from_a_large_snapshot_are_normal(self):
         # 100 exceeds the count floor but is only 10% of this snapshot.
@@ -277,7 +339,7 @@ class PromoteTests(unittest.TestCase):
                 self.assertEqual(len(changes), 1)
                 self.assertNotIn("proof", database["players"][0])
 
-    def test_attribute_order_is_normalised(self):
+    def test_attribute_order_is_normalized(self):
         database, _ = self.promote([player("[U:1:300]", ["racist", "suspicious"])])
         self.assertEqual(database["players"][0]["attributes"], ["cheater", "racist"])
 
@@ -545,7 +607,7 @@ class DemoteTests(unittest.TestCase):
         self.assertEqual(len(database["players"]), 1)
 
     def test_sync_never_demotes_when_the_caller_forgets_enable_demote(self):
-        """Defence in depth: removals without the flag demote nobody.
+        """Defense in depth: removals without the flag demote nobody.
 
         The CLI never gets here (it empties the set when --demote is off), but a
         future caller that hands over removed_ids and forgets the flag must not
@@ -743,7 +805,8 @@ class MalformedEntryTests(unittest.TestCase):
         self.assertEqual(database["players"][0], "not a dict")
 
     def test_promote_skips_entries_it_cannot_interpret(self):
-        index = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in (200, 201, 202, 203)])
+        index = index_of(*[hackerpolice_entry(f"[U:1:{n}]") for n in (200, 201, 202, 203, 204)])
+        mixed = player("[U:1:204]", ["suspicious", 1])
         database = {
             "players": [
                 "not a dict",
@@ -753,12 +816,20 @@ class MalformedEntryTests(unittest.TestCase):
                 player("[U:1:201]", [1]),
                 player("[U:1:202]", ["cheater"]),  # Already a cheater.
                 player("[U:1:203]", ["suspicious"]),
+                # A promotable attribute next to a non-string one. Dropping the
+                # all-strings check lets this entry through, and the bot writes
+                # ["cheater", "suspicious", 1] -- an integer in attributes, which
+                # makes TF2BD reject the whole file. A list of only non-string
+                # attributes cannot catch that: it is skipped a few lines later
+                # anyway, for having nothing promotable in it.
+                mixed,
                 player("[U:1:999]", ["suspicious"]),  # Not listed upstream.
             ]
         }
         changes = promote(database, index)
         promoted = [change.steamid for change in changes]
         self.assertEqual(promoted, ["[U:1:203]"])
+        self.assertEqual(mixed["attributes"], ["suspicious", 1], "a malformed entry must be left exactly as it was")
 
     def test_sync_tolerates_a_missing_players_array(self):
         self.assertEqual(promote({}, index_of()), [])

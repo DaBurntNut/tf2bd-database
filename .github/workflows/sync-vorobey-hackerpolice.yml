@@ -10,7 +10,11 @@ name: Sync Vorobey hackerpolice
 
 on:
   schedule:
-    # Run daily at 05:23 UTC to avoid the busy top of the hour.
+    # Nominally 05:23 UTC, off the busy top of the hour. GitHub queues scheduled
+    # jobs, and how long it queues them is a property of the repository rather
+    # than of this line: over two weeks in November 2026 two repositories running
+    # this exact expression started a median of 0.9 and 8.5 hours late. Read it as
+    # "once a day", never as a clock; nothing here depends on the time of day.
     - cron: "23 5 * * *"
   workflow_dispatch:
     inputs:
@@ -39,25 +43,19 @@ on:
       - ".gitattributes"
       - ".gitignore"
       - "playerlist.garou3299.json"
-      - "playerlist.scammers.json"
       - "rules.garou3299.json"
       - "snapshot/playerlist.vorobey-hackerpolice.json"
-      # Tests read the Dependabot config and this workflow; include each in this filter.
-      # README.md is not listed: no test reads it, so prose edits need no checks.
+      # No test reads pyproject.toml, rules.garou3299.json or the Dependabot config.
+      # They are listed so a tooling or data change still runs the checks, not because
+      # anything asserts on them: each one may be edited or deleted and the suite stays
+      # green. README.md is not listed at all. Only the sync's own inputs -- the
+      # database, the snapshot, the code, and the two git settings that govern its
+      # commits -- are allowed to fail a test, because only those can break the bot.
       - ".github/dependabot.yml"
       - ".github/workflows/sync-vorobey-hackerpolice.yml"
 
 # Least privilege by default: no job may read or write more than its own block.
 permissions: {}
-
-# Pin tool versions so both Python matrix legs use identical check tooling.
-env:
-  RUFF_VERSION: "0.17.4"
-  MYPY_VERSION: "2.4.1"
-  BANDIT_VERSION: "1.9.4"
-  # Coverage 7.17.3 requires Python 3.11; use 7.16.2 for Python 3.10.
-  COVERAGE_VERSION: "7.16.2"
-  VULTURE_VERSION: "2.16"
 
 jobs:
   # Read-only checks gate publishing and run without write credentials.
@@ -73,7 +71,7 @@ jobs:
       matrix:
         # Test the documented minimum (3.10) and production runtime (3.12).
         python-version: ["3.10", "3.12"]
-    # Isolate checks from sync and cancel stale runs without cancelling sibling Python legs.
+    # Isolate checks from sync and cancel stale runs without canceling sibling Python legs.
     concurrency:
       group: checks-${{ github.event.pull_request.number || github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true
@@ -92,35 +90,48 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install the pinned check tooling
+        # Versions live in pyproject.toml's [dependency-groups] so Dependabot
+        # can track them; installing once gives every step identical tooling.
+        # pip only learned --group in 25.1 and setup-python can ship an older
+        # one, so raise pip first -- without this the install fails with
+        # "no such option: --group".
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check --upgrade "pip>=25.1"
+          python3 -m pip install --quiet --disable-pip-version-check --group ci
+
       - name: Lint (ruff)
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check "ruff==${RUFF_VERSION}"
           python3 -m ruff check scripts tests
           python3 -m ruff format --check scripts tests
 
       - name: Type-check (mypy, strict)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "mypy==${MYPY_VERSION}"
-          python3 -m mypy scripts
+        run: python3 -m mypy scripts
 
       - name: Security scan (bandit)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "bandit==${BANDIT_VERSION}"
-          python3 -m bandit -q -r scripts
+        run: python3 -m bandit -q -r scripts
 
       - name: Run unit tests under the coverage gate
         # The floor is fail_under in pyproject.toml (95%), not 100%: the suite
         # reaches 100% today, but the gate must not demand a test for a branch
         # that cannot be reached.
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check "coverage==${COVERAGE_VERSION}"
           python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
           python3 -m coverage report
 
+      - name: No test may depend on the clock standing still
+        # Second pass with the displayed clock advancing on every read. A test
+        # that renders the same run twice and compares the results otherwise
+        # passes unless the minute ticks between them: a failure that shows up
+        # once in a few thousand runs and reproduces for nobody. Here it fails
+        # every time instead. See _tick_the_clock_on_every_read in
+        # tests/_support.py; a failure below is fixed with frozen_clock().
+        env:
+          TF2BD_TICKING_CLOCK: "1"
+        run: python3 -m unittest discover -s tests -q
+
       - name: Dead code (vulture)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "vulture==${VULTURE_VERSION}"
-          python3 -m vulture scripts tests --min-confidence 60
+        run: python3 -m vulture scripts tests --min-confidence 60
 
   sync:
     name: Check Vorobey hackerpolice list

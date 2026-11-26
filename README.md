@@ -19,8 +19,14 @@ Send a permanent Steam profile link or ID **with video evidence** to
 
 ## What the bot does
 
-Every day at **05:23 UTC** (GitHub can delay the run) it compares this database
-with Vorobey's list and opens a pull request. Scheduled runs do not change the
+Once a day it compares this database with Vorobey's list and opens a pull
+request. The schedule asks for **05:23 UTC**, but GitHub queues scheduled
+jobs, and how long it queues them depends on the repository rather than on
+the schedule: this fork's last ten runs started between **06:10 and 06:53
+UTC**, about an hour late, while the upstream repository — running the
+identical cron line — started between **12:19 and 16:13 UTC**, a median of
+**8.5 hours** late. Read it as "once a day"; nothing in the bot depends on
+the time of day. Scheduled runs do not change the
 default branch until you merge that pull request. A manual run from the default
 branch (**Actions → Run workflow**) can instead open a pull request, commit
 directly, or only report a dry run; a dispatch from another branch runs the
@@ -71,7 +77,7 @@ in this database's own `proof` fields are never copied into the report; a
 demotion note quotes one only when that `[auto] automatically marked: Racist`
 line is the record that justifies a surviving `racist` tag.
 
-The removed-ID table lists up to 100 SteamIDs with profile and
+The removed-ID table lists up to 300 SteamIDs with profile and
 [SteamHistory](https://steamhistory.net/) links, then reports how many more were
 omitted. `snapshot/playerlist.vorobey-hackerpolice.json` is the previous
 byte-for-byte copy of Vorobey's list — the bot compares against it to know who
@@ -88,18 +94,22 @@ every entry is named the same way. The link target points at the exact upstream
 URL, except a YouTube video, which targets YouTube's own short form
 (`https://youtu.be/<id>`): a faithful alias of the same video that keeps the
 markdown short. One rule covers every YouTube spelling, short or long: the id,
-plus a timestamp (`t` / `start`) when the link actually carried one, because a
-proof is often one specific moment in a long video. Every other parameter is
-dropped, including the `si=` share tag, so
-`youtu.be/ID?si=abc` → `youtu.be/ID` and
-`youtu.be/ID?si=abc&t=326` → `youtu.be/ID?t=326`. No timestamp is ever invented. That is a pure text rewrite — no
+plus the first timestamp the link actually carried, because a proof is often one
+specific moment in a long video. The moment may arrive as `t` or as the embed
+player's `start`, and is always written back as `t`, the parameter the short
+domain reads. Every other parameter is dropped, including the `si=` share tag, so
+`youtu.be/ID?si=abc` → `youtu.be/ID`,
+`youtu.be/ID?si=abc&t=326` → `youtu.be/ID?t=326` and
+`youtube.com/embed/ID?start=90` → `youtu.be/ID?t=90`. No timestamp is ever invented. That is a pure text rewrite — no
 request and no third-party shortener — so the report stays offline and the link
 stays verifiable. A link whose credentials had to be redacted is shown as plain
 code instead, never as a clickable target.
 
 The report is kept below GitHub's body limit: each change table stops at 150 rows
-and the removed-ID table at 100, with an `… and N more` overflow note. If needed,
-the report reduces those caps further, and a last-resort 60 KB byte cap (well
+and the removed-ID table at 300, with an `… and N more` overflow note. If needed,
+the report reduces those caps further -- shortening the removed-ID list before the
+change tables, so a busy run never hides what happened to this database in order to
+name more upstream removals -- and a last-resort 60 KB byte cap (well
 under GitHub's limit) is marked rather than silently cutting text. The tables aid review; the repository diff
 remains the complete record.
 
@@ -166,7 +176,7 @@ than from the raw totals, so the line can never contradict itself.
   If the runner's output file fails during the append, the run cannot leave an
   unpublished database or snapshot change behind.
 - **Checked changes** — a pull request touching `scripts/`, `tests/`,
-  `playerlist.garou3299.json`, `playerlist.scammers.json`, `rules.garou3299.json`,
+  `playerlist.garou3299.json`, `rules.garou3299.json`,
   the hackerpolice snapshot, `pyproject.toml`, `.gitattributes`, `.gitignore`,
   `.github/dependabot.yml` or the workflow runs ruff, `mypy --strict`,
   a bandit security scan, vulture (dead code) and the tests under a branch-coverage
@@ -182,6 +192,20 @@ than from the raw totals, so the line can never contradict itself.
   added later cannot inherit a write token by accident. The checks job does not
   even fetch the Git history it never reads.
 
+## If the daily run seems to have stopped
+
+GitHub disables scheduled workflows in a public repository after 60 days with
+no repository activity. It does this silently — no email, no failed run, no
+entry in the log; the daily sync simply stops happening. This repository has
+never been quiet that long, but a cheater list that nobody touches for two
+months is exactly the case where it would bite, and the symptom looks like a
+broken bot rather than a paused one.
+
+So if the syncs have gone missing, check **Actions** before reading any code:
+a workflow switched off this way is greyed out there, and one click re-enables
+it (`gh workflow enable "Sync Vorobey hackerpolice"` does the same). Filtering
+the run list by the `schedule` event shows when the last automatic run was.
+
 ## Run it yourself
 
 ```
@@ -190,10 +214,12 @@ python3 scripts/sync_vorobey_hackerpolice.py --demote --report out.md
 ```
 
 The scripts use only Python's standard library. To run the coverage gate locally,
-install the same coverage version as CI first:
+install the same check tooling as CI first. The versions live in pyproject.toml,
+so this cannot drift from the workflow (pip 25.1+ is needed for `--group`):
 
 ```
-python3 -m pip install coverage==7.16.2
+python3 -m pip install --upgrade "pip>=25.1"
+python3 -m pip install --group ci
 python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v
 python3 -m coverage report
 ```

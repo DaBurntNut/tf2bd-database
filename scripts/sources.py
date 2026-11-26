@@ -31,10 +31,12 @@ from pathlib import Path
 from typing import IO, Any
 
 from playerlist import (
+    CREDENTIAL_NAME_MARKERS,
     MAX_FILE_BYTES,
     SURROGATE_RE,
     display_path,
     error_reason,
+    fold_name_for_matching,
     normalize_steamid,
     read_bounded_regular_file,
     redact_diagnostic_text,
@@ -87,7 +89,7 @@ class SyncError(Exception):
 LOGGER = logging.getLogger("vorobey_sources")
 
 
-class _ShortRead(OSError):
+class _ShortReadError(OSError):
     """A response body that ended before the length the server declared.
 
     Deliberately an OSError: the retry loop treats OSError as a transient
@@ -159,7 +161,7 @@ def _declared_length(response: object) -> int | None:
     if isinstance(declared, str) and declared.isascii() and declared.isdigit():
         # Bound the digits before int(): a hostile header with thousands of
         # digits would otherwise trip Python's int-conversion limit and turn a
-        # malformed header into a ValueError traceback. Ten digits is ~10 GiB,
+        # malformed header into a ValueError traceback. Ten digits is ~10 GB,
         # far beyond the byte cap, so a longer value is simply "too large".
         significant = declared.lstrip("0") or "0"
         return int(significant) if len(significant) <= 10 else MAX_SOURCE_BYTES + 1
@@ -285,17 +287,16 @@ def load_snapshot(path: Path) -> tuple[HackerpoliceIndex, bytes] | None:
     return HackerpoliceIndex.build(document, what=f"the previous snapshot {_display_path(path)}"), raw
 
 
-# Match credential-like parameter names broadly; false positives are safer than leaks.
-_SECRET_QUERY_PARAM = re.compile(
-    r"token|secret|pass|pwd|auth|credential|session|sid|cookie|csrf|xsrf|bearer|jwt|assertion|otp|mfa|nonce|state|ticket|"
-    r"apikey|api[_-]?key|sig|hmac|saml|key|x-amz|x-goog|code",
-    re.IGNORECASE,
-)
+# Match credential-like parameter names broadly; false positives are safer than
+# leaks. The vocabulary is shared with the diagnostic redactor so the two cannot
+# drift apart: no case-folding limit here, because a query name reaches us
+# straight off the wire and ``KEY`` spelled with a Kelvin sign must still match.
+_SECRET_QUERY_PARAM = re.compile(CREDENTIAL_NAME_MARKERS, re.IGNORECASE)
 _PERCENT_ESCAPE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE | re.ASCII)
 _SAFE_QUERY_NAME = re.compile(r"[A-Za-z0-9_.-]+", re.ASCII)
 
 
-def _normalised_query_name(name: str) -> str | None:
+def _normalized_query_name(name: str) -> str | None:
     """Remove invisible/control/separator characters before checking a key name.
 
     URL-decoding can reveal a tab, newline, zero-width character or other
@@ -315,12 +316,12 @@ def _normalised_query_name(name: str) -> str | None:
     if _PERCENT_ESCAPE.search(decoded):
         # Fail closed on unresolved escapes; another decoder could expose a credential key.
         return None
-    return "".join(char for char in decoded if unicodedata.category(char)[0] not in {"C", "Z"}).casefold()
+    return fold_name_for_matching(decoded)
 
 
 def _has_sensitive_query_name(name: str) -> bool:
     """Fail closed if a parameter name is secret-looking or too encoded to inspect."""
-    normalized = _normalised_query_name(name)
+    normalized = _normalized_query_name(name)
     return normalized is None or _SECRET_QUERY_PARAM.search(normalized) is not None
 
 
@@ -343,7 +344,7 @@ def _html_unescape_bounded(value: str) -> str | None:
     return None if html.unescape(value) != value else value
 
 
-# Neutralise control and format characters in URLs before logging or publishing.
+# Neutralize control and format characters in URLs before logging or publishing.
 _URL_IN_TEXT = re.compile(r"(?:(?:[a-z][a-z0-9+.-]*:)?//)[^\s<>\"'`]+", re.IGNORECASE | re.ASCII)
 # A malformed HTTP URL can leave userinfo in its path instead of its authority.
 _HTTP_URL_WITH_AT_IN_TEXT = re.compile(r"https?:[^\s<>\"'`]*@[^\s<>\"'`]+", re.IGNORECASE | re.ASCII)
@@ -357,9 +358,38 @@ _QUERY_PARAM_IN_TEXT = re.compile(
     # Extend values to the next delimiter so secret suffixes are not exposed.
     r"(?P<value>[^&;#]*)"
 )
-# Catch userinfo split by line breaks; urlsplit ignores raw newlines.
-_MULTILINE_USERINFO_IN_TEXT = re.compile(
-    r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//)[^/@?#<>\"'`]*\s+[^/@?#<>\"'`]*@",
+# Catch userinfo that the URL patterns above cannot match as a single token:
+# a line break (urlsplit ignores raw newlines) or a quote, angle bracket or
+# backtick. Those quoting characters delimit URLs in prose and markup, which is
+# why the patterns above stop at them -- but ``'`` is a legal sub-delimiter in
+# userinfo (RFC 3986), so a password beside one used to survive the scan
+# (``https://us'er:SECRET@h``), including by prefixing a quote to reach a line
+# break. One pattern covers both: anything between ``//`` and ``@`` is dropped
+# whole rather than parsed.
+#
+# The run before the break character must exclude break characters itself.
+# Spelling it ``[^/@?#]*[<>"'`\s]+[^/@?#]*@`` instead lets a blank match either
+# the class or the repeat, so a run of blanks with no closing ``@`` costs cubic
+# time -- 2,000 characters took 42 seconds, and ``proof`` strings arrive from
+# the upstream list. Anchoring on the first break character keeps the matched
+# span identical while leaving only one way to divide the text.
+#
+# The ``//`` is optional after an explicit ``http:``/``https:``, because the
+# slashes are not what hides the credential: ``https:user name:SECRET@h.test``
+# has no authority for ``urlsplit`` to parse, no ``//`` for the pattern above,
+# and a blank that stops ``_HTTP_URL_WITH_AT_IN_TEXT`` -- so the password rode
+# through into the pull request body. Only ``http``/``https`` may drop the
+# slashes: allowing it for any scheme would turn ordinary prose such as
+# ``note: jane doe@example.com`` into a redacted span.
+#
+# The closing ``@`` may also be percent-encoded, at any number of layers
+# (``%40``, ``%2540``, ...): the blank already stopped every pattern that
+# parses the string as one URL, and ``_netloc_without_encoded_userinfo`` --
+# which does decode ``%40`` -- never sees it, because the blank split the
+# token before parsing. Whoever decodes the string later still reads a
+# password, so the span is dropped here as well.
+_SPLIT_USERINFO_IN_TEXT = re.compile(
+    r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//|https?:)[^/@?#<>\"'`\s]*[<>\"'`\s][^/@?#]*(?:@|%(?:25)*40)",
     re.IGNORECASE | re.ASCII,
 )
 
@@ -436,11 +466,11 @@ def _redact_nested_url(value: str, depth: int) -> str:
     return value if safe == candidate else safe
 
 
-def _sanitised_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tuple[str, str]], bool]:
+def _sanitized_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tuple[str, str]], bool]:
     """Replace secret values and redact nested URLs, reporting whether anything changed.
 
     Shared by the query string and the fragment, which carry the same kind of
-    parameter. Sanitised before ``urlencode``: one lone surrogate in a name or a
+    parameter. Sanitized before ``urlencode``: one lone surrogate in a name or a
     value would raise instead of redacting. The change flag lets ordinary URLs
     keep their original spelling and encoding untouched. ``depth`` bounds
     recursive URL nesting.
@@ -458,6 +488,99 @@ def _sanitised_pairs(items: list[tuple[str, str]], depth: int) -> tuple[list[tup
     return safe_items, changed
 
 
+def _path_hides_userinfo(parts: urllib.parse.SplitResult) -> bool:
+    """True when a malformed HTTP URL left credentials in its path.
+
+    ``urlsplit`` only fills ``netloc`` when the URL has a ``//``, so
+    ``https:user@host`` parses with an empty authority and the userinfo sits
+    in ``path`` where the authority rules never see it. Percent-encoding can
+    hide the ``@`` as well, so a bounded number of decoding layers is
+    inspected -- unless the path is itself an encoded URL, which
+    ``_redact_nested_url`` handles later with the depth counter.
+    """
+    if parts.scheme.lower() not in {"http", "https"} or parts.netloc:
+        return False
+    if "@" in parts.path:
+        return True
+    if not _PERCENT_ESCAPE.search(parts.path) or _ENCODED_HTTP_URL_MARKER.search(parts.path) is not None:
+        return False
+    candidate = parts.path
+    for _ in range(_MAX_NESTED_URL_DEPTH):
+        decoded = urllib.parse.unquote(candidate)
+        if decoded == candidate:
+            break
+        candidate = decoded
+        if "@" in candidate:
+            return True
+    # Still encoded after the inspection limit: it cannot be shown to be safe.
+    return _PERCENT_ESCAPE.search(candidate) is not None
+
+
+def _netloc_without_encoded_userinfo(netloc: str) -> str | None:
+    """Strip userinfo whose ``@`` is percent-encoded, or ``None`` if unsafe to show.
+
+    Encoded reserved characters are not delimiters to ``urlsplit``, so it
+    reports no username, but a later consumer may decode them and find one.
+    """
+    candidate = netloc
+    for _ in range(_MAX_NESTED_URL_DEPTH):
+        decoded = urllib.parse.unquote(candidate)
+        if decoded == candidate:
+            break
+        candidate = decoded
+        at = candidate.rfind("@")
+        if at >= 0:
+            # A delimiter before the ``@`` means this is no longer one authority.
+            return None if any(char in candidate[:at] for char in "/?#") else candidate[at + 1 :]
+    # Omit a netloc that is still encoded after the inspection limit.
+    return None if _PERCENT_ESCAPE.search(candidate) else netloc
+
+
+def _authority_without_userinfo(parts: urllib.parse.SplitResult) -> str:
+    """Rebuild ``host[:port]`` from a parsed URL, dropping any ``user:password``."""
+    host = parts.hostname or ""
+    # Restore IPv6 brackets when rebuilding the authority.
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:  # Ignore malformed ports rather than failing during redaction.
+        return host
+    return host if port is None else f"{host}:{port}"
+
+
+def _redacted_path(path: str, depth: int) -> str:
+    """Redact a URL nested inside a path, keeping it one path component."""
+    safe_path = _redact_nested_url(path, depth)
+    if safe_path == path:
+        return path
+    # Keep nested URL separators inside the path; never let a decoded ? or # escape its component.
+    return urllib.parse.quote(_no_surrogates(safe_path), safe="/:@!$&'()*+,;=-._~")
+
+
+def _redacted_query(query: str, depth: int) -> str:
+    """Redact secret-looking parameters and nested URLs in a query string."""
+    if not query:
+        return query
+    safe_items, changed = _sanitized_pairs(_query_pairs(query), depth)
+    return urllib.parse.urlencode(safe_items) if changed else query
+
+
+def _redacted_fragment(fragment: str, depth: int) -> str:
+    """Redact a fragment, which may be query-shaped (OAuth) or hold a nested URL."""
+    if not fragment:
+        return fragment
+    if "=" in fragment:
+        fragment = _redacted_query(fragment, depth)
+    return _redact_nested_url(fragment, depth)
+
+
+def _fit_url_for_display(shown: str) -> str:
+    """Make a redacted URL safe to print, on one line and within the display cap."""
+    shown = redact_diagnostic_text(_one_line(_no_surrogates(shown)))
+    return shown if len(shown) <= MAX_URL_DISPLAY_CHARS else shown[:MAX_URL_DISPLAY_CHARS] + "…"
+
+
 def _redact_url(url: str, depth: int) -> str:
     """Hide credentials in a URL before it is logged or published.
 
@@ -469,6 +592,9 @@ def _redact_url(url: str, depth: int) -> str:
     so the line still identifies what was fetched. Oversized URLs are omitted
     before parsing: even a giant path need not be scanned to display a truncated
     link, and a giant query could make ``parse_qsl`` allocate millions of pairs.
+
+    Anything that cannot be shown to be credential-free is omitted rather than
+    guessed at, so each step below either narrows the URL or gives up on it.
     """
     if len(url) > _MAX_URL_PARSE_CHARS:
         return "[URL omitted: too long to inspect safely]"
@@ -477,92 +603,33 @@ def _redact_url(url: str, depth: int) -> str:
     decoded_url = _html_unescape_bounded(url)
     if decoded_url is None:
         return "[URL omitted: too deeply encoded to inspect safely]"
-    url = decoded_url
     try:
-        parts = urllib.parse.urlsplit(url)
+        parts = urllib.parse.urlsplit(decoded_url)
     except ValueError:
         # Omit unparseable URLs rather than risk echoing credentials.
         return "[malformed URL omitted]"
-    is_http_without_authority = parts.scheme.lower() in {"http", "https"} and not parts.netloc
-    if is_http_without_authority and (
-        "@" in parts.path
-        or (_PERCENT_ESCAPE.search(parts.path) and _ENCODED_HTTP_URL_MARKER.search(parts.path) is None)
-    ):
-        # urllib leaves userinfo-looking text in the path of malformed URLs such as ``https:user@host``.
-        if "@" in parts.path:
-            return "[malformed URL omitted]"
-        candidate = parts.path
-        for _ in range(_MAX_NESTED_URL_DEPTH):
-            decoded = urllib.parse.unquote(candidate)
-            if decoded == candidate:
-                break
-            candidate = decoded
-            if "@" in candidate:
-                return "[malformed URL omitted]"
-        if _PERCENT_ESCAPE.search(candidate):
-            return "[malformed URL omitted]"
+
+    if _path_hides_userinfo(parts):
+        return "[malformed URL omitted]"
 
     netloc = parts.netloc
     if parts.username is None and _PERCENT_ESCAPE.search(netloc):
-        # Encoded reserved characters are not delimiters to urlsplit(), but a later consumer may decode them.
-        candidate = netloc
-        found_encoded_userinfo = False
-        for _ in range(_MAX_NESTED_URL_DEPTH):
-            decoded = urllib.parse.unquote(candidate)
-            if decoded == candidate:
-                break
-            candidate = decoded
-            at = candidate.rfind("@")
-            if at >= 0:
-                if any(char in candidate[:at] for char in "/?#"):
-                    return "[malformed URL omitted]"
-                netloc = candidate[at + 1 :]
-                found_encoded_userinfo = True
-                break
-        if not found_encoded_userinfo and _PERCENT_ESCAPE.search(candidate):
+        resolved = _netloc_without_encoded_userinfo(netloc)
+        if resolved is None:
             return "[malformed URL omitted]"
+        netloc = resolved
+    elif parts.username is not None:
+        netloc = _authority_without_userinfo(parts)
 
-    if parts.username is not None:
-        host = parts.hostname or ""
-        # Restore IPv6 brackets when rebuilding the authority.
-        if ":" in host:
-            host = f"[{host}]"
-        try:
-            port = parts.port
-        except ValueError:  # Ignore malformed ports rather than failing during redaction.
-            port = None
-        if port is not None:
-            host = f"{host}:{port}"
-        netloc = host
-
-    path = parts.path
-    safe_path = _redact_nested_url(path, depth)
-    if safe_path != path:
-        # Keep nested URL separators inside the path; never let a decoded ? or # escape its component.
-        path = urllib.parse.quote(_no_surrogates(safe_path), safe="/:@!$&'()*+,;=-._~")
-
-    query = parts.query
-    if query:
-        safe_items, changed = _sanitised_pairs(_query_pairs(query), depth)
-        if changed:
-            query = urllib.parse.urlencode(safe_items)
-
-    # Redact query-shaped fragments (for example, OAuth tokens) and nested URLs in ordinary anchors.
-    fragment = parts.fragment
-    if fragment and "=" in fragment:
-        safe_items, changed = _sanitised_pairs(_query_pairs(fragment), depth)
-        if changed:
-            fragment = urllib.parse.urlencode(safe_items)
-    if fragment:
-        fragment = _redact_nested_url(fragment, depth)
+    path = _redacted_path(parts.path, depth)
+    query = _redacted_query(parts.query, depth)
+    fragment = _redacted_fragment(parts.fragment, depth)
 
     if netloc == parts.netloc and path == parts.path and query == parts.query and fragment == parts.fragment:
         shown = original_url  # Preserve the caller's original spelling when nothing needs redaction.
     else:
         shown = urllib.parse.urlunsplit((parts.scheme, netloc, path, query, fragment))
-    # Keep output encodable and on one line.
-    shown = redact_diagnostic_text(_one_line(_no_surrogates(shown)))
-    return shown if len(shown) <= MAX_URL_DISPLAY_CHARS else shown[:MAX_URL_DISPLAY_CHARS] + "…"
+    return _fit_url_for_display(shown)
 
 
 def redact_url(url: str) -> str:
@@ -570,22 +637,38 @@ def redact_url(url: str) -> str:
     return _redact_url(url, 0)
 
 
-def _redact_url_occurrence(match: re.Match[str], depth: int) -> str:
-    """Redact one URL embedded in prose, preserving sentence punctuation."""
-    value = match.group()
+def _prose_tail_start(value: str, punctuation: str) -> int:
+    """Return where the trailing prose begins, so a URL is not redacted with it.
+
+    Trailing sentence punctuation, and closing brackets that were never opened
+    inside the match, belong to the surrounding sentence rather than the URL.
+    ``punctuation`` differs by caller: a semicolon ends a sentence in prose but
+    separates parameters inside a query string, so only the prose caller trims it.
+    """
     end = len(value)
-    while end and value[end - 1] in ".,;:!?":
+    while end and value[end - 1] in punctuation:
         end -= 1
     for closer, opener in ((")", "("), ("]", "["), ("}", "{")):
         balance = value[:end].count(closer) - value[:end].count(opener)
         while end and value[end - 1] == closer and balance > 0:
             end -= 1
             balance -= 1
+    return end
+
+
+def _redact_url_occurrence(match: re.Match[str], depth: int) -> str:
+    """Redact one URL embedded in prose, preserving sentence punctuation."""
+    value = match.group()
+    end = _prose_tail_start(value, ".,;:!?")
     return _redact_url(value[:end], depth) + value[end:]
 
 
-def _redact_multiline_userinfo(match: re.Match[str]) -> str:
-    """Replace userinfo that crosses a line break while embedded in prose."""
+def _redact_userinfo_span(match: re.Match[str]) -> str:
+    """Replace a userinfo span the URL patterns cannot match as one token.
+
+    Serves both the line-break and the quote/bracket cases: either way the
+    span between ``//`` and ``@`` is dropped whole rather than parsed.
+    """
     return f"{match.group('prefix')}REDACTED@"
 
 
@@ -600,15 +683,60 @@ def _redact_text_query_parameter(match: re.Match[str], depth: int) -> str:
 
     # Redact parameter names that contain an encoded delimiter or secret.
     safe_name = raw_name if _SAFE_QUERY_NAME.fullmatch(raw_name) else "REDACTED"
-    end = len(value)
-    while end and value[end - 1] in ".,:!?":
-        end -= 1
-    for closer, opener in ((")", "("), ("]", "["), ("}", "{")):
-        balance = value[:end].count(closer) - value[:end].count(opener)
-        while end and value[end - 1] == closer and balance > 0:
-            end -= 1
-            balance -= 1
+    # A semicolon separates parameters here, so it stays with the value. No test
+    # can show the difference -- _QUERY_PARAM_IN_TEXT's value excludes ';', so one
+    # never reaches this trim -- but the lists are kept apart to match the regex.
+    end = _prose_tail_start(value, ".,:!?")
     return f"{match.group('separator')}{safe_name}=REDACTED{value[end:]}"
+
+
+def _redacted_entity_view(text: str, depth: int) -> str | None:
+    """Redact an HTML-decoded view of prose, or ``None`` to keep the original.
+
+    Entities can hide a delimiter (``&#64;`` for ``@``), so the decoded view is
+    inspected too -- but prose that decodes to itself, or whose decoded view
+    needed no redaction, must keep the spelling the caller wrote.
+    """
+    decoded = _html_unescape_bounded(text)
+    if decoded is None:
+        return "[URL omitted: too deeply encoded to inspect safely]"
+    if decoded == text:
+        return None
+    safe_decoded = _redact_urls_in_text(decoded, depth, decode_entities=False)
+    return safe_decoded if safe_decoded != decoded else None
+
+
+def _is_one_bare_url(text: str) -> bool:
+    """True when the whole string is a single URL, not prose that contains a colon."""
+    stripped = text.strip()
+    if any(char.isspace() for char in stripped):
+        return False
+    has_html_reference = html.unescape(stripped) != stripped
+    looks_like_http_url = stripped[:5].casefold() == "http:" or stripped[:6].casefold() == "https:"
+    return looks_like_http_url or "?" in stripped or ("#" in stripped and not has_html_reference)
+
+
+def _redacted_encoded_urls(text: str, depth: int) -> str | None:
+    """Redact URLs whose scheme is percent-encoded, or ``None`` if none survive decoding."""
+    if depth >= _MAX_NESTED_URL_DEPTH:
+        return "[nested URL omitted: too deep to inspect safely]"
+    candidate = text
+    safe_candidate: str | None = None
+    inspected_url = False
+    for _ in range(_MAX_NESTED_URL_DEPTH):
+        decoded = urllib.parse.unquote(candidate)
+        if decoded == candidate:
+            break
+        candidate = decoded
+        if _URL_IN_TEXT.search(candidate) or _HTTP_URL_WITH_AT_IN_TEXT.search(candidate):
+            inspected_url = True
+            safe = _redact_urls_in_text(candidate, depth + 1, decode_entities=False, inspect_encoded_urls=False)
+            if safe != candidate:
+                # Keep decoding the original view: another layer may reveal userinfo hidden beside a redacted query.
+                safe_candidate = safe
+    if _ENCODED_HTTP_URL_MARKER.search(candidate) or (inspected_url and _PERCENT_ESCAPE.search(candidate)):
+        return "[nested URL omitted: too deep to inspect safely]"
+    return safe_candidate
 
 
 def _redact_urls_in_text(
@@ -624,60 +752,35 @@ def _redact_urls_in_text(
         # for a long paragraph sent the reader looking for a link that was never there.
         return "[text omitted: too long to inspect safely]"
     if decode_entities:
-        decoded = _html_unescape_bounded(text)
-        if decoded is None:
-            return "[URL omitted: too deeply encoded to inspect safely]"
-        if decoded != text:
-            # Inspect a decoded view for entity-hidden delimiters; preserve original prose if unchanged.
-            safe_decoded = _redact_urls_in_text(decoded, depth, decode_entities=False)
-            if safe_decoded != decoded:
-                return safe_decoded
-    text = _MULTILINE_USERINFO_IN_TEXT.sub(_redact_multiline_userinfo, text)
+        from_entities = _redacted_entity_view(text, depth)
+        if from_entities is not None:
+            return from_entities
+    text = _SPLIT_USERINFO_IN_TEXT.sub(_redact_userinfo_span, text)
     # Inspect HTTP strings containing @ even when malformed syntax left userinfo in the path.
     text = _HTTP_URL_WITH_AT_IN_TEXT.sub(lambda match: _redact_url_occurrence(match, depth), text)
     # Do not parse prose colons as schemes; redact standalone queries and embedded URLs separately.
-    stripped = text.strip()
-    has_html_reference = html.unescape(stripped) != stripped
-    looks_like_http_url = stripped[:5].casefold() == "http:" or stripped[:6].casefold() == "https:"
-    if not any(char.isspace() for char in stripped) and (
-        looks_like_http_url or "?" in stripped or ("#" in stripped and not has_html_reference)
-    ):
+    if _is_one_bare_url(text):
         text = _redact_url(text, depth)
     text = _URL_IN_TEXT.sub(lambda match: _redact_url_occurrence(match, depth), text)
     text = _QUERY_PARAM_IN_TEXT.sub(lambda match: _redact_text_query_parameter(match, depth), text)
 
     # Inspect percent-encoded URL schemes anywhere in prose or path text, not only in parsed query values.
     if inspect_encoded_urls and _ENCODED_HTTP_URL_MARKER.search(text):
-        if depth >= _MAX_NESTED_URL_DEPTH:
-            return "[nested URL omitted: too deep to inspect safely]"
-        candidate = text
-        safe_candidate: str | None = None
-        inspected_url = False
-        for _ in range(_MAX_NESTED_URL_DEPTH):
-            decoded = urllib.parse.unquote(candidate)
-            if decoded == candidate:
-                break
-            candidate = decoded
-            if _URL_IN_TEXT.search(candidate) or _HTTP_URL_WITH_AT_IN_TEXT.search(candidate):
-                inspected_url = True
-                safe = _redact_urls_in_text(
-                    candidate,
-                    depth + 1,
-                    decode_entities=False,
-                    inspect_encoded_urls=False,
-                )
-                if safe != candidate:
-                    # Keep decoding the original view: another layer may reveal userinfo hidden beside a redacted query.
-                    safe_candidate = safe
-        if _ENCODED_HTTP_URL_MARKER.search(candidate) or (inspected_url and _PERCENT_ESCAPE.search(candidate)):
-            return "[nested URL omitted: too deep to inspect safely]"
-        if safe_candidate is not None:
-            return safe_candidate
+        from_encoded = _redacted_encoded_urls(text, depth)
+        if from_encoded is not None:
+            return from_encoded
     return text
 
 
 def redact_urls_in_text(text: str) -> str:
-    """Redact URL credentials and common bare secrets in untrusted prose."""
+    """Redact URL credentials and common bare secrets in untrusted prose.
+
+    Apply this once per value. It rewrites rather than deletes -- a bare
+    ``?token`` becomes ``?token=REDACTED`` -- so its output is a different
+    document that a second pass may legitimately parse differently, and the
+    function is not a fixed point. One pass is what every caller does and is
+    what the guarantee covers: no secret value survives it.
+    """
     return redact_diagnostic_text(_redact_urls_in_text(text, 0))
 
 
@@ -691,8 +794,8 @@ def _redact_source(value: str) -> str:
     surrounding text.
     """
     if http_scheme(value):
-        # ``http_scheme`` already recognises the http/https prefixes itself, including
-        # for a URL too long to parse, so repeating the prefix test here added nothing.
+        # ``http_scheme`` recognizes the http/https prefixes itself, including for a
+        # URL too long to parse, so no separate prefix test is needed here.
         return redact_url(value)
     return _one_line(_no_surrogates(redact_urls_in_text(value)))
 
@@ -714,7 +817,7 @@ def _safe_fetch_error(exc: Exception) -> str:
     """
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP status {exc.code}"
-    if isinstance(exc, _ShortRead):
+    if isinstance(exc, _ShortReadError):
         return str(exc)  # Generated locally from byte counts; safe to display.
     if isinstance(exc, http.client.IncompleteRead):
         return "incomplete HTTP response"
@@ -727,8 +830,28 @@ def _safe_fetch_error(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def _log_retry(attempt: int, exc: Exception) -> None:
-    """Say, at debug level, why an attempt failed and that another follows."""
+# 429 means "ask again later" and 5xx is the server's own failure; both can
+# succeed on the next attempt. Every other 4xx is a statement about the
+# request itself and will answer the same way however often it is repeated.
+TOO_MANY_REQUESTS = 429
+SERVER_ERRORS = range(500, 600)
+
+
+def _is_retryable_status(code: int) -> bool:
+    """True when another attempt at the same URL could plausibly succeed."""
+    return code == TOO_MANY_REQUESTS or code in SERVER_ERRORS
+
+
+def _pause_before_retry(attempt: int, exc: Exception) -> None:
+    """Back off before the next attempt, or return at once after the last one.
+
+    Every transient branch of the fetch loop needs the same three steps, and
+    the "is there another attempt?" guard is the one that matters: without it
+    the final failure still sleeps, delaying the fallback to the next source
+    for no reason.
+    """
+    if attempt >= FETCH_ATTEMPTS:
+        return
     LOGGER.debug(
         "  attempt %d of %d failed (%s); retrying in %d s.",
         attempt,
@@ -736,6 +859,7 @@ def _log_retry(attempt: int, exc: Exception) -> None:
         _safe_fetch_error(exc),
         RETRY_BACKOFF_SECONDS * attempt,
     )
+    time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
 
 def _fetch_bytes(url: str) -> bytes:
@@ -779,7 +903,7 @@ def _fetch_bytes(url: str) -> bytes:
                 raise _too_large(url)
             if declared is not None and not chunked and len(body) != declared:
                 # Retry if a declared response body ends early.
-                raise _ShortRead(f"received {len(body):,} of {declared:,} bytes")
+                raise _ShortReadError(f"received {len(body):,} of {declared:,} bytes")
             return body
         except urllib.error.HTTPError as exc:
             # Close HTTPError bodies before retrying or falling back.
@@ -787,22 +911,16 @@ def _fetch_bytes(url: str) -> bytes:
                 with contextlib.suppress(OSError, ValueError):
                     exc.close()
             last_error = exc
-            if exc.code != 429 and not 500 <= exc.code < 600:
-                break  # Non-retryable client error; try the next source.
-            if attempt < FETCH_ATTEMPTS:
-                _log_retry(attempt, exc)
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-        except OSError as exc:  # Retry network and socket errors.
+            if not _is_retryable_status(exc.code):
+                break  # Permanent: this URL will answer the same way. Next source.
+            _pause_before_retry(attempt, exc)
+        except (OSError, http.client.IncompleteRead) as exc:
+            # Transient: network and socket errors, a cut-short transfer
+            # (_ShortReadError is an OSError for this reason), and a response
+            # the HTTP decoder found incomplete. IncompleteRead is caught here
+            # rather than falling through to the HTTPException clause below.
             last_error = exc
-            if attempt < FETCH_ATTEMPTS:
-                _log_retry(attempt, exc)
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-        except http.client.IncompleteRead as exc:
-            # Retry incomplete HTTP responses.
-            last_error = exc
-            if attempt < FETCH_ATTEMPTS:
-                _log_retry(attempt, exc)
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            _pause_before_retry(attempt, exc)
         except (ValueError, http.client.HTTPException) as exc:
             # Report invalid URL or HTTP syntax as a fetch failure so the next source can be tried.
             raise SyncError(f"could not fetch {redact_url(url)}: {_safe_fetch_error(exc)}") from exc
@@ -993,7 +1111,7 @@ def _resolve_indirect_document(document: dict[str, Any], source: str) -> tuple[d
 
 
 def _has_usable_steamids(document: dict[str, Any]) -> bool:
-    """True when at least one entry carries a SteamID this tool can normalise."""
+    """True when at least one entry carries a SteamID this tool can normalize."""
     players = document.get("players")
     if not isinstance(players, list):
         return False
@@ -1006,7 +1124,7 @@ def load_first_available_raw(sources: Iterable[str]) -> tuple[dict[str, Any], st
     The raw bytes are what gets written to the snapshot file, so the
     snapshot is an exact replica of the original upstream file -- same
     bytes, guaranteed by construction: nothing is ever decoded, parsed and
-    re-serialised on the way to the snapshot.
+    re-serialized on the way to the snapshot.
     """
     failures: list[str] = []
     for source in sources:

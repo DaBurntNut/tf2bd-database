@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -170,6 +171,31 @@ class SourceFetchTests(unittest.TestCase):
                     load_first_available_raw([self.URL])
                 self.assertEqual(urlopen.call_count, 1)  # The response URL was not followed.
 
+    def test_the_contents_api_may_only_hand_off_to_githubs_raw_host(self):
+        """The redirect guard, exercised with the address the bot really uses.
+
+        Every other case here starts from the example.invalid fixture, so the
+        one branch that only exists for api.github.com was never tested from
+        api.github.com: loosening it to allow ANY destination from that host
+        left the whole suite green. The source is taken from the shipped list
+        rather than retyped, so it cannot drift away from the real one.
+        """
+        api = next(url for url in sources.DEFAULT_SOURCES if urllib.parse.urlsplit(url).hostname == "api.github.com")
+        self.assertTrue(sources._allowed_download_url(api, "https://raw.githubusercontent.com/Nocrex/Tom/x.json"))
+        self.assertTrue(sources._allowed_download_url(api, "https://api.github.com/other"))  # Same origin.
+        for bad in (
+            "https://evil.test/steal",
+            "https://raw.githubusercontent.com.evil.test/x",  # Lookalike host.
+            "http://raw.githubusercontent.com/x",  # Downgraded scheme.
+            "https://raw.githubusercontent.com:8443/x",  # Non-default port.
+            "https://user:pw@raw.githubusercontent.com/x",  # Credentials attached.
+            "https://github.com/Nocrex/Tom/raw/main/x.json",  # Not the raw host.
+        ):
+            with self.subTest(candidate=bad):
+                self.assertFalse(sources._allowed_download_url(api, bad))
+        # The allowance runs one way only.
+        self.assertFalse(sources._allowed_download_url("https://raw.githubusercontent.com/a/b", api))
+
     def test_an_oversized_download_url_is_rejected_before_url_parsing(self):
         candidate = "https://example.invalid/" + "x" * sources._MAX_URL_PARSE_CHARS
         with mock.patch("sources.urllib.parse.urlsplit", side_effect=AssertionError("must not parse")):
@@ -318,6 +344,50 @@ class SourceFetchTests(unittest.TestCase):
             encoded_host = sources.urllib.parse.quote(encoded_host, safe="")
         malformed_authority = "https://host" + encoded_host + ".invalid/path"
         self.assertIn("omitted", sources.redact_url(malformed_authority))
+
+    def test_a_blank_in_userinfo_cannot_smuggle_a_password_past_the_prose_scan(self):
+        """A blank splits the token, so no single-URL pattern ever parses the authority.
+
+        ``_SPLIT_USERINFO_IN_TEXT`` is the only scan that still sees the span, so it
+        must not insist on the two shapes a well-formed URL happens to have: the
+        ``//`` after the scheme, and a literal ``@``. Both were optional for an
+        attacker and mandatory for the pattern, and every case below rode through
+        into the pull request body and the console log.
+        """
+        secret = "BLANK_SPLIT_USERINFO_SECRET"
+        hosts = (
+            f"https:user name:{secret}@host.invalid/p",  # no slashes after the scheme
+            f"http:user name:{secret}@host.invalid/p",
+            f"https://user name%3a{secret}%40host.invalid/p",  # percent-encoded ':' and '@'
+            f"https://user name:{secret}%40host.invalid/p",
+            f"https://user name%3A{secret}%40host.invalid/p",  # uppercase escapes
+            f"https://user name%3a{secret}%2540host.invalid/p",  # doubly encoded '@'
+        )
+        for blank in (" ", "\t", "\n", "\r"):
+            for template in hosts:
+                text = template.replace(" ", blank)
+                with self.subTest(text=text):
+                    shown = sources.redact_urls_in_text(text)
+                    self.assertNotIn(secret, shown)
+                    # Any of the safe outcomes will do -- the span is replaced, the
+                    # authority is rebuilt without userinfo, or the whole URL is
+                    # omitted -- but the text must not come back untouched.
+                    self.assertNotEqual(shown, text)
+
+    def test_prose_that_merely_looks_like_userinfo_is_left_readable(self):
+        """Dropping the ``//`` requirement must not swallow ordinary sentences.
+
+        Only ``http``/``https`` may omit the slashes. A prose colon followed by an
+        address is far more common than a credential, and redacting it would hide
+        the diagnostic the reader came for.
+        """
+        for text in (
+            "note: jane doe@example.invalid",
+            "contact: ops team@example.invalid for access",
+            "see RFC 3986: user info@example.invalid",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(sources.redact_urls_in_text(text), text)
 
     def test_bare_secret_fields_and_authorization_headers_are_redacted(self):
         cases = (
@@ -753,6 +823,226 @@ class SourceFetchTests(unittest.TestCase):
         self.assertNotIn("USERNAME_PASSWORD", shown)
         self.assertIn("https://example.invalid/watch", shown)
 
+    def test_a_semicolon_after_a_link_stays_with_the_sentence(self):
+        """The prose trim list includes ';'; the query one must not.
+
+        Mutation testing killed neither direction: no test distinguished the
+        two punctuation lists, so collapsing them to one string -- the obvious
+        "tidy-up" -- passed the whole suite. The cost is not cosmetic. A
+        semicolon left attached to the match is swallowed by the redaction
+        along with everything after it, so the remainder of the sentence
+        disappears from the report.
+        """
+        shown = sources.redact_urls_in_text("see https://e.invalid/?token=SECRET; next")
+        self.assertEqual("see https://e.invalid/?token=REDACTED; next", shown)
+        self.assertNotIn("SECRET", shown)
+
+    def test_prose_tail_start_separates_a_link_from_the_prose_around_it(self):
+        """Pin the trim helper's contract directly.
+
+        A closing bracket means two different things: part of the link when
+        the match opened it, and part of the sentence when it did not. Six
+        mutants of this logic survived the suite -- dropping the brace pair,
+        counting closers without openers, an off-by-one on the balance -- all
+        reachable in principle but only through inputs like '?token=S {(}))',
+        which would pin accidents rather than the rule. The rule is cheap to
+        state here instead.
+        """
+        prose, query = ".,;:!?", ".,:!?"
+        for value, punctuation, expected in (
+            # A bracket the match opened itself belongs to the link.
+            ("()", prose, 2),
+            ("(a)", prose, 3),
+            ("[a]", prose, 3),
+            ("{a}", prose, 3),
+            # A bracket the match never opened belongs to the sentence.
+            ("a)", prose, 1),
+            ("a]", prose, 1),
+            ("a}", prose, 1),
+            ("a))", prose, 1),
+            ("(a))", prose, 3),
+            # Punctuation goes first, then unmatched brackets behind it.
+            ("a).", prose, 1),
+            # Nothing but a closer leaves nothing of the link.
+            (")", prose, 0),
+            ("]", prose, 0),
+            ("}", prose, 0),
+            # The one difference between the two lists.
+            ("a;", prose, 1),
+            ("a;", query, 2),
+            ("a.", query, 1),
+            # Degenerate inputs stay in range.
+            ("a", prose, 1),
+            ("", prose, 0),
+        ):
+            with self.subTest(value=value, punctuation=punctuation):
+                self.assertEqual(expected, sources._prose_tail_start(value, punctuation))
+
+    def test_redacting_prose_stays_fast_on_blanks_that_never_close(self):
+        """A run of blanks with no closing ``@`` must not cost super-linear time.
+
+        The multiline-userinfo pattern looks for whitespace between ``//`` and
+        ``@``. If the runs on either side of that whitespace can match
+        whitespace themselves, every way of dividing a blank run is a separate
+        attempt, and text that never supplies the ``@`` makes the engine try
+        all of them: 2,000 characters took 42 seconds and the 4,096-character
+        inspection limit allowed roughly six minutes, per call.
+
+        ``proof`` strings come from the upstream list, are redacted one by one,
+        and are capped individually rather than in total, so a vandalized entry
+        could stall the scheduled run until the job timed out. The budget here
+        is thousands of times the fixed cost and hundreds of times smaller than
+        the old one, so it distinguishes the two without depending on the speed
+        of the machine.
+        """
+        longest = "http://" + " " * (sources._MAX_URL_PARSE_CHARS - 8)
+        self.assertLessEqual(len(longest), sources._MAX_URL_PARSE_CHARS)
+        started = time.monotonic()
+        # The full evidence budget: every row of the table, every link in a row.
+        for index in range(report_module.MAX_CHANGE_TABLE_ROWS * report_module.MAX_EVIDENCE_LINKS):
+            sources.redact_urls_in_text("http://" + " " * (report_module.MAX_EVIDENCE_LINK_CHARS - 13) + f"{index:06d}")
+        sources.redact_urls_in_text(longest)
+        self.assertLess(time.monotonic() - started, 30.0)
+
+    def test_blanks_before_userinfo_are_still_redacted(self):
+        """The faster pattern must still catch what the slower one caught."""
+        for blanks in (" ", "\n", "\t", "   ", " \n\t "):
+            with self.subTest(blanks=blanks):
+                shown = sources.redact_urls_in_text(f"Proof: https://user{blanks}name:BLANKS_SECRET@host.invalid/x")
+                self.assertNotIn("BLANKS_SECRET", shown)
+                self.assertNotIn("username", shown)
+                self.assertEqual("Proof: https://host.invalid/x", shown)
+
+    def test_an_encoded_at_sign_is_stripped_wherever_it_decodes(self):
+        """The authority is rebuilt from the text after the LAST decoded ``@``.
+
+        Three edges of that rule had no test. An ``@`` decoding to position
+        zero still delimits an (empty) userinfo; the host begins one character
+        past it, not at it; and a URL that already declares a username takes
+        the parsed-authority path even when the rest is percent-encoded. Each
+        case below fails if any of those three is altered.
+        """
+        for url, expected in (
+            # The decoded "@" lands at index 0 -- an empty userinfo still delimits.
+            ("https://%40host.invalid/x", "https://host.invalid/x"),
+            # The host starts after the "@", never at it.
+            ("https://%75%3A%53ECRETPW%40h.invalid/x", "https://h.invalid/x"),
+            # Declared username plus an encoded password: the port is unparseable and dropped.
+            ("https://u:%53ECRETPW@h.invalid:bad/x", "https://h.invalid/x"),
+        ):
+            with self.subTest(url=url):
+                shown = sources.redact_url(url)
+                self.assertEqual(expected, shown)
+                self.assertNotIn("SECRETPW", shown)
+
+    def test_prose_exactly_at_the_inspection_limit_is_still_inspected(self):
+        """The limit is a maximum, not a threshold: text OF that length is
+        inspected, and only text past it is dropped unread. An off-by-one here
+        would throw away a redactable message that is exactly at the edge.
+        """
+        limit = sources._MAX_URL_PARSE_CHARS
+        for length, inspected in ((limit - 1, True), (limit, True), (limit + 1, False)):
+            with self.subTest(length=length):
+                text = "http://u:pw@x.test/?a=1 " + "b" * (length - 24)
+                self.assertEqual(len(text), length)
+                shown = sources.redact_urls_in_text(text)
+                self.assertNotIn("u:pw@", shown)
+                if inspected:
+                    self.assertTrue(shown.startswith("http://x.test/?a=1 "), shown[:40])
+                else:
+                    self.assertEqual(shown, "[text omitted: too long to inspect safely]")
+
+    def test_one_bare_url_is_told_apart_from_prose_that_merely_has_punctuation(self):
+        """Prose is not parsed as a URL just because it contains a colon, and a
+        lone URL is not left unparsed just because it has no scheme. The HTML
+        reference case is the subtle one: ``a#b&#64;c`` is prose whose ``#``
+        introduces an entity, not a fragment.
+        """
+        for text, expected in (
+            ("http://x.test/a", True),
+            ("https://x.test/a", True),
+            ("HTTP://x.test/a", True),
+            ("see http://x.test", False),
+            ("a?b", True),
+            ("a#b", True),
+            ("a#b&#64;c", False),
+            ("a:b", False),
+            ("x", False),
+        ):
+            with self.subTest(text=text):
+                self.assertIs(sources._is_one_bare_url(text), expected)
+
+    def test_an_encoded_scheme_inside_entity_brackets_is_not_left_in_prose(self):
+        """Decoding reveals a URL that the raw text hides behind ``%3A%2F%2F``
+        and HTML brackets. It must be reported as omitted rather than passed
+        through with the encoded scheme intact.
+        """
+        shown = sources.redact_urls_in_text("&lt;http%3A%2F%2F[::1]&gt;")
+        self.assertNotIn("%3A%2F%2F", shown)
+        self.assertIn("omitted", shown)
+
+    def test_a_quote_inside_userinfo_cannot_smuggle_a_password_through_prose(self):
+        """``'`` is a legal sub-delimiter in userinfo, and the prose patterns stop at it.
+
+        ``redact_url`` always stripped these; only the in-prose scan let them
+        past, so the leak needed the URL to be surrounded by other words.
+        """
+        for delimiter in ("'", '"', "`", "<", ">"):
+            for scheme in ("https://", "http://", "ftp://", "//"):
+                with self.subTest(delimiter=delimiter, scheme=scheme):
+                    url = f"{scheme}us{delimiter}er:QUOTED_USERINFO_SECRET@host.invalid/x"
+                    shown = sources.redact_urls_in_text(f"Proof: {url} end")
+                    self.assertNotIn("QUOTED_USERINFO_SECRET", shown)
+                    self.assertEqual(f"Proof: {scheme}host.invalid/x end", shown)
+
+    def test_a_quote_cannot_be_used_to_reach_a_line_break(self):
+        """Neither half of the old pair caught both at once.
+
+        The line-break pattern's leading run stopped at a quote, and a
+        quote-only pattern would stop at the blank, so one character of each
+        kind slipped between them.
+        """
+        for userinfo in ("us'er na\nme", "<;a\tb", "x\n'y", "'", " '"):
+            with self.subTest(userinfo=userinfo):
+                shown = sources.redact_urls_in_text(f"Proof: https://{userinfo}:MIXED_BREAK_SECRET@host.invalid/x")
+                self.assertNotIn("MIXED_BREAK_SECRET", shown)
+
+    def test_a_proof_url_beside_an_unrelated_address_is_left_alone(self):
+        """Failing closed may not cost the reader a real link.
+
+        Every evidence URL carries a path, and the scan stops at its first
+        ``/``, so the surrounding prose survives even when a later ``@``
+        appears on the same line.
+        """
+        for text in (
+            "check 'https://steamcommunity.com/id/foo' and ask bob@corp.invalid",
+            "see <https://youtube.invalid/watch?v=abc> or mail me@there.invalid",
+            "`https://steamcommunity.com/profiles/765611980` filed by a@b.invalid",
+            "[clip](https://medal.invalid/clips/xyz) and contact x@y.invalid",
+            '{"url":"https://a.invalid/p","contact":"x@y.invalid"}',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(text, sources.redact_urls_in_text(text))
+
+    def test_a_bare_host_before_an_address_is_dropped_rather_than_parsed(self):
+        """A scheme and bare host with no path cannot be told apart from userinfo.
+
+        ``https://site.invalid' and ask bob@`` has the shape of a credential
+        split across prose, so the span goes whole. This is the same trade the
+        line-break pattern already made; it is recorded here so a future reader
+        sees it is chosen, not accidental.
+        """
+        shown = sources.redact_urls_in_text("check 'https://site.invalid' and ask bob@corp.invalid")
+        self.assertEqual("check 'https://corp.invalid", shown)
+
+    def test_break_characters_before_userinfo_cannot_cause_catastrophic_backtracking(self):
+        """The pattern anchors on the first break character, whichever kind it is."""
+        for payload in ("'" * 2_000, "'\"<>` \t" * 400, " " * 2_000, "a '" * 1_300 + "@h"):
+            with self.subTest(length=len(payload)):
+                started = time.perf_counter()
+                sources.redact_urls_in_text(f"https://{payload}")
+                self.assertLess(time.perf_counter() - started, 5.0)
+
     def test_percent_encoded_controls_cannot_split_a_credential_in_prose(self):
         for separator in ("%0A", "%0D", "%09", "%20", "%E2%80%8B", "%250A"):
             with self.subTest(separator=separator):
@@ -1069,7 +1359,7 @@ class SourceFetchTests(unittest.TestCase):
         self.assertIn("use https:// or a local path", str(caught.exception))
 
     def test_has_usable_steamids(self):
-        """The chain's accept test: one normalisable SteamID is enough."""
+        """The chain's accept test: one normalizable SteamID is enough."""
         self.assertFalse(sources._has_usable_steamids({}))
         self.assertFalse(sources._has_usable_steamids({"players": "nope"}))
         self.assertFalse(sources._has_usable_steamids({"players": []}))
@@ -1183,11 +1473,22 @@ class SourceFetchTests(unittest.TestCase):
         self.assertEqual(raw, self.BODY)
 
     def test_oversized_local_source_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "big.json"
-            path.write_bytes(b"x" * 4096)
-            with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError):
-                load_first_available_raw([str(path)])
+        """The size limit must be the thing that rejects it, not a later parse error.
+
+        A file of junk fails JSON parsing as well, so asserting SyncError alone
+        still passes with the limit deleted. The second body is the one that
+        matters: its first MAX_SOURCE_BYTES bytes are valid JSON, so without the
+        limit the oversized read is simply truncated and accepted, and the bot
+        syncs against a silently shortened upstream list.
+        """
+        prefix = b'{"players":[{"steamid":"[U:1:100]","attributes":["cheater"]}]}'
+        for label, body in (("junk", b"x" * 4096), ("valid JSON prefix", prefix + b" " * 4096)):
+            with self.subTest(body=label), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "big.json"
+                path.write_bytes(body)
+                with mock.patch("sources.MAX_SOURCE_BYTES", 1024), self.assertRaises(SyncError) as caught:
+                    load_first_available_raw([str(path)])
+                self.assertIn("safety limit", str(caught.exception))
 
     @unittest.skipUnless(Path("/dev/zero").exists(), "needs a special file")
     def test_special_files_are_refused_before_opening(self):
@@ -1664,6 +1965,138 @@ class SnapshotReadTests(unittest.TestCase):
         ):
             sources.load_snapshot(path)
         self.assertIn("Permission denied", str(caught.exception))
+
+
+class CredentialVocabularyTests(unittest.TestCase):
+    """The two redactors must agree on what a credential name looks like.
+
+    ``sources`` redacts credential-looking URL query names; ``playerlist``
+    redacts credential-looking fields in free-form diagnostic text. They used
+    to carry two hand-written copies of the same word list, and the copies
+    drifted: ``key``, ``pass``, ``passphrase``, ``appkey`` and ``ssh_key`` were
+    redacted inside a URL but printed in the clear in a diagnostic, which ends
+    up in a public Actions log and in the pull request body.
+    """
+
+    CREDENTIAL_NAMES = (
+        "token",
+        "access_token",
+        "refresh_token",
+        "api_key",
+        "apikey",
+        "api-key",
+        "appkey",
+        "key",
+        "ssh_key",
+        "private_key",
+        "secret",
+        "client_secret",
+        "password",
+        "passwd",
+        "pwd",
+        "pass",
+        "passphrase",
+        "auth",
+        "authorization",
+        "bearer",
+        "session",
+        "sessionid",
+        "cookie",
+        "csrf",
+        "xsrf",
+        "signature",
+        "sig",
+        "hmac",
+        "nonce",
+        "otp",
+        "mfa",
+        "credential",
+        "jwt",
+        "oauth",
+        "x-api-key",
+        "assertion",
+        "saml",
+        "x-amz-date",
+    )
+    HARMLESS_NAMES = ("steamid", "attributes", "proof", "players", "v", "si", "list", "page")
+
+    def test_both_redactors_use_the_one_shared_vocabulary(self):
+        self.assertIs(sources._SECRET_QUERY_PARAM.pattern, playerlist_module.CREDENTIAL_NAME_MARKERS)
+        self.assertIs(
+            playerlist_module._DIAGNOSTIC_SECRET_MARKER.pattern,
+            playerlist_module.CREDENTIAL_NAME_MARKERS,
+        )
+
+    def test_every_credential_name_is_caught_by_both_modules(self):
+        for name in self.CREDENTIAL_NAMES:
+            with self.subTest(name=name):
+                self.assertTrue(
+                    playerlist_module._is_secret_field_name(name),
+                    f"{name} would be printed in a diagnostic",
+                )
+                self.assertTrue(
+                    sources._has_sensitive_query_name(name),
+                    f"{name} would be published in a URL",
+                )
+
+    def test_the_two_modules_never_disagree(self):
+        """Drift in either direction is the bug; this pins both.
+
+        Over-matching is deliberate, so ordinary words containing a marker
+        (``monkey`` contains ``key``) are expected to be redacted by both.
+        """
+        for name in self.CREDENTIAL_NAMES + self.HARMLESS_NAMES + ("monkey", "passage", "encode"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    playerlist_module._is_secret_field_name(name),
+                    sources._has_sensitive_query_name(name),
+                    f"the redactors disagree about {name!r}",
+                )
+
+    def test_ordinary_playerlist_fields_are_still_readable(self):
+        """Over-matching must not swallow the words a diagnostic needs."""
+        for name in self.HARMLESS_NAMES:
+            with self.subTest(name=name):
+                self.assertFalse(playerlist_module._is_secret_field_name(name))
+
+    # A credential name hidden behind an invisible character or a look-alike
+    # letter. Each of these was printed in the clear by the diagnostic
+    # redactor; the soft hyphen was missing from a hand-written character
+    # list, and the look-alikes survived because nothing folded them onto the
+    # ASCII letters they imitate.
+    DISGUISED_NAMES = (
+        ("soft hyphen", "to\u00adken"),
+        ("zero-width space", "to\u200bken"),
+        ("zero-width joiner", "to\u200dken"),
+        ("byte-order mark", "to\ufeffken"),
+        ("full-width letters", "\uff54\uff4f\uff4b\uff45\uff4e"),
+        ("kelvin sign", "\u212aey"),
+        ("long s", "\u017fecret"),
+        ("percent-encoded", "to%6Ben"),
+        ("html reference", "to&#107;en"),
+    )
+
+    def test_a_disguised_credential_name_is_still_redacted(self):
+        for label, name in self.DISGUISED_NAMES:
+            with self.subTest(spelling=label):
+                self.assertTrue(
+                    playerlist_module._is_secret_field_name(name),
+                    f"{label} would be printed in a diagnostic",
+                )
+                self.assertTrue(
+                    sources._has_sensitive_query_name(name),
+                    f"{label} would be published in a URL",
+                )
+
+    def test_folding_is_by_unicode_category_not_a_fixed_list(self):
+        """Any control, format or separator character must fold away.
+
+        An enumerated list silently stops covering characters assigned after
+        it was written, which is how U+00AD came to be missing from it.
+        """
+        for code in ("\u0000", "\u001f", "\u007f", "\u00ad", "\u061c", "\u2060", "\u206a", "\u3000", "\ufff9"):
+            with self.subTest(char=hex(ord(code))):
+                self.assertEqual(playerlist_module.fold_name_for_matching(f"to{code}ken"), "token")
 
 
 if __name__ == "__main__":

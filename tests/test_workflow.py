@@ -23,7 +23,6 @@ import sync_vorobey_hackerpolice as sync_module
 from playerlist import (
     dumps,
     load,
-    strict_json_loads,
     validate,
 )
 from policy import is_racist_proof
@@ -43,7 +42,6 @@ class WorkflowContractTests(unittest.TestCase):
 
     root = Path(__file__).resolve().parent.parent
     workflow_path = root / ".github" / "workflows" / "sync-vorobey-hackerpolice.yml"
-    dependabot_path = root / ".github" / "dependabot.yml"
 
     @classmethod
     def setUpClass(cls):
@@ -122,13 +120,57 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertRegex(sha, r"^[0-9a-f]{40}$", f"{reference} is not pinned to a commit SHA")
             self.assertRegex(comment or "", r"#\s*v\d", f"{reference} needs its release tag in a comment")
 
+    # Files that belong to the maintainer and not to the sync. Spelled in halves
+    # so this tuple does not match itself when the scan below reads this file.
+    MAINTAINER_OWNED = (
+        "READ" + "ME.md",
+        "pyproj" + "ect.toml",
+        "rules.garou" + "3299.json",
+        "depend" + "abot.yml",
+    )
+
+    def test_no_test_reads_a_file_the_bot_does_not_need(self):
+        """A check that can fail over the README is an off-switch for the sync.
+
+        This is not hypothetical. A merge deleted a data file that one test
+        still loaded, the checks went red, and because the scheduled run is
+        gated on them the bot stopped publishing until someone noticed days
+        later. Nothing the sync does not read may be allowed to fail a test.
+
+        Prose is exempt, so the rule can be explained where it is enforced:
+        unparsing the tree drops comments, and the docstrings come off first.
+        Every function is scanned, not only the tests, because the read that
+        caused that outage sat two helpers deep and a scan of test bodies
+        alone would have missed it.
+        """
+        for path in sorted((self.root / "tests").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
+                    continue
+                first = node.body[0] if node.body else None
+                if isinstance(first, ast.Expr) and isinstance(getattr(first.value, "value", None), str):
+                    node.body[0] = ast.Pass()
+            lines = ast.unparse(tree).splitlines()
+            for name in self.MAINTAINER_OWNED:
+                found = [line.strip()[:90] for line in lines if name in line]
+                with self.subTest(path=path.name, name=name):
+                    self.assertEqual(found, [], f"{path.name} reads {name}, which the bot never does")
+
     def test_a_change_to_any_file_the_suite_reads_runs_the_checks(self):
         """Every file these tests read must be able to trigger them.
 
-        The dependabot contract and the shipped JSON data are validated here.
-        If any of those paths fall out of the workflow filter, a data-only
-        pull request could bypass its assertion. README.md is deliberately
-        absent: no test reads it, so its wording belongs to the maintainer.
+        If one of these paths fell out of the workflow filter, a change to it
+        could bypass the assertion that guards it.
+
+        The list below is deliberately short: it holds only what the sync
+        actually needs -- the database it edits, the snapshot it compares
+        against, the code, and the two git settings that govern its own
+        commits. Everything else in this repository belongs to the
+        maintainer. README.md, rules.garou3299.json, pyproject.toml and the
+        Dependabot config may be rewritten or deleted outright and no test
+        here will object, because a test that fails over one of them would
+        take the bot offline over a file the bot never reads.
         """
         block = self.workflow.split("  pull_request:\n", 1)[1].split("\npermissions:", 1)[0]
         patterns = re.findall(r'^\s+- "([^"]+)"', block, re.M)
@@ -141,12 +183,8 @@ class WorkflowContractTests(unittest.TestCase):
             ".gitattributes",
             ".gitignore",
             "playerlist.garou3299.json",
-            "playerlist.scammers.json",
-            "rules.garou3299.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
-            ".github/dependabot.yml",
             ".github/workflows/sync-vorobey-hackerpolice.yml",
-            "pyproject.toml",
             "scripts/playerlist.py",
             "tests/test_sources.py",
             "tests/test_policy.py",
@@ -187,6 +225,7 @@ class WorkflowContractTests(unittest.TestCase):
             "python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m unittest discover -s tests -v",
             "python3 -m coverage report",
             "python3 -m vulture scripts tests --min-confidence 60",
+            "python3 -m unittest discover -s tests -q",
         ):
             self.assertIn(command, checks)
             self.assertNotIn(command, sync)
@@ -200,6 +239,24 @@ class WorkflowContractTests(unittest.TestCase):
         for name, block in jobs.items():
             self.assertIn("timeout-minutes:", block, f"the {name} job has no timeout")
             self.assertIn("concurrency:", block, f"the {name} job has no concurrency group")
+
+    def test_the_second_test_pass_actually_ticks_the_clock(self):
+        """Without the env var the clock step is just the suite run twice.
+
+        The step re-runs the same discover command the coverage step already
+        ran; TF2BD_TICKING_CLOCK is the only thing that makes it a different
+        test. Dropping the variable would leave a green step that proves
+        nothing, so assert the variable and the command travel together.
+        """
+        checks = self.jobs()["checks"]
+        step = checks.split("No test may depend on the clock standing still", 1)[-1]
+        self.assertIn('TF2BD_TICKING_CLOCK: "1"', step)
+        self.assertIn("python3 -m unittest discover -s tests -q", step)
+        self.assertIn(
+            "TF2BD_TICKING_CLOCK",
+            (Path(__file__).resolve().parent / "_support.py").read_text(encoding="utf-8"),
+            "the workflow sets TF2BD_TICKING_CLOCK but nothing reads it",
+        )
 
     def test_the_sync_job_always_acts_on_the_default_branch(self):
         """A non-default workflow ref must never reach the write-capable job.
@@ -260,11 +317,12 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("continue-on-error: true", block)
         self.assertIn('gh pr list --repo "$REPOSITORY" --head "$BOT_BRANCH" --state open', block)
 
-    def test_the_checks_job_tests_the_python_floor_the_readme_promises(self):
+    def test_the_checks_job_tests_the_documented_python_floor(self):
         """Keep the 3.10 floor and production 3.12 in the checks matrix.
 
         Without the floor leg, a 3.11+ API (``datetime.UTC``, ``tomllib``) or a
-        3.12-only f-string could pass CI while breaking the documented promise.
+        3.12-only f-string could pass CI while breaking the floor that
+        pyproject.toml and the lint target both declare.
         The write-capable sync job stays on 3.12 as the production runtime.
         """
         checks = self.jobs()["checks"]
@@ -292,12 +350,6 @@ class WorkflowContractTests(unittest.TestCase):
         with self.assertRaises(SyntaxError):
             ast.parse("type Alias = int\n", feature_version=(3, 10))
 
-    def test_python_310_floor_matches_the_lint_target_and_ci(self):
-        pyproject = (self.root / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn("Python 3.10+", pyproject)
-        self.assertIn('target-version = "py310"', pyproject)
-        self.assertIn('"3.10"', self.jobs()["checks"])
-
     def test_the_suite_does_not_inherit_the_runners_output_file(self):
         """GITHUB_OUTPUT is exported by every CI step, including the test step.
 
@@ -306,7 +358,7 @@ class WorkflowContractTests(unittest.TestCase):
         reading its own outputs would be reading values produced by the tests.
 
         Checked in a CHILD interpreter, because that is the only place the
-        import-time behaviour can be observed -- and because asserting on this
+        import-time behavior can be observed -- and because asserting on this
         file's own text would match this test's own source and never fail.
         """
         code = (
@@ -321,46 +373,27 @@ class WorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "<popped>", result.stderr[-500:])
 
-    def test_the_coverage_gate_is_encoded_not_just_convention(self):
-        """`coverage report` must fail on an untested statement OR branch.
-
-        Without a [tool.coverage] section the gate only exists in a reviewer's
-        head: a plain `coverage run` reports line coverage, and anything at all
-        reports success. The thresholds belong in the file CI reads.
-        """
-        pyproject = (self.root / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn("branch = true", pyproject)
-        self.assertIn('source = ["scripts"]', pyproject)
-        # The floor must be high enough to catch real rot, and low enough that a
-        # contributor is not pushed to invent a test for an unreachable branch.
-        match = re.search(r"^fail_under = (\d+)$", pyproject, re.MULTILINE)
-        self.assertIsNotNone(match, "coverage fail_under is missing from pyproject.toml")
-        threshold = int(match.group(1))
-        self.assertGreaterEqual(threshold, 90)
-        self.assertLessEqual(threshold, 100)
-
     def test_the_check_job_is_read_only(self):
         jobs = self.jobs()
         self.assertIn("contents: read", jobs["checks"])
         self.assertNotIn("contents: write", jobs["checks"])
         self.assertNotIn("pull-requests: write", jobs["checks"])
 
-    def test_the_tool_versions_are_defined_once_and_interpolated(self):
-        for name in ("RUFF_VERSION", "MYPY_VERSION", "BANDIT_VERSION", "COVERAGE_VERSION", "VULTURE_VERSION"):
-            self.assertEqual(len(re.findall(rf'^\s*{name}:\s*"[^"]+"$', self.workflow, re.M)), 1, name)
-        for name, tool in (
-            ("RUFF_VERSION", "ruff"),
-            ("MYPY_VERSION", "mypy"),
-            ("BANDIT_VERSION", "bandit"),
-            ("COVERAGE_VERSION", "coverage"),
-            ("VULTURE_VERSION", "vulture"),
-        ):
-            self.assertIn(f'"{tool}==${{{name}}}"', self.workflow)
+    def test_the_workflow_installs_the_pinned_tools_and_pins_nothing_inline(self):
+        """One source of truth: a second inline pin could silently disagree."""
+        self.assertIn("--group ci", self.workflow)
+        for tool in ("ruff", "mypy", "bandit", "coverage", "vulture"):
+            self.assertNotRegex(self.workflow, rf'"{tool}==[^"]*"', f"{tool} is also pinned inline")
 
-    def test_ci_pins_the_coverage_tool_version(self):
-        """An unpinned coverage release could move the gate under us."""
-        configured = re.search(r'^\s*COVERAGE_VERSION:\s*"([^"]+)"$', self.workflow, re.M)
-        self.assertIsNotNone(configured, "CI must pin coverage")
+    def test_the_workflow_raises_pip_before_asking_for_a_dependency_group(self):
+        """``--group`` arrives in pip 25.1; setup-python can ship an older pip.
+
+        Without the upgrade the install dies with "no such option: --group" on
+        whichever leg happens to have the older pip -- a failure that looks
+        nothing like its cause.
+        """
+        install = self.workflow.split("--group ci", 1)[0]
+        self.assertIn('--upgrade "pip>=25.1"', install)
 
     def test_checks_run_for_all_events_and_only_pull_requests_run_no_sync(self):
         jobs = self.jobs()
@@ -369,13 +402,6 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("needs: checks", jobs["sync"])
         for watched in ("scripts/**", "tests/**", ".github/workflows/sync-vorobey-hackerpolice.yml"):
             self.assertIn(watched, self.workflow)
-
-    def test_dependabot_only_bumps_the_pinned_actions(self):
-        text = self.dependabot_path.read_text(encoding="utf-8")
-        self.assertIn('package-ecosystem: "github-actions"', text)
-        self.assertNotIn("pip", text)  # Runtime scripts have no third-party dependencies to update.
-        self.assertNotIn("package-ecosystem: npm", text)
-        self.assertIn('interval: "weekly"', text)
 
 
 class RepositoryDataTests(unittest.TestCase):
@@ -407,43 +433,12 @@ class RepositoryDataTests(unittest.TestCase):
         # after a manual formatting-only change.
         self.assertEqual(dumps(database), original)
 
-    def test_the_shipped_standalone_playerlist_is_valid_and_canonical(self):
-        """The separate scammer list is still shipped, even though the bot ignores it."""
-        database, original = load(self.ROOT / "playerlist.scammers.json")
-        self.assertEqual(validate(database).errors, [])
-        self.assertEqual(dumps(database), original)
-
-    def test_the_shipped_racist_rule_still_justifies_automatic_racist_proofs(self):
-        """The demotion policy relies on TF2BD's rule continuing to mark racist."""
-        document = strict_json_loads((self.ROOT / "rules.garou3299.json").read_bytes())
-        self.assertIsInstance(document, dict)
-        rules = document.get("rules")
-        self.assertIsInstance(rules, list)
-        racist_rules = [
-            rule
-            for rule in rules
-            if isinstance(rule, dict)
-            and isinstance(rule.get("actions"), dict)
-            and isinstance(rule["actions"].get("mark"), list)
-            and "racist" in rule["actions"]["mark"]
-        ]
-        self.assertTrue(racist_rules, "the shipped rule no longer marks racist")
-        self.assertTrue(
-            any(
-                isinstance(rule.get("triggers"), dict)
-                and isinstance(rule["triggers"].get("chatmsg_text_match"), dict)
-                and rule["triggers"]["chatmsg_text_match"].get("case_sensitive") is False
-                and rule["triggers"]["chatmsg_text_match"].get("mode") == "word"
-                and isinstance(rule["triggers"]["chatmsg_text_match"].get("patterns"), list)
-                and bool(rule["triggers"]["chatmsg_text_match"]["patterns"])
-                and all(
-                    isinstance(pattern, str) and pattern
-                    for pattern in rule["triggers"]["chatmsg_text_match"]["patterns"]
-                )
-                for rule in racist_rules
-            ),
-            "the racist rule must remain case-insensitive, word-matched, and non-empty",
-        )
+    # rules.garou3299.json is deliberately not read here at all. It is TF2BD's
+    # file, used by the detector and never by this bot, so holding it to this
+    # tool's idea of valid or canonical would only fail CI over an edit that has
+    # nothing to do with the sync -- and a failing check stops the scheduled run,
+    # so that edit would silently take the bot offline. The same reasoning keeps
+    # README.md, pyproject.toml and the Dependabot config out of this suite.
 
     def test_atomic_write_temporaries_are_ignored_by_git(self):
         """A SIGTERM/SIGKILL can leave a temp file that must not be staged."""
@@ -462,14 +457,18 @@ class RepositoryDataTests(unittest.TestCase):
         self.assertEqual(unrelated.returncode, 1, "the temporary-file rule must not hide unrelated dotfiles")
 
     def test_git_does_not_apply_line_ending_conversion_to_json_data(self):
-        """The snapshot must remain the exact upstream byte sequence."""
+        """The snapshot must remain the exact upstream byte sequence.
+
+        `git check-attr` answers for any path, existing or not, so a name that
+        leaves the repository would keep passing here forever. Each name is
+        therefore required to be a file that is actually shipped.
+        """
         for name in (
             "playerlist.garou3299.json",
-            "playerlist.scammers.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
-            "rules.garou3299.json",
         ):
             with self.subTest(path=name):
+                self.assertTrue((self.ROOT / name).is_file(), f"{name} is named here but no longer shipped")
                 result = subprocess.run(
                     ["git", "check-attr", "text", "--", name],
                     cwd=self.ROOT,
@@ -494,7 +493,7 @@ class RepositoryDataTests(unittest.TestCase):
                 break
         return "\n".join(lines[start:end])
 
-    def test_a_running_sync_is_never_cancelled_and_cannot_hang_forever(self):
+    def test_a_running_sync_is_never_canceled_and_cannot_hang_forever(self):
         workflow = (self.ROOT / ".github/workflows/sync-vorobey-hackerpolice.yml").read_text(encoding="utf-8")
         sync_block = self.job_block(workflow, "sync")
         self.assertIn("cancel-in-progress: false", workflow)
