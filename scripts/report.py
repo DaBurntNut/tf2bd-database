@@ -804,6 +804,15 @@ def _header_lines(info: RunInfo) -> list[str]:
         lines.append(f"- Demotion: **{_text(info.demotion_note)}**")
     if info.snapshot_note:
         # Snapshot notes contain code-authored Markdown; preserve their formatting.
+        #
+        # Deliberately NOT escaped through _text() the way the demotion note above
+        # is, and that asymmetry is intentional: a demotion note interpolates a
+        # filesystem path (data), while every snapshot note is assembled from fixed
+        # wording plus integers in _plan_demotion -- it never carries upstream text,
+        # so there is nothing here to neutralize. Escaping it would publish a
+        # literal "\*\*not refreshed\*\*" and "\`--demote\`" instead of bold text
+        # and a code span. If a snapshot note ever starts embedding a value that
+        # came from the network, escape that value at the point it is built.
         lines.append(f"- Snapshot: {info.snapshot_note}")
     elif info.snapshot_changed:
         verb = "would be updated" if info.dry_run else "updated"
