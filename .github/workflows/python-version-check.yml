@@ -81,7 +81,18 @@ jobs:
       - name: Read the pinned version
         id: pinned
         run: |
+          set -euo pipefail
           # Parse the same line the check edits, so a drift in either is caught here.
+          # current_series() in the checker refuses anything but exactly one
+          # PYTHON_VERSION line. This runs first, so it has to be just as strict:
+          # with two, grep returns both and "current=" below becomes a two-line
+          # $GITHUB_OUTPUT entry -- a malformed output written before the
+          # checker ever gets to report the real problem.
+          found="$(grep -cP '^  PYTHON_VERSION: "\d+\.\d+"$' "$WORKFLOW" || true)"
+          if [ "$found" != "1" ]; then
+            echo "::error::expected exactly one PYTHON_VERSION line in $WORKFLOW, found $found"
+            exit 1
+          fi
           version="$(grep -oP '^  PYTHON_VERSION: "\K\d+\.\d+' "$WORKFLOW")"
           test -n "$version"
           echo "current=$version" >> "$GITHUB_OUTPUT"

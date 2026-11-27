@@ -846,6 +846,36 @@ class RepositoryDataTests(unittest.TestCase):
             self.assertEqual(len(condition), 1, f"{name} must have exactly one condition")
             self.assertIn("steps.sync.outcome == 'success'", condition[0], f"{name} can run after a failed sync")
 
+    def test_the_shell_and_the_checker_are_equally_strict_about_PYTHON_VERSION(self):
+        """Two parsers read the same line; the looser one runs first.
+
+        ``current_series`` refuses a workflow with anything but exactly one
+        PYTHON_VERSION line. The shell step that feeds setup-python reads it
+        earlier with grep, and a plain grep happily returns two matches -- the
+        step would then write a two-line ``current=`` into $GITHUB_OUTPUT and
+        fail obscurely, before the checker could report the real problem.
+        Same input, same verdict, whichever parser sees it first.
+        """
+        import python_version_check as checker
+
+        two = 'on:\n  schedule: []\n\nenv:\n  PYTHON_VERSION: "3.14"\n  PYTHON_VERSION: "3.15"\n\njobs: {}\n'
+        with self.assertRaises(sync_module.SyncError):
+            checker.current_series(two)
+        with self.assertRaises(sync_module.SyncError):
+            checker.current_series("on:\n  schedule: []\n\njobs: {}\n")
+
+        check = (self.ROOT / ".github/workflows/python-version-check.yml").read_text(encoding="utf-8")
+        step = next(
+            (s for s in check.split("\n      - ") if s.startswith("name: Read the pinned version")),
+            None,
+        )
+        self.assertIsNotNone(step, "the step that reads the pinned version is gone")
+        body = step or ""
+        guard = body.index("grep -cP")
+        emit = body.index('echo "current=')
+        self.assertLess(guard, emit, "the count must be checked before the output is written")
+        self.assertIn('!= "1" ', body, "the step must accept exactly one PYTHON_VERSION line")
+
     def test_shipped_snapshot_is_a_usable_hackerpolice_list(self):
         snapshot = load_snapshot(self.ROOT / "snapshot" / "playerlist.vorobey-hackerpolice.json")
         self.assertIsNotNone(snapshot)
