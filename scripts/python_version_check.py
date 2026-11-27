@@ -32,6 +32,7 @@ Exit codes: 0 = the check ran (whether or not it proposes an upgrade),
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
 import itertools
 import logging
@@ -39,6 +40,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,7 +68,8 @@ _RELEASE = re.compile(r"\d+\.\d+\.\d+")
 # The pinned version lives in exactly one line of the workflow; capture its
 # halves so a rewrite cannot disturb the quoting or indentation around it.
 _PINNED_VERSION = re.compile(r'^(?P<head>  PYTHON_VERSION: ")(?P<series>\d+\.\d+)(?P<tail>")$', re.MULTILINE)
-_TOOL_PIN = re.compile(r'"([A-Za-z][\w.-]*)==([\w.]+)"')
+# Anchored with fullmatch, so anything it cannot read is reported, not skipped.
+_TOOL_PIN = re.compile(r"(?P<name>[A-Za-z][\w.-]*)==(?P<version>[\w.]+)")
 
 # Bound every decoded document: these are remote inputs like any other.
 MAX_TOOLS = 50
@@ -164,24 +167,43 @@ def supported_series(metadata: object, tool: str) -> frozenset[str]:
 
 
 def pinned_tools(config_text: str) -> dict[str, str]:
-    """Read the ``ci`` dependency group's exact pins, in file order."""
+    """Read the ``ci`` dependency group's exact pins, in file order.
+
+    EVERY entry has to parse. A requirement this cannot read -- an extra
+    (``coverage[toml]==7.17.5``), an environment marker, a range instead of a
+    pin -- raises rather than being skipped. Skipping one would drop a tool
+    from the support check silently, and the upgrade would then be proposed
+    on the word of the tools that happened to be legible. A check that
+    quietly measures less than it claims is worse than one that stops.
+    """
     block = re.search(r"^ci = \[\n(.*?)^\]", config_text, flags=re.MULTILINE | re.DOTALL)
     if block is None:
         raise SyncError("could not find the ci dependency group")
-    tools = dict(_TOOL_PIN.findall(block[1]))
-    if not tools:
+    # Comments may hold anything, including quotes; they are not requirements.
+    body = re.sub(r"#[^\n]*", "", block[1])
+    entries = re.findall(r'"([^"]*)"', body)
+    if not entries:
         raise SyncError("the ci dependency group pins no tools")
-    if len(tools) > MAX_TOOLS:
+    if len(entries) > MAX_TOOLS:
         raise SyncError(f"the ci dependency group pins more than {MAX_TOOLS} tools")
+    tools: dict[str, str] = {}
+    for entry in entries:
+        pin = _TOOL_PIN.fullmatch(entry.strip())
+        if pin is None:
+            raise SyncError(f"cannot read {entry!r} as an exact name==version pin; the support check needs one")
+        name, version = pin["name"], pin["version"]
+        if name in tools:
+            raise SyncError(f"{name} is pinned twice in the ci dependency group")
+        tools[name] = version
     return tools
 
 
 def current_series(workflow_text: str) -> str:
     """The single series the workflow pins today."""
-    matches = _PINNED_VERSION.findall(workflow_text)
+    matches = list(_PINNED_VERSION.finditer(workflow_text))
     if len(matches) != 1:
-        raise SyncError(f"expected exactly one PYTHON_VERSION line, found {len(matches)}")
-    return str(matches[0][1])
+        raise SyncError(f"expected exactly one PYTHON_VERSION line in the workflow, found {len(matches)}")
+    return matches[0]["series"]
 
 
 def rewrite_version(workflow_text: str, target: str) -> str:
@@ -226,9 +248,15 @@ def fetch_manifest(fetch: Fetch) -> object:
     document = _decode_json(fetch(MANIFEST_URL), MANIFEST_URL)
     if isinstance(document, dict):
         # The Contents API answers with the file wrapped, not the file itself.
+        # Anything else shaped like an object is an API error, not the manifest.
         unwrapped = sources._unwrap_github_contents_envelope(document)
         if unwrapped is None:
-            raise SyncError("the Python version manifest arrived in an envelope this check cannot open")
+            detail = document.get("message") if isinstance(document.get("message"), str) else None
+            raise SyncError(
+                f"the Python version manifest endpoint returned an object, not the manifest: {detail}"
+                if detail
+                else "the Python version manifest endpoint returned an object this check cannot read"
+            )
         document = _decode_json(unwrapped, MANIFEST_URL)
     return document
 
@@ -241,7 +269,7 @@ def gather(workflow_text: str, config_text: str, fetch: Fetch = _default_fetch) 
 
     support: dict[str, frozenset[str]] = {}
     for name, version in tools.items():
-        url = PYPI_URL.format(name=name, version=version)
+        url = PYPI_URL.format(name=urllib.parse.quote(name, safe=""), version=urllib.parse.quote(version, safe=""))
         support[name] = supported_series(_decode_json(fetch(url), url), name)
 
     newest = max(releases, key=_series_key)
@@ -320,20 +348,58 @@ def mask_clock(text: str, label: str) -> str:
     """
     masked, count = _RUN_AT.subn("- Run at: <masked for comparison>", text)
     if count != 1:
-        raise SyncError(f"expected exactly one timestamp line in {label}, found {count}")
+        raise SyncError(
+            f"expected exactly one '- Run at: YYYY-MM-DD HH:MM UTC' line in {label}, found {count}; "
+            "the report format changed, or the file uses CRLF line endings"
+        )
     return masked
 
 
+def _invisible_difference(old_text: str, new_text: str) -> list[str]:
+    """Describe a difference that a line-by-line diff cannot show.
+
+    ``str.splitlines()`` drops the terminator it split on and treats U+2028,
+    U+000B and U+000C as line breaks, so two texts can differ in bytes and
+    still produce identical line lists -- a diff of which is empty. Reporting
+    "identical" there would be the one wrong answer this whole check exists to
+    avoid, so the mismatch is described by offset instead.
+    """
+    pair = (old_text, new_text)
+    offset = next((index for index, (a, b) in enumerate(zip(*pair, strict=False)) if a != b), min(map(len, pair)))
+    return [
+        "The reports differ only in characters a line-by-line diff cannot show",
+        "(a line terminator, or a trailing newline).",
+        f"  first difference at character {offset}",
+        f"  current:  ...{old_text[max(0, offset - 20) : offset + 20]!r}",
+        f"  proposed: ...{new_text[max(0, offset - 20) : offset + 20]!r}",
+        f"  lengths: current {len(old_text)}, proposed {len(new_text)}",
+    ]
+
+
 def compare_reports(old_text: str, new_text: str) -> list[str]:
-    """Diff two sync reports, ignoring only the timestamp; empty means identical."""
+    """Diff two sync reports, ignoring only the timestamp; empty means identical.
+
+    The verdict is taken from the masked strings themselves, never from the
+    rendered diff: a readable diff is a nicety, and an empty one must never be
+    mistaken for agreement.
+    """
     old_masked = mask_clock(old_text, "the report from the current version")
     new_masked = mask_clock(new_text, "the report from the proposed version")
     if old_masked == new_masked:
         return []
-    diff = difflib.unified_diff(
-        old_masked.splitlines(), new_masked.splitlines(), fromfile="current", tofile="proposed", lineterm=""
+    diff = list(
+        itertools.islice(
+            difflib.unified_diff(
+                old_masked.splitlines(),
+                new_masked.splitlines(),
+                fromfile="current",
+                tofile="proposed",
+                lineterm="",
+            ),
+            MAX_DIFF_LINES,
+        )
     )
-    return list(itertools.islice(diff, MAX_DIFF_LINES))
+    return diff or _invisible_difference(old_masked, new_masked)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -341,7 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workflow", type=Path, default=DEFAULT_WORKFLOW, help="workflow file holding PYTHON_VERSION")
     parser.add_argument("--pins", type=Path, default=DEFAULT_PYPROJECT, help="file holding the ci dependency group")
-    parser.add_argument("--report", metavar="PATH", help="write the Markdown summary to this file")
+    parser.add_argument("--report", type=Path, metavar="PATH", help="write the Markdown summary to this file")
     parser.add_argument("--write", action="store_true", help="apply the upgrade to the workflow file")
     parser.add_argument(
         "--compare",
@@ -393,10 +459,13 @@ def run(args: argparse.Namespace, fetch: Fetch = _default_fetch) -> int:
 
     if args.report:
         try:
-            Path(args.report).write_text(report, encoding="utf-8")
+            args.report.write_text(report, encoding="utf-8")
         except OSError as exc:
             raise SyncError(f"cannot write {args.report}: {error_reason(exc)}") from exc
-    print(report, end="")
+    # The summary has already been written to --report, which is what the
+    # workflow publishes; a stdout that cannot take it is not worth the run.
+    with contextlib.suppress(OSError, ValueError):
+        print(report, end="")
     _write_outputs(decision)
     return 0
 
@@ -433,6 +502,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SyncError as exc:
         # A silent failure is worse than no check: make the run red.
         LOGGER.error("error: %s", exc)
+        return 2
+    except OSError as exc:
+        # Matches the sync CLI: a failed write is an exit code, not a traceback.
+        LOGGER.error("error: %s", error_reason(exc))
         return 2
     except KeyboardInterrupt:
         LOGGER.warning("interrupted.")

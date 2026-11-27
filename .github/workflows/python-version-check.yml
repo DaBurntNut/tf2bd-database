@@ -30,7 +30,12 @@ name: Python version check
 
 on:
   schedule:
-    # 06:00 UTC on the 1st, well clear of the 05:23 daily sync.
+    # Nominally 06:00 UTC on the 1st. Read it as "once a month", never as a
+    # clock: GitHub queues scheduled jobs, and the sync workflow's own comment
+    # records runs starting a median of 0.9 and 8.5 hours late. Nothing here
+    # depends on the time, or on landing clear of the daily sync -- this job
+    # copies the database and snapshot into a temporary directory and never
+    # writes to either, so the two cannot collide whatever order they run in.
     - cron: "0 6 1 * *"
   workflow_dispatch:
     inputs:
@@ -47,6 +52,7 @@ env:
   WORKFLOW: .github/workflows/sync-vorobey-hackerpolice.yml
   DATABASE: playerlist.garou3299.json
   SNAPSHOT: snapshot/playerlist.vorobey-hackerpolice.json
+  BOT_BRANCH: bot/python-version
 
 concurrency:
   group: python-version-check
@@ -65,7 +71,12 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          # Always the default branch: a manual dispatch may start from another
+          # ref, and the version this proposes to change lives on the default one.
+          ref: ${{ github.event.repository.default_branch }}
+          # Credentials are kept because the fallback step pushes with git.
+          # The alternative -- pasting a token into the remote URL -- is one
+          # bad error message away from printing it. Matches the sync job.
 
       - name: Read the pinned version
         id: pinned
@@ -169,17 +180,28 @@ jobs:
           test "$actual" != "$PREVIOUS"
 
       - name: Run the full suite on the proposed version
+        id: suite
         if: steps.check.outputs.upgrade == 'true'
-        # Standard library only, so no tooling has to be installed first. ruff,
-        # mypy, bandit and vulture are not run here on purpose: the pull request
-        # edits the sync workflow, which is one of its own pull_request paths, so
-        # the normal checks job re-runs all of them on the proposed version.
+        # Recorded, not fatal. Failing evidence belongs in the pull request
+        # where somebody reads it, not only in a run log nobody opens; the run
+        # is still failed at the end. Standard library only, so no tooling has
+        # to be installed first. ruff, mypy, bandit and vulture are left out on
+        # purpose: the pull request edits the sync workflow, which is one of its
+        # own pull_request paths, so the normal checks job re-runs all of them
+        # on the proposed version.
+        continue-on-error: true
         run: python3 -m unittest discover -s tests -q
 
       - name: Run the real sync on the PROPOSED version
+        id: sync_proposed
         if: steps.check.outputs.upgrade == 'true'
         # Same inputs, same relative paths, same flags -- only the interpreter
         # differs. That is the whole experiment.
+        #
+        # Recorded rather than fatal: the sync failing outright on the new
+        # version is the loudest possible result, and it has to reach the pull
+        # request. The comparison below turns a missing report into a failure.
+        continue-on-error: true
         run: |
           mkdir -p "$RUNNER_TEMP/proposed"
           cp "$DATABASE" "$RUNNER_TEMP/proposed/database.json"
@@ -200,7 +222,17 @@ jobs:
         # masking, no normalizing, no tolerance. Only the report gets the one
         # concession it has to: it stamps the minute it ran, and --compare
         # fails if that line is not found exactly once.
+        #
+        # Recorded rather than fatal, for the same reason as the suite above.
+        continue-on-error: true
+        env:
+          SYNC_PROPOSED: ${{ steps.sync_proposed.outcome }}
         run: |
+          set -euo pipefail
+          if [ "$SYNC_PROPOSED" != "success" ]; then
+            echo "The sync did not complete on the proposed version; there is nothing to compare."
+            exit 1
+          fi
           cmp "$RUNNER_TEMP/current/database.json" "$RUNNER_TEMP/proposed/database.json"
           cmp "$RUNNER_TEMP/current/snapshot.json" "$RUNNER_TEMP/proposed/snapshot.json"
           python3 scripts/python_version_check.py \
@@ -212,15 +244,29 @@ jobs:
         env:
           CURRENT: ${{ steps.pinned.outputs.current }}
           TARGET: ${{ steps.check.outputs.target }}
+          SUITE: ${{ steps.suite.outcome }}
+          COMPARE: ${{ steps.compare.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          set -euo pipefail
           {
             cat "$RUNNER_TEMP/python-version-check.md"
             echo
-            echo "The sync ran on both $CURRENT and $TARGET from one download of the same"
-            echo "upstream list. The database, the snapshot and the report it produced are"
-            echo "byte-for-byte identical on the two versions."
+            if [ "$SUITE" = "success" ]; then
+              echo "- The full test suite passes on \`$TARGET\`."
+            else
+              echo "- **The test suite does NOT pass on \`$TARGET\`.** See the run log: $RUN_URL"
+            fi
+            if [ "$COMPARE" = "success" ]; then
+              echo "- The sync ran on both \`$CURRENT\` and \`$TARGET\` from one download of the"
+              echo "  same upstream list. The database, the snapshot and the report are"
+              echo "  byte-for-byte identical on the two versions."
+            else
+              echo "- **The two versions did NOT produce identical output.** This is the check"
+              echo "  that matters; do not merge without reading it: $RUN_URL"
+            fi
             echo
-            echo "Nothing here merges itself. If a check is red, the upgrade needs a human."
+            echo "Nothing here merges itself. A red check means the upgrade needs a human."
           } > "$RUNNER_TEMP/pull-request-body.md"
 
       - name: Open a pull request
@@ -232,7 +278,7 @@ jobs:
         uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
         with:
           token: ${{ secrets.BOT_TOKEN || github.token }}
-          branch: bot/python-version
+          branch: ${{ env.BOT_BRANCH }}
           delete-branch: true
           title: "Upgrade Python ${{ steps.pinned.outputs.current }} -> ${{ steps.check.outputs.target }}"
           body-path: ${{ runner.temp }}/pull-request-body.md
@@ -250,19 +296,71 @@ jobs:
 
       - name: Push the branch and link a manual pull request
         if: steps.check.outputs.upgrade == 'true' && !inputs.dry_run && steps.pr.outcome == 'failure'
+        # Mirrors the sync workflow's fallback, including the parts that look
+        # like belt and braces: -B rather than -b because the action may have
+        # created the branch before it failed, and an explicitly fetched lease
+        # because a bare --force-with-lease has nothing to compare against when
+        # the ref was never fetched -- which makes it a plain force push.
         env:
           CURRENT: ${{ steps.pinned.outputs.current }}
           TARGET: ${{ steps.check.outputs.target }}
           REPOSITORY: ${{ github.repository }}
-          TOKEN: ${{ secrets.BOT_TOKEN || github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          branch="bot/python-version"
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
-          git add -- "$WORKFLOW"
-          git commit -m "Upgrade Python $CURRENT -> $TARGET"
-          git push --force-with-lease \
-            "https://x-access-token:$TOKEN@github.com/$REPOSITORY.git" "HEAD:$branch"
-          echo "Could not open the pull request automatically. Open it here:" >> "$GITHUB_STEP_SUMMARY"
-          echo "https://github.com/$REPOSITORY/compare/$branch?expand=1" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check the worktree, not only the branch ref; the action may already have committed.
+          if [ -n "$(git status --porcelain -- "$WORKFLOW")" ]; then
+            git checkout -B "$BOT_BRANCH"
+            git add -- "$WORKFLOW"
+            git commit -m "Upgrade Python $CURRENT -> $TARGET"
+          fi
+          if ! git rev-parse --verify --quiet "refs/heads/$BOT_BRANCH" > /dev/null; then
+            echo "::error::Nothing was committed to $BOT_BRANCH and no such branch exists - nothing to push."
+            exit 1
+          fi
+          # Derive the lease from an explicit fetch; checkout fetches only the default branch.
+          expected=''
+          if git fetch --quiet origin "+refs/heads/$BOT_BRANCH:refs/remotes/origin/$BOT_BRANCH" 2>/dev/null; then
+            expected=$(git rev-parse --verify "refs/remotes/origin/$BOT_BRANCH")
+          fi
+          # An empty lease requires the remote branch to be absent, so a failed fetch cannot authorize an overwrite.
+          git push --force-with-lease="refs/heads/$BOT_BRANCH:$expected" --set-upstream origin "$BOT_BRANCH"
+
+          {
+            echo ""
+            echo "### Pull request could not be created automatically"
+            echo ""
+            echo "The branch \`$BOT_BRANCH\` was pushed, but this repository does not allow"
+            echo "\`GITHUB_TOKEN\` to open pull requests."
+            echo ""
+            echo "Open it with one click: https://github.com/$REPOSITORY/compare/$BASE_BRANCH...$BOT_BRANCH?expand=1"
+            echo ""
+            echo "Or enable *Settings → Actions → General → Workflow permissions → Allow GitHub"
+            echo "Actions to create and approve pull requests*, or add a \`BOT_TOKEN\` secret"
+            echo "(contents + pull requests: write)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the run if the evidence did not hold
+        # Last, so the pull request exists and carries the failure before the
+        # run goes red. A silent pass here would be the worst outcome available:
+        # an upgrade that changed the published output, merged on trust.
+        if: always() && steps.check.outputs.upgrade == 'true'
+        env:
+          SUITE: ${{ steps.suite.outcome }}
+          COMPARE: ${{ steps.compare.outcome }}
+        run: |
+          set -euo pipefail
+          failed=0
+          if [ "$SUITE" != "success" ]; then
+            echo "::error::The test suite did not pass on the proposed Python version."
+            failed=1
+          fi
+          if [ "$COMPARE" != "success" ]; then
+            echo "::error::The proposed Python version did not produce identical output."
+            failed=1
+          fi
+          exit "$failed"

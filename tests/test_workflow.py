@@ -233,6 +233,11 @@ class WorkflowContractTests(unittest.TestCase):
         Dependabot config may be rewritten or deleted outright and no test
         here will object, because a test that fails over one of them would
         take the bot offline over a file the bot never reads.
+
+        Both workflows are on the list. The security assertions above read
+        every file in .github/workflows, so a second workflow arriving made
+        it a file the suite reads -- and the rule in this docstring applies
+        to it the moment that became true.
         """
         block = self.workflow.split("  pull_request:\n", 1)[1].split("\npermissions:", 1)[0]
         patterns = re.findall(r'^\s+- "([^"]+)"', block, re.M)
@@ -241,12 +246,19 @@ class WorkflowContractTests(unittest.TestCase):
         def covered(name: str) -> bool:
             return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
+        # Derived, not listed: the assertions above glob this directory, so a
+        # third workflow is covered the day it is added rather than the day
+        # somebody remembers to extend a literal list.
+        workflows = [
+            f".github/workflows/{path.name}" for path in sorted((self.root / ".github" / "workflows").glob("*.yml"))
+        ]
+        self.assertGreaterEqual(len(workflows), 2)
         for name in (
+            *workflows,
             ".gitattributes",
             ".gitignore",
             "playerlist.garou3299.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
-            ".github/workflows/sync-vorobey-hackerpolice.yml",
             "scripts/playerlist.py",
             "tests/test_sources.py",
             "tests/test_policy.py",

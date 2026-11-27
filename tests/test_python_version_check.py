@@ -16,6 +16,7 @@ import contextlib
 import io
 import json
 import logging
+import random
 import runpy
 import tempfile
 import unittest
@@ -207,6 +208,31 @@ class BadInputTests(unittest.TestCase):
         with self.assertRaises(SyncError):
             checker.pinned_tools("[dependency-groups]\nci = [\n]\n")
 
+    def test_a_requirement_it_cannot_read_stops_the_check(self):
+        """Regression. These were silently skipped, which is the unsafe answer.
+
+        A tool missing from the table is a tool whose opinion was never asked,
+        and the upgrade would then be proposed on the word of the pins that
+        happened to be legible. Stopping is the only safe response.
+        """
+        for label, entry in {
+            "an extra": '"coverage[toml]==7.17.5"',
+            "an environment marker": "\"mypy==2.4.1 ; python_version >= '3.9'\"",
+            "a range rather than a pin": '"mypy>=2.4.1"',
+            "a bare name": '"mypy"',
+        }.items():
+            with self.subTest(case=label), self.assertRaises(SyncError):
+                checker.pinned_tools(f'[dependency-groups]\nci = [\n    "ruff==0.17.6",\n    {entry},\n]\n')
+
+    def test_one_tool_pinned_twice_is_refused(self):
+        """Last-one-wins would silently drop the first pin's verdict."""
+        with self.assertRaises(SyncError):
+            checker.pinned_tools('[dependency-groups]\nci = [\n    "ruff==0.17.6",\n    "ruff==0.18.0",\n]\n')
+
+    def test_a_comment_is_not_mistaken_for_a_requirement(self):
+        pins = '[dependency-groups]\nci = [\n    "ruff==0.17.6",  # the "fast" one\n    "mypy==2.4.1",\n]\n'
+        self.assertEqual(checker.pinned_tools(pins), {"ruff": "0.17.6", "mypy": "2.4.1"})
+
     def test_an_absurd_number_of_pins_is_refused(self):
         pins = "".join(f'    "tool{index}==1.0",\n' for index in range(checker.MAX_TOOLS + 1))
         with self.assertRaises(SyncError):
@@ -215,7 +241,14 @@ class BadInputTests(unittest.TestCase):
     def test_an_envelope_the_check_cannot_open_is_an_error(self):
         with self.assertRaises(SyncError) as caught:
             checker.fetch_manifest(lambda url: b'{"encoding": "none"}')
-        self.assertIn("envelope", str(caught.exception))
+        self.assertIn("cannot read", str(caught.exception))
+
+    def test_a_github_error_object_is_reported_with_its_message(self):
+        """A 404 body is an object too; saying "envelope" would send the reader
+        looking for a decoding problem that is not there."""
+        with self.assertRaises(SyncError) as caught:
+            checker.fetch_manifest(lambda url: b'{"message": "Not Found"}')
+        self.assertIn("Not Found", str(caught.exception))
 
     def test_a_base64_envelope_is_unwrapped(self):
         payload = base64.b64encode(manifest("3.14.10")).decode()
@@ -288,6 +321,47 @@ class ComparisonTests(unittest.TestCase):
         big = self.REPORT + "".join(f"- line {index}\n" for index in range(5000))
         diff = checker.compare_reports(self.REPORT, big)
         self.assertLessEqual(len(diff), checker.MAX_DIFF_LINES)
+
+    def test_a_difference_a_line_diff_cannot_show_is_still_reported(self):
+        """Regression. This check reported "identical" for differing files.
+
+        ``str.splitlines()`` drops the terminator it split on and treats
+        U+2028, U+000B and U+000C as line breaks, so these pairs produced
+        identical line lists and an empty diff -- which the caller read as
+        agreement. The verdict now comes from the masked strings themselves.
+
+        U+2028 is not hypothetical here: this repository's own corpus uses it
+        in player names, and names are rendered into the report.
+        """
+        cases = {
+            "no trailing newline": self.REPORT.rstrip("\n"),
+            "U+2028 line separator": self.REPORT.replace("- Entries: 6,418\n", "- Entries: 6,418\u2028"),
+            "U+000B vertical tab": self.REPORT.replace("- Entries: 6,418\n", "- Entries: 6,418\u000b"),
+            "U+000C form feed": self.REPORT.replace("- Entries: 6,418\n", "- Entries: 6,418\u000c"),
+            "CR instead of LF": self.REPORT.replace("- Entries: 6,418\n", "- Entries: 6,418\r"),
+        }
+        for label, other in cases.items():
+            with self.subTest(case=label):
+                self.assertNotEqual(self.REPORT, other, "the fixture must actually differ")
+                self.assertNotEqual(checker.compare_reports(self.REPORT, other), [])
+
+    def test_the_readable_diff_is_only_ever_a_nicety(self):
+        """The verdict must not depend on difflib producing output.
+
+        ``splitlines(keepends=True)`` round-trips exactly, so two texts with
+        equal line lists are equal texts -- which is what lets an empty diff
+        be replaced by a description instead of being trusted.
+        """
+        alphabet = "ab\n\r\u2028\u2029\u000b\u000c\u0085 "
+        random.seed(20261114)
+        for _ in range(2000):
+            text = "".join(random.choice(alphabet) for _ in range(random.randrange(12)))
+            self.assertEqual("".join(text.splitlines(keepends=True)), text)
+
+    def test_the_description_points_at_the_offset(self):
+        diff = checker.compare_reports(self.REPORT, self.REPORT.rstrip("\n"))
+        self.assertTrue(any("first difference at character" in line for line in diff))
+        self.assertTrue(any("lengths:" in line for line in diff))
 
 
 class CommandLineTests(unittest.TestCase):
@@ -373,7 +447,7 @@ class CommandLineTests(unittest.TestCase):
             (root / "p.toml").write_text(PINS, encoding="utf-8")
             report = root / "out.md"
             fetch = fetcher(manifest("3.12.16", "3.14.10"), ruff=pypi("3.12", "3.14"), mypy=pypi("3.12", "3.14"))
-            args = self.args(workflow=workflow, pins=root / "p.toml", write=True, report=str(report))
+            args = self.args(workflow=workflow, pins=root / "p.toml", write=True, report=report)
             self.assertEqual(self.invoke(args, fetch), 0)
             self.assertIn('PYTHON_VERSION: "3.14"', workflow.read_text(encoding="utf-8"))
             self.assertIn("all 2 tools support 3.14", report.read_text(encoding="utf-8"))
@@ -444,7 +518,7 @@ class FailureToWriteTests(unittest.TestCase):
     def test_a_report_that_cannot_be_written_is_an_error(self):
         target = self.root / "missing-directory" / "out.md"
         with self.assertRaises(SyncError) as caught:
-            checker.run(self.args(report=str(target)), self.fetch)
+            checker.run(self.args(report=target), self.fetch)
         self.assertIn("cannot write", str(caught.exception))
 
     def test_step_outputs_that_cannot_be_written_are_an_error(self):
@@ -455,6 +529,22 @@ class FailureToWriteTests(unittest.TestCase):
         ):
             checker._write_outputs(decision)
         self.assertIn("step outputs", str(caught.exception))
+
+    def test_a_dead_stdout_does_not_cost_a_finished_check_its_exit_code(self):
+        """The summary is already in --report, which is what the workflow reads.
+
+        The sibling sync CLI suppresses exactly this; an unattended job should
+        not have two answers to the same question.
+        """
+        dead = io.StringIO()
+        dead.close()
+        with contextlib.redirect_stdout(dead), quiet_logger():
+            self.assertEqual(checker.run(self.args(), self.fetch), 0)
+
+    def test_an_oserror_is_an_exit_code_and_not_a_traceback(self):
+        """Matches the sync CLI's mapping: 0 / 2 / 130, never a stack trace."""
+        with mock.patch.object(checker, "run", side_effect=OSError(28, "No space left on device")), quiet_logger():
+            self.assertEqual(checker.main([]), 2)
 
     def test_a_fifo_at_the_output_path_is_refused_rather_than_blocking(self):
         """The sync's opener is reused precisely so this cannot hang the job."""

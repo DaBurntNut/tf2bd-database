@@ -53,6 +53,12 @@ on:
       # commits -- are allowed to fail a test, because only those can break the bot.
       - ".github/dependabot.yml"
       - ".github/workflows/sync-vorobey-hackerpolice.yml"
+      # The suite reads EVERY workflow, not just this one, to check that actions
+      # are SHA-pinned, that no job grants permissions globally and that no
+      # untrusted text reaches a shell. A file the tests read has to be able to
+      # run them, or a bad edit lands unchecked and fails somebody else's
+      # unrelated pull request later.
+      - ".github/workflows/python-version-check.yml"
 
 # Least privilege by default: no job may read or write more than its own block.
 permissions: {}

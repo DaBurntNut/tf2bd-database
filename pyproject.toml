@@ -1,6 +1,7 @@
-# Tooling config only. The scripts target the ONE Python version the workflow
-# pins (PYTHON_VERSION in .github/workflows/sync-vorobey-hackerpolice.yml);
-# keep target-version below in step with it.
+# Tooling config only. The scripts run on the ONE Python version the workflow
+# pins (PYTHON_VERSION in .github/workflows/sync-vorobey-hackerpolice.yml).
+# ruff's target-version below is deliberately NOT that number -- see the note
+# above it before changing either.
 
 # Versions of the tools configured below, so a tool's settings and its version
 # live in one file. Dependabot owns this table (see .github/dependabot.yml) and
