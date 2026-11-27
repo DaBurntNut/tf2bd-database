@@ -351,12 +351,25 @@ jobs:
         if: always() && steps.check.outputs.upgrade == 'true'
         env:
           SUITE: ${{ steps.suite.outcome }}
+          SYNC_PROPOSED: ${{ steps.sync_proposed.outcome }}
           COMPARE: ${{ steps.compare.outcome }}
         run: |
           set -euo pipefail
           failed=0
           if [ "$SUITE" != "success" ]; then
             echo "::error::The test suite did not pass on the proposed Python version."
+            failed=1
+          fi
+          # Checked here as well as inside the compare step. The compare step
+          # refuses to run when the sync failed, so this is unreachable while
+          # that guard stands -- but it is the guard standing, not this job's
+          # own logic, that keeps a crashed sync from passing. Naming all three
+          # evidence steps in the one place that decides red or green means an
+          # edit to the compare script cannot quietly turn a broken upgrade
+          # green, and the error names the step that actually failed instead of
+          # blaming the comparison for a sync that never produced output.
+          if [ "$SYNC_PROPOSED" != "success" ]; then
+            echo "::error::The sync did not complete on the proposed Python version."
             failed=1
           fi
           if [ "$COMPARE" != "success" ]; then

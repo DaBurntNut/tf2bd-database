@@ -182,6 +182,59 @@ class WorkflowContractTests(unittest.TestCase):
                     with self.subTest(workflow=path.name, expression=expression):
                         self.assertRegex(expression, safe, f"{expression} reaches a shell; pass it through env:")
 
+    def test_a_step_allowed_to_fail_is_either_handled_or_declared_best_effort(self):
+        """``continue-on-error`` turns a failure into silence. Silence needs a plan.
+
+        The flag is right for two different reasons and the difference matters.
+        Evidence steps use it so the run can keep going and attach the failure
+        to a pull request a human reads -- their outcome must then be read back
+        somewhere, or the job goes green with a broken result. Housekeeping
+        steps use it because their failure genuinely does not matter, and that
+        has to be said out loud rather than inferred from the absence of a
+        reader.
+
+        Without this test the two are indistinguishable in review: adding a
+        fourth evidence step and forgetting to name it in the final gate looks
+        exactly like deliberate best-effort cleanup, and the only symptom is a
+        green tick on an upgrade nobody verified.
+
+        Read with the same plain-text scan the other checks here use: PyYAML is
+        not a dependency of this suite, and adding one so a test can read a
+        workflow would put the bot's checks at the mercy of a package it does
+        not otherwise need.
+        """
+        for path in sorted((self.root / ".github" / "workflows").glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            lines = text.splitlines()
+            for index, line in enumerate(lines):
+                if line.strip() != "continue-on-error: true":
+                    continue
+                name, identifier = self._enclosing_step(lines, index)
+                read_back = bool(
+                    identifier and re.search(rf"steps\.{re.escape(identifier)}\.(outcome|conclusion)", text)
+                )
+                above = lines[index - 1].strip()
+                declared = above.startswith("#") and "best-effort" in above.casefold()
+                with self.subTest(workflow=path.name, step=name):
+                    self.assertTrue(
+                        read_back or declared,
+                        f"{name!r} may fail silently: give it an id and read its outcome, "
+                        f"or say in a comment directly above continue-on-error why best-effort is correct",
+                    )
+
+    @staticmethod
+    def _enclosing_step(lines: list[str], index: int) -> tuple[str, str | None]:
+        """Name and id of the step containing ``lines[index]``, scanning upwards."""
+        name, identifier = "(unnamed)", None
+        for cursor in range(index, -1, -1):
+            stripped = lines[cursor].strip()
+            if stripped.startswith("id:") and identifier is None:
+                identifier = stripped.removeprefix("id:").strip()
+            if stripped.startswith("- name:"):
+                name = stripped.removeprefix("- name:").strip()
+                break
+        return name, identifier
+
     # Files that belong to the maintainer and not to the sync. Spelled in halves
     # so this tuple does not match itself when the scan below reads this file.
     MAINTAINER_OWNED = (
