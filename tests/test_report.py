@@ -320,11 +320,17 @@ class ReportTests(unittest.TestCase):
             return len(_UNESCAPED_PIPE.findall(line)) - 1
 
         header_cells = None
+        compared = 0
         for line in report.splitlines():
             if line.startswith("| SteamID |"):
                 header_cells = cells(line)
             elif line.startswith("| `["):
                 self.assertEqual(cells(line), header_cells, line)
+                compared += 1
+        # Without this the test passes on a report that renders no rows at all:
+        # every assertion above lives inside the loop. Three changes went in, so
+        # three rows must have come back out.
+        self.assertEqual(compared, 3, "expected a row per change; the table lost rows")
 
     def test_unusable_steamid_renders_name_without_a_link(self):
         changes = (Change(steamid="nope", name="someone", before=("suspicious",), after=("cheater",)),)

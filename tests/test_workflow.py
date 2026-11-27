@@ -47,6 +47,18 @@ class WorkflowContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = cls.workflow_path.read_text(encoding="utf-8")
 
+    def workflow_files(self) -> list[Path]:
+        """Every workflow in the repository, newest rules applied to all of them.
+
+        Returning the list from one place keeps a new workflow from inheriting
+        none of the rules below, and the assertion means a glob that stops
+        matching fails loudly instead of turning every caller into a test that
+        scans nothing and passes.
+        """
+        paths = sorted((self.root / ".github" / "workflows").glob("*.yml"))
+        self.assertGreaterEqual(len(paths), 2, "expected the sync and the version check")
+        return paths
+
     def jobs(self) -> dict[str, str]:
         """Split the jobs: mapping into one string per job."""
         _, _, body = self.workflow.partition("\njobs:\n")
@@ -100,10 +112,19 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(read - set(written), set(), "the workflow reads an output nothing writes")
 
     def test_the_publish_steps_require_a_successful_sync(self):
-        for block in re.findall(
+        """Renaming a publishing step must not quietly exempt it from the gate.
+
+        The scan finds steps by name, so a rename would match nothing and the
+        loop below would assert nothing. Count the publishing steps a second
+        way -- anything that writes to the repository -- and require the two
+        counts to agree before trusting the result.
+        """
+        blocks = re.findall(
             r"- name: (?:Open or update pull request|Push branch|Commit directly)([\s\S]*?)(?=\n\s+- name:|\Z)",
             self.workflow,
-        ):
+        )
+        self.assertEqual(len(blocks), 3, "expected the pull request, the fallback push and the direct commit")
+        for block in blocks:
             self.assertIn("steps.sync.outcome == 'success'", block, "publishing must not run after a failed sync")
             self.assertIn("steps.sync.outputs.changed == 'true'", block)
 
@@ -125,8 +146,7 @@ class WorkflowContractTests(unittest.TestCase):
         A second one arrived and inherited none of them -- an unpinned action in
         it would have been just as exploitable, and nothing would have said so.
         """
-        workflows = sorted((self.root / ".github" / "workflows").glob("*.yml"))
-        self.assertGreaterEqual(len(workflows), 2, "expected the sync and the version check")
+        workflows = self.workflow_files()
         total = 0
         for path in workflows:
             uses = re.findall(r"uses:\s*(\S+)\s*(#[^\n]*)?", path.read_text(encoding="utf-8"))
@@ -146,7 +166,7 @@ class WorkflowContractTests(unittest.TestCase):
         repository is current while the other is not.
         """
         pins: dict[str, set[str]] = {}
-        for path in sorted((self.root / ".github" / "workflows").glob("*.yml")):
+        for path in self.workflow_files():
             for reference, _ in re.findall(r"uses:\s*(\S+)\s*(#[^\n]*)?", path.read_text(encoding="utf-8")):
                 repository, _, sha = reference.partition("@")
                 pins.setdefault(repository, set()).add(sha)
@@ -156,7 +176,7 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_no_workflow_grants_permissions_globally(self):
         """Least privilege is a property of the repository, not of one file."""
-        for path in sorted((self.root / ".github" / "workflows").glob("*.yml")):
+        for path in self.workflow_files():
             text = path.read_text(encoding="utf-8")
             with self.subTest(workflow=path.name):
                 self.assertIn("\npermissions: {}\n", text, f"{path.name} must start from no permissions")
@@ -175,12 +195,25 @@ class WorkflowContractTests(unittest.TestCase):
             r"|^steps\.[\w-]+\.(outcome|conclusion)$"
             r"|^secrets\.[\w]+ \|\| github\.token$"
         )
-        for path in sorted((self.root / ".github" / "workflows").glob("*.yml")):
+        scanned = 0
+        for path in self.workflow_files():
             text = path.read_text(encoding="utf-8")
-            for block in re.findall(r"\n        run: \|?\n?([\s\S]*?)(?=\n      - |\n  [a-z]|\Z)", text):
+            blocks = re.findall(r"\n        run: \|?\n?([\s\S]*?)(?=\n      - |\n  [a-z]|\Z)", text)
+            # A scanner that silently matches nothing is indistinguishable from
+            # a clean repository. Count the run: steps two ways and insist the
+            # numbers agree, so a drift in the layout this regex assumes shows
+            # up as a failure here rather than as unnoticed coverage loss.
+            self.assertEqual(
+                len(blocks),
+                len(re.findall(r"^\s+run:", text, re.MULTILINE)),
+                f"the run: scan missed a step in {path.name}; its injection check is not running",
+            )
+            scanned += len(blocks)
+            for block in blocks:
                 for expression in re.findall(r"\$\{\{\s*([^}]+?)\s*\}\}", block):
                     with self.subTest(workflow=path.name, expression=expression):
                         self.assertRegex(expression, safe, f"{expression} reaches a shell; pass it through env:")
+        self.assertGreaterEqual(scanned, 20, "the workflows run far more shell than this; the scan is not finding it")
 
     def test_a_step_allowed_to_fail_is_either_handled_or_declared_best_effort(self):
         """``continue-on-error`` turns a failure into silence. Silence needs a plan.
@@ -203,7 +236,7 @@ class WorkflowContractTests(unittest.TestCase):
         workflow would put the bot's checks at the mercy of a package it does
         not otherwise need.
         """
-        for path in sorted((self.root / ".github" / "workflows").glob("*.yml")):
+        for path in self.workflow_files():
             text = path.read_text(encoding="utf-8")
             lines = text.splitlines()
             for index, line in enumerate(lines):
@@ -258,7 +291,9 @@ class WorkflowContractTests(unittest.TestCase):
         caused that outage sat two helpers deep and a scan of test bodies
         alone would have missed it.
         """
-        for path in sorted((self.root / "tests").glob("*.py")):
+        test_files = sorted((self.root / "tests").glob("*.py"))
+        self.assertGreaterEqual(len(test_files), 5, "the test glob matched almost nothing; this scan is not running")
+        for path in test_files:
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
@@ -302,9 +337,7 @@ class WorkflowContractTests(unittest.TestCase):
         # Derived, not listed: the assertions above glob this directory, so a
         # third workflow is covered the day it is added rather than the day
         # somebody remembers to extend a literal list.
-        workflows = [
-            f".github/workflows/{path.name}" for path in sorted((self.root / ".github" / "workflows").glob("*.yml"))
-        ]
+        workflows = [f".github/workflows/{path.name}" for path in self.workflow_files()]
         self.assertGreaterEqual(len(workflows), 2)
         for name in (
             *workflows,

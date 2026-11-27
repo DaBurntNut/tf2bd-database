@@ -520,8 +520,18 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("current=3.12\n", written)
 
     def test_no_outputs_are_written_outside_actions(self):
-        with mock.patch.dict(checker.os.environ, {}, clear=True):
+        """Off Actions there is no $GITHUB_OUTPUT, and nothing may be opened.
+
+        Asserting only that the call does not raise would also pass if it wrote
+        to some fallback path, so fail if it opens anything at all.
+        """
+        opened = []
+        with (
+            mock.patch.dict(checker.os.environ, {}, clear=True),
+            mock.patch.object(checker.sync, "_open_github_output", side_effect=lambda p: opened.append(p)),
+        ):
             checker._write_outputs(checker.Decision("3.12", "3.12", None, None, (), {}))
+        self.assertEqual(opened, [], "nothing may be opened when $GITHUB_OUTPUT is unset")
 
 
 class FailureToWriteTests(unittest.TestCase):
