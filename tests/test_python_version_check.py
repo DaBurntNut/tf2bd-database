@@ -174,6 +174,38 @@ class BadInputTests(unittest.TestCase):
             checker.gather(WORKFLOW, PINS, lambda url: b"<html>not json</html>")
         self.assertIn("readable JSON", str(caught.exception))
 
+    def test_a_deeply_nested_response_is_an_error_and_not_a_traceback(self):
+        """RecursionError is not a ValueError, so it has to be named explicitly.
+
+        Both other callers of strict_json_loads in this repository catch it.
+        If this one does not, a nested body from the network leaves the runner
+        a traceback instead of the exit code and message every other bad
+        response produces -- and the difference is invisible until it happens.
+        """
+        nested = ("[" * 100_000 + "]" * 100_000).encode()
+        with self.assertRaises(SyncError) as caught:
+            checker.gather(WORKFLOW, PINS, lambda url: nested)
+        self.assertIn("readable JSON", str(caught.exception))
+
+    def test_every_strict_json_caller_in_the_repository_catches_the_same_errors(self):
+        """The three call sites must agree, because they fail the same way.
+
+        Named rather than inferred: a fourth caller is the likely future, and
+        a reader comparing them should find the list in one place.
+        """
+        root = Path(__file__).resolve().parent.parent / "scripts"
+        sources_ = {path: path.read_text(encoding="utf-8") for path in sorted(root.glob("*.py"))}
+        callers = {path: text for path, text in sources_.items() if "strict_json_loads(" in text}
+        self.assertGreaterEqual(len(callers), 3)
+        for path, text in callers.items():
+            with self.subTest(module=path.name):
+                # assertTrue, not assertIn: assertIn prints the haystack, and
+                # the haystack here is a thousand-line module.
+                self.assertTrue(
+                    "RecursionError" in text,
+                    f"{path.name} parses JSON without catching RecursionError",
+                )
+
     def test_pypi_metadata_without_info_is_an_error(self):
         with self.assertRaises(SyncError):
             checker.supported_series({}, "ruff")

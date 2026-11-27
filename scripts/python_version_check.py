@@ -229,7 +229,11 @@ def _decode_json(raw: bytes, url: str) -> object:
         # strict_json_loads, not json.loads: it rejects NaN/Infinity, duplicate
         # keys and unbounded integers, which are remote inputs here like any other.
         return strict_json_loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, RecursionError, ValueError) as exc:
+        # RecursionError, like the two callers of strict_json_loads in
+        # sources.py and playerlist.py: a deeply nested body is bad input from
+        # the network, and bad input is an exit code with a message, never a
+        # traceback. It is not a ValueError, so it needs naming here.
         raise SyncError(f"{sources.redact_url(url)} did not return readable JSON: {exc}") from exc
 
 
