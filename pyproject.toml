@@ -17,17 +17,18 @@ ci = [
 
 [tool.ruff]
 line-length = 120
-# Deliberately ONE SERIES BEHIND PYTHON_VERSION in the sync workflow, and the
-# monthly version check never edits it.
+# Deliberately BEHIND PYTHON_VERSION in the sync workflow, and the monthly
+# version check never edits this line.
 #
 # Matching it to the runtime looks tidier and quietly costs the rollback. At
 # py314 the formatter rewrites ``except (A, B):`` into PEP 758's ``except A, B:``
-# in two files, and nothing before 3.14 can parse that -- so dropping
+# in two files, and no earlier Python can parse that -- so dropping
 # PYTHON_VERSION back after a bad upgrade would need a reformat first, exactly
-# when the priority is getting the bot publishing again. Lagging by one keeps
-# the source parseable by the runtime it might have to return to.
+# when the priority is getting the bot publishing again. Staying below 3.14
+# keeps the source parseable by the runtime it might have to return to.
 #
-# The lag costs only a few modernization suggestions; it is not a support claim.
+# This is a formatting floor, NOT a support claim: nothing promises the scripts
+# run on 3.13. It costs a few modernization suggestions and nothing else.
 target-version = "py313"
 
 [tool.ruff.lint]
@@ -42,7 +43,7 @@ ignore = [
 "tests/*" = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["playerlist", "sources", "policy", "report", "sync_vorobey_hackerpolice"]
+known-first-party = ["playerlist", "sources", "policy", "report", "sync_vorobey_hackerpolice", "python_version_check"]
 
 # mypy is the type checker CI runs; a second, unenforced config would only drift.
 [tool.mypy]

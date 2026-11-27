@@ -119,13 +119,68 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(body.group(1), reported.group(1))
 
     def test_every_action_is_pinned_to_a_commit_and_says_which_release_it_is(self):
-        uses = re.findall(r"uses:\s*(\S+)\s*(#[^\n]*)?", self.workflow)
-        self.assertGreaterEqual(len(uses), 3)
-        for reference, comment in uses:
-            repository, _, sha = reference.partition("@")
-            self.assertRegex(repository, r"^[\w.-]+/[\w.-]+$")
-            self.assertRegex(sha, r"^[0-9a-f]{40}$", f"{reference} is not pinned to a commit SHA")
-            self.assertRegex(comment or "", r"#\s*v\d", f"{reference} needs its release tag in a comment")
+        """Scans EVERY workflow, not just the sync.
+
+        These rules were written for the sync because it was the only workflow.
+        A second one arrived and inherited none of them -- an unpinned action in
+        it would have been just as exploitable, and nothing would have said so.
+        """
+        workflows = sorted((self.root / ".github" / "workflows").glob("*.yml"))
+        self.assertGreaterEqual(len(workflows), 2, "expected the sync and the version check")
+        total = 0
+        for path in workflows:
+            uses = re.findall(r"uses:\s*(\S+)\s*(#[^\n]*)?", path.read_text(encoding="utf-8"))
+            total += len(uses)
+            for reference, comment in uses:
+                repository, _, sha = reference.partition("@")
+                with self.subTest(workflow=path.name, action=reference):
+                    self.assertRegex(repository, r"^[\w.-]+/[\w.-]+$")
+                    self.assertRegex(sha, r"^[0-9a-f]{40}$", f"{reference} is not pinned to a commit SHA")
+                    self.assertRegex(comment or "", r"#\s*v\d", f"{reference} needs its release tag in a comment")
+        self.assertGreaterEqual(total, 3)
+
+    def test_the_same_action_is_pinned_to_the_same_commit_everywhere(self):
+        """Two workflows on two SHAs of one action is a half-finished update.
+
+        Whichever is older keeps running, and an audit of one file says the
+        repository is current while the other is not.
+        """
+        pins: dict[str, set[str]] = {}
+        for path in sorted((self.root / ".github" / "workflows").glob("*.yml")):
+            for reference, _ in re.findall(r"uses:\s*(\S+)\s*(#[^\n]*)?", path.read_text(encoding="utf-8")):
+                repository, _, sha = reference.partition("@")
+                pins.setdefault(repository, set()).add(sha)
+        for repository, shas in sorted(pins.items()):
+            with self.subTest(action=repository):
+                self.assertEqual(len(shas), 1, f"{repository} is pinned to {len(shas)} different commits")
+
+    def test_no_workflow_grants_permissions_globally(self):
+        """Least privilege is a property of the repository, not of one file."""
+        for path in sorted((self.root / ".github" / "workflows").glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(workflow=path.name):
+                self.assertIn("\npermissions: {}\n", text, f"{path.name} must start from no permissions")
+
+    def test_no_workflow_interpolates_untrusted_text_into_a_shell(self):
+        """``${{ }}`` inside run: is how a workflow gets a shell injected.
+
+        Values that an outside account can influence -- a title, a branch name,
+        a body -- must reach the shell through env:, where they stay data.
+        Static repository settings are fine, so the check lists what is allowed
+        rather than trying to recognize what is dangerous.
+        """
+        safe = re.compile(
+            r"^(env|inputs|vars|matrix|runner|job|strategy)\.[\w.-]+$"
+            r"|^(github\.(repository|repository_owner|ref|ref_name|sha|run_id|run_number|workspace|token|event_name))$"
+            r"|^steps\.[\w-]+\.(outcome|conclusion)$"
+            r"|^secrets\.[\w]+ \|\| github\.token$"
+        )
+        for path in sorted((self.root / ".github" / "workflows").glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            for block in re.findall(r"\n        run: \|?\n?([\s\S]*?)(?=\n      - |\n  [a-z]|\Z)", text):
+                for expression in re.findall(r"\$\{\{\s*([^}]+?)\s*\}\}", block):
+                    with self.subTest(workflow=path.name, expression=expression):
+                        self.assertRegex(expression, safe, f"{expression} reaches a shell; pass it through env:")
 
     # Files that belong to the maintainer and not to the sync. Spelled in halves
     # so this tuple does not match itself when the scan below reads this file.
