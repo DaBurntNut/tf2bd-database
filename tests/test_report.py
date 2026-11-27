@@ -2335,6 +2335,32 @@ class RenderMemoTests(unittest.TestCase):
         render_report(info)
         self.assertEqual(report_module._EVIDENCE_STATUS_CACHE, {})
 
+    def test_a_render_that_does_not_finish_leaves_no_proof_text_either(self):
+        """The memo must be emptied on the way out, however the render ends.
+
+        Clearing it on the last line only honours the promise when nothing goes
+        wrong, and "nothing went wrong" is the case that does not need the
+        promise. Ctrl-C between the two renders -- the sync handles an interrupt
+        and exits 130 -- used to leave every proof link of a half-built report
+        sitting in a module global.
+        """
+        info = RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://example.invalid/list.json",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+            changes=(Change("[U:1:1]", "name", ("suspicious",), ("cheater",), evidence=("https://e.invalid/1",)),),
+        )
+        report_module._EVIDENCE_STATUS_CACHE.clear()
+        # Raise after the first render has populated the memo, not before.
+        with (
+            mock.patch.object(report_module, "_utf8_len", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            render_report(info)
+        self.assertEqual(report_module._EVIDENCE_STATUS_CACHE, {})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1045,12 +1045,19 @@ def render_report(info: RunInfo) -> str:
     """
     promotions, demotions = _prepare_changes(info)
     closing_sentence = render_closing(info.changes, database=info.database_label)
-    text = _render_body(info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS, promotions, demotions, closing_sentence)
-    for change_limit, removed_limit in _SHRINK_STEPS:
-        if _utf8_len(text) <= MAX_REPORT_BYTES:
-            break
-        text = _render_body(info, change_limit, removed_limit, promotions, demotions, closing_sentence)
-    # The memo only has to live as long as this report; dropping it here keeps a
-    # long-lived caller (or the test suite) from holding onto proof text.
-    _EVIDENCE_STATUS_CACHE.clear()
+    try:
+        text = _render_body(
+            info, MAX_CHANGE_TABLE_ROWS, MAX_REMOVED_TABLE_ROWS, promotions, demotions, closing_sentence
+        )
+        for change_limit, removed_limit in _SHRINK_STEPS:
+            if _utf8_len(text) <= MAX_REPORT_BYTES:
+                break
+            text = _render_body(info, change_limit, removed_limit, promotions, demotions, closing_sentence)
+    finally:
+        # The memo only has to live as long as this report; dropping it here keeps a
+        # long-lived caller (or the test suite) from holding onto proof text. In a
+        # ``finally`` because a render that does not finish is exactly when that
+        # matters: Ctrl-C between the two renders above used to leave every proof
+        # link of a half-built report sitting in a module global.
+        _EVIDENCE_STATUS_CACHE.clear()
     return _safe(_fit_body(text))
