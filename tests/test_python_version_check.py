@@ -174,18 +174,37 @@ class BadInputTests(unittest.TestCase):
             checker.gather(WORKFLOW, PINS, lambda url: b"<html>not json</html>")
         self.assertIn("readable JSON", str(caught.exception))
 
-    def test_a_deeply_nested_response_is_an_error_and_not_a_traceback(self):
+    def test_a_parser_recursion_error_is_an_error_and_not_a_traceback(self):
         """RecursionError is not a ValueError, so it has to be named explicitly.
 
         Both other callers of strict_json_loads in this repository catch it.
         If this one does not, a nested body from the network leaves the runner
         a traceback instead of the exit code and message every other bad
         response produces -- and the difference is invisible until it happens.
+
+        The parser is replaced rather than fed a deeply nested document on
+        purpose. How deep a document has to be before CPython gives up is an
+        interpreter detail: it changed in 3.12 when the C recursion limit was
+        split out, and again in 3.14. A test that provokes the error by
+        nesting reports a perfectly good guard as broken on the next runtime
+        that raises its limit -- which is precisely the upgrade this very
+        script exists to propose. The contract being pinned here is "the
+        parser raising RecursionError becomes a named SyncError", and that
+        does not depend on any of it.
         """
-        nested = ("[" * 100_000 + "]" * 100_000).encode()
-        with self.assertRaises(SyncError) as caught:
-            checker.gather(WORKFLOW, PINS, lambda url: nested)
+        original = checker.strict_json_loads
+
+        def refuse(raw: str | bytes) -> object:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+        checker.strict_json_loads = refuse
+        try:
+            with self.assertRaises(SyncError) as caught:
+                checker._decode_json(b"[]", "https://example.test/manifest.json")
+        finally:
+            checker.strict_json_loads = original
         self.assertIn("readable JSON", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, RecursionError)
 
     def test_every_strict_json_caller_in_the_repository_catches_the_same_errors(self):
         """The three call sites must agree, because they fail the same way.
