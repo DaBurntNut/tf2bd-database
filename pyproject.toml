@@ -1,4 +1,6 @@
-# Tooling config only; runtime scripts support Python 3.10+.
+# Tooling config only. The scripts target the ONE Python version the workflow
+# pins (PYTHON_VERSION in .github/workflows/sync-vorobey-hackerpolice.yml);
+# keep target-version below in step with it.
 
 # Versions of the tools configured below, so a tool's settings and its version
 # live in one file. Dependabot owns this table (see .github/dependabot.yml) and
@@ -9,17 +11,24 @@ ci = [
     "ruff==0.17.6",
     "mypy==2.4.1",
     "bandit==1.9.4",
-    # Held back deliberately: coverage 7.17.0 raised its floor to Python 3.11
-    # while the matrix still tests 3.10, and there is no 7.16.3, so 7.16.2 is
-    # the last installable release. dependabot.yml ignores >=7.17.0 for this
-    # reason; drop that ignore when the 3.10 leg retires.
-    "coverage==7.16.2",
+    "coverage==7.17.5",
     "vulture==2.16",
 ]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+# Deliberately ONE SERIES BEHIND PYTHON_VERSION in the sync workflow, and the
+# monthly version check never edits it.
+#
+# Matching it to the runtime looks tidier and quietly costs the rollback. At
+# py314 the formatter rewrites ``except (A, B):`` into PEP 758's ``except A, B:``
+# in two files, and nothing before 3.14 can parse that -- so dropping
+# PYTHON_VERSION back after a bad upgrade would need a reformat first, exactly
+# when the priority is getting the bot publishing again. Lagging by one keeps
+# the source parseable by the runtime it might have to return to.
+#
+# The lag costs only a few modernization suggestions; it is not a support claim.
+target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "PIE", "RUF"]

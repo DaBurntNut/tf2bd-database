@@ -54,6 +54,13 @@ class WorkflowContractTests(unittest.TestCase):
         parts = re.split(r"^  ([a-z][a-z-]*):$", body, flags=re.M)
         return {parts[index]: parts[index + 1] for index in range(1, len(parts) - 1, 2)}
 
+    def python_version(self) -> str:
+        """The single Python version the workflow pins, read from its one home."""
+        header, _, _ = self.workflow.partition("\njobs:\n")
+        match = re.search(r'^  PYTHON_VERSION: "([^"]+)"$', header, flags=re.M)
+        self.assertIsNotNone(match, "the workflow must declare PYTHON_VERSION above jobs:")
+        return match[1]
+
     def sync_invocation(self) -> str:
         start = self.workflow.index("python3 scripts/sync_vorobey_hackerpolice.py")
         lines = []
@@ -317,38 +324,38 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("continue-on-error: true", block)
         self.assertIn('gh pr list --repo "$REPOSITORY" --head "$BOT_BRANCH" --state open', block)
 
-    def test_the_checks_job_tests_the_documented_python_floor(self):
-        """Keep the 3.10 floor and production 3.12 in the checks matrix.
+    def test_both_jobs_read_the_same_single_python_version(self):
+        """One pinned Python version, declared once, used by both jobs.
 
-        Without the floor leg, a 3.11+ API (``datetime.UTC``, ``tomllib``) or a
-        3.12-only f-string could pass CI while breaking the floor that
-        pyproject.toml and the lint target both declare.
-        The write-capable sync job stays on 3.12 as the production runtime.
+        The checks job used to run a 3.10 leg beside the production 3.12 one,
+        to catch a 3.11+ API reaching code an older machine might run. Nothing
+        runs these scripts off GitHub Actions -- what people download is the
+        playerlist JSON -- so the leg guarded a case that cannot happen, while
+        holding back a tool pin that could not install on 3.10.
+
+        What replaces it is this: the version lives in exactly ONE place, so
+        the gate that tests the code and the job that writes to the database
+        can never drift onto different runtimes.
         """
-        checks = self.jobs()["checks"]
-        self.assertIn("matrix:", checks)
-        self.assertIn('"3.10"', checks)  # The documented minimum supported version.
-        self.assertIn(
-            '"3.12"',
-            checks,
-        )  # The production runtime version.
-        self.assertIn("python-version: ${{ matrix.python-version }}", checks)
-        # Keep matrix legs in separate cancellation groups.
-        group = next(line for line in checks.splitlines() if line.strip().startswith("group: checks-"))
-        self.assertIn("matrix.python-version", group)
-        # The production sync job intentionally uses a single Python version.
-        self.assertNotIn("matrix:", self.jobs()["sync"])
+        version = self.python_version()
+        # Two numbers only: a third would freeze the bot on one patch release
+        # and silently skip every later security fix.
+        self.assertRegex(version, r"^3\.\d+$", "pin the series, never the patch")
 
-    def test_scripts_and_tests_parse_as_python_310(self):
-        """The documented floor applies to shipped code and the test suite."""
-        paths = sorted((self.root / "scripts").glob("*.py")) + sorted((self.root / "tests").glob("*.py"))
-        for path in paths:
-            with self.subTest(path=path.relative_to(self.root)):
-                ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10))
+        for name in ("checks", "sync"):
+            with self.subTest(job=name):
+                job = self.jobs()[name]
+                self.assertIn("python-version: ${{ env.PYTHON_VERSION }}", job)
+                # A literal version in a job is the drift this test exists to stop.
+                self.assertNotRegex(job, r'python-version:\s*"3\.\d', f"{name} pins its own Python version")
+                self.assertNotIn("matrix:", job)
 
-        # Ensure the Python 3.10 parser rejects newer syntax.
-        with self.assertRaises(SyntaxError):
-            ast.parse("type Alias = int\n", feature_version=(3, 10))
+    # Deliberately NOT tested here: that ruff's target-version in pyproject.toml
+    # equals PYTHON_VERSION above. Reading a maintainer-owned file would make a
+    # lint setting able to fail the checks, and the sync job is gated on them --
+    # see test_no_test_reads_a_file_the_bot_does_not_need for the outage that
+    # rule came from. The coupling is a comment in both files instead; drifting
+    # costs a lint suggestion, never a missed day of publishing.
 
     def test_the_suite_does_not_inherit_the_runners_output_file(self):
         """GITHUB_OUTPUT is exported by every CI step, including the test step.
