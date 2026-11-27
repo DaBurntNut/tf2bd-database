@@ -137,7 +137,9 @@ def _same_host(first: str, second: str) -> bool:
         ports = (one.port or 443, two.port or 443)
     except ValueError:
         return False
-    return (one.hostname or "").lower() == (two.hostname or "").lower() and ports[0] == ports[1]
+    # ``hostname`` is already lower-cased by urlparse (unlike ``netloc``), so
+    # the comparison is case-insensitive without folding it again here.
+    return (one.hostname or "") == (two.hostname or "") and ports[0] == ports[1]
 
 
 class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
