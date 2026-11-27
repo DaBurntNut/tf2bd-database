@@ -752,6 +752,26 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _force_plain_output() -> None:
+    """Keep the interpreter from inspecting stdout to decide about colour.
+
+    Python 3.14 colourizes argparse's help and error text, and it works out
+    whether to by calling ``os.isatty(sys.stdout.fileno())`` -- from inside
+    ``ArgumentParser.__init__``. On a stdout that cannot answer, that raises
+    while the first exception is still being handled, and the run dies in
+    ``build_parser()``: before the arguments are read, before anything is
+    written. The suppressed ``print`` further down exists precisely so a dead
+    stdout cannot cost the run its writes, and 3.14 moved the failure to a
+    point upstream of it.
+
+    Setting the variable is checked before the stream is, so the question is
+    never asked. Plain output is what this bot wants anyway: everything it
+    prints is read from a workflow log or pasted into a pull request body, and
+    neither is improved by escape codes.
+    """
+    os.environ.setdefault("PYTHON_COLORS", "0")
+
+
 def _force_utf8_streams() -> None:
     """Make stdout/stderr UTF-8 so the report can never crash the run.
 
@@ -768,6 +788,9 @@ def _force_utf8_streams() -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the sync and return the process exit status."""
+    # Both of these run BEFORE the parser is built: 3.14 reads stdout while
+    # constructing it, and an unusable stdout must not abort the run.
+    _force_plain_output()
     _force_utf8_streams()
     args = build_parser().parse_args(argv)
 

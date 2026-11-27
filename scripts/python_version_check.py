@@ -422,6 +422,8 @@ def _write_outputs(decision: Decision) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point: parse arguments, run the check, map failures to exit codes."""
+    # Before the parser is built: see sync._force_plain_output.
+    sync._force_plain_output()
     args = build_parser().parse_args(argv)
     logging.basicConfig(
         stream=sys.stderr, level=logging.ERROR if args.quiet else logging.INFO, format="%(message)s", force=True
