@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import dataclasses
 import io
 import json
 import logging
@@ -93,6 +94,41 @@ class DecisionTests(unittest.TestCase):
     def test_it_falls_back_to_the_newest_version_all_tools_do_support(self):
         decision = self.gather(["3.12.16", "3.13.9", "3.14.10"], ["3.13", "3.14"], ["3.13"])
         self.assertEqual(decision.target, "3.13")
+
+    def test_each_verdict_says_what_that_tool_claimed_about_the_measured_series(self):
+        """The decision is only half the answer; the table is the other half.
+
+        Every test above reads ``target``, so the per-tool verdicts behind the
+        table were free to be wrong -- inverted, or copied from one tool to all
+        of them -- while the proposal itself stayed correct. Pin both.
+        """
+        decision = self.gather(["3.12.16", "3.14.10"], ["3.12", "3.14"], ["3.12"])
+        self.assertIsNone(decision.target)
+        self.assertEqual(
+            {verdict.name: verdict.supported for verdict in decision.verdicts},
+            {"ruff": True, "mypy": False},
+            "each tool's row must carry that tool's own answer",
+        )
+
+    def test_with_nothing_proposed_the_tools_are_measured_against_the_blocked_series(self):
+        """Holding still has to say which version was tried, and against what.
+
+        When there is no target the verdicts fall back to the candidate. If
+        that fallback broke, the table would quietly describe no version at
+        all while still printing a row per tool.
+        """
+        decision = self.gather(["3.12.16", "3.14.10"], ["3.12"], ["3.12"])
+        self.assertIsNone(decision.target)
+        self.assertEqual(decision.candidate, "3.14")
+        self.assertEqual([verdict.supported for verdict in decision.verdicts], [False, False])
+        body = checker.render_report(decision, "2026-12-01 06:00 UTC")
+        self.assertIn("| Tool | Pinned version | Supports 3.14 |", body)
+
+    def test_a_tool_supporting_the_target_is_not_marked_blocked(self):
+        """The upgrade case: every verdict must be a real yes, not a default."""
+        decision = self.gather(["3.12.16", "3.14.10"], ["3.12", "3.14"], ["3.12", "3.14"])
+        self.assertEqual(decision.target, "3.14")
+        self.assertEqual([verdict.supported for verdict in decision.verdicts], [True, True])
 
     def test_it_proposes_nothing_when_already_current(self):
         decision = self.gather(["3.12.16"], ["3.12"], ["3.12"])
@@ -289,6 +325,17 @@ class BadInputTests(unittest.TestCase):
         with self.assertRaises(SyncError):
             checker.pinned_tools(f"[dependency-groups]\nci = [\n{pins}]\n")
 
+    def test_exactly_the_maximum_number_of_pins_is_still_allowed(self):
+        """One over is refused; the limit itself has to be accepted.
+
+        Testing only the rejecting side leaves the comparison free to be
+        off by one, which would turn a legal pin list into a hard failure
+        of the monthly check for no reason a reader could see.
+        """
+        pins = "".join(f'    "tool{index}==1.0",\n' for index in range(checker.MAX_TOOLS))
+        tools = checker.pinned_tools(f"[dependency-groups]\nci = [\n{pins}]\n")
+        self.assertEqual(len(tools), checker.MAX_TOOLS)
+
     def test_an_envelope_the_check_cannot_open_is_an_error(self):
         with self.assertRaises(SyncError) as caught:
             checker.fetch_manifest(lambda url: b'{"encoding": "none"}')
@@ -338,6 +385,20 @@ class WorkflowEditTests(unittest.TestCase):
     def test_the_rewrite_refuses_a_file_it_cannot_identify(self):
         with self.assertRaises(SyncError):
             checker.rewrite_version("nothing here\n", "3.14")
+
+    def test_a_decision_cannot_be_edited_after_it_is_made(self):
+        """These records are passed to the renderer and to the comparison.
+
+        Both are frozen so a later step cannot quietly restate the verdict it
+        was handed. Nothing tried to, which is exactly why the guarantee was
+        free to disappear in a refactor without a single test noticing.
+        """
+        verdict = checker.ToolVerdict("ruff", "0.17.6", True)
+        decision = checker.Decision("3.12", "3.14", "3.14", "3.14", (verdict,), {"3.14": "3.14.10"})
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            verdict.supported = False  # type: ignore[misc]
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            decision.target = "9.99"  # type: ignore[misc]
 
 
 class ComparisonTests(unittest.TestCase):
@@ -395,6 +456,32 @@ class ComparisonTests(unittest.TestCase):
             with self.subTest(case=label):
                 self.assertNotEqual(self.REPORT, other, "the fixture must actually differ")
                 self.assertNotEqual(checker.compare_reports(self.REPORT, other), [])
+
+    def test_the_invisible_difference_points_at_the_character_that_differs(self):
+        """ "They differ, somewhere" is not enough to act on.
+
+        This message is all a reader gets when the diff itself is empty, so
+        the offset has to be the real one. Nothing checked the number, which
+        left it free to report the first matching character instead of the
+        first differing one, or to be measured from the wrong end.
+        """
+        old = self.REPORT
+        new = self.REPORT.replace("- Entries: 6,418\n", "- Entries: 6,418\u2028")
+        # Offsets are into the masked text: masking the clock line changes its
+        # length, so measuring against the raw report would be off by that much.
+        masked = (checker.mask_clock(old, "current"), checker.mask_clock(new, "proposed"))
+        expected = next(index for index, (a, b) in enumerate(zip(*masked, strict=False)) if a != b)
+        lines = checker.compare_reports(old, new)
+        self.assertIn(f"  first difference at character {expected}", lines)
+        self.assertIn(f"  lengths: current {len(masked[0])}, proposed {len(masked[1])}", lines)
+
+    def test_a_pure_truncation_is_located_at_the_end_of_the_shorter_text(self):
+        """With no differing character, the offset is where one text ran out."""
+        old = self.REPORT
+        new = self.REPORT.rstrip("\n")
+        shorter = len(checker.mask_clock(new, "proposed"))
+        lines = checker.compare_reports(old, new)
+        self.assertIn(f"  first difference at character {shorter}", lines)
 
     def test_the_readable_diff_is_only_ever_a_nicety(self):
         """The verdict must not depend on difflib producing output.
@@ -663,6 +750,37 @@ class ReportTests(unittest.TestCase):
         body = checker.render_report(self.decide(None, supported=False), "2026-12-01 06:00 UTC")
         self.assertIn("not yet - 1 of 2 tools do not support 3.14", body)
         self.assertIn("Will check again next month", body)
+
+    def test_the_blocked_count_counts_the_tools_that_are_missing_not_the_ones_present(self):
+        """One unsupported of two is the same number either way round.
+
+        The existing hold case cannot tell "count the unsupported" from "count
+        the supported": both answer 1. Three tools, two of them blocking, make
+        the two readings disagree, which is the only way this number is pinned.
+        """
+        verdicts = (
+            checker.ToolVerdict("ruff", "0.17.6", False),
+            checker.ToolVerdict("mypy", "2.4.1", False),
+            checker.ToolVerdict("bandit", "1.9.4", True),
+        )
+        decision = checker.Decision("3.12", "3.14", "3.14", None, verdicts, {"3.14": "3.14.10"})
+        body = checker.render_report(decision, "2026-12-01 06:00 UTC")
+        self.assertIn("not yet - 2 of 3 tools do not support 3.14", body)
+
+    def test_the_table_marks_each_tool_with_its_own_answer(self):
+        """A row saying "yes" for a tool that said no is the worst outcome here.
+
+        The table is the evidence a human merges on, so each row has to track
+        its own verdict rather than the table as a whole being right on average.
+        """
+        verdicts = (
+            checker.ToolVerdict("ruff", "0.17.6", False),
+            checker.ToolVerdict("mypy", "2.4.1", True),
+        )
+        decision = checker.Decision("3.12", "3.14", "3.14", None, verdicts, {"3.14": "3.14.10"})
+        body = checker.render_report(decision, "2026-12-01 06:00 UTC")
+        self.assertIn("| ruff | 0.17.6 | **no** |", body)
+        self.assertIn("| mypy | 2.4.1 | yes |", body)
         self.assertNotIn("Only the Python version changes", body)
 
     def test_the_table_marks_the_blocking_tool(self):
