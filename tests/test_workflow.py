@@ -880,6 +880,96 @@ class RepositoryDataTests(unittest.TestCase):
         self.assertLess(guard, emit, "the count must be checked before the output is written")
         self.assertIn('!= "1" ', body, "the step must accept exactly one PYTHON_VERSION line")
 
+    def test_the_sync_inputs_cannot_silently_invert(self):
+        """Three gates in the sync job rest entirely on an input's declared type.
+
+        ``${{ inputs.dry_run && '--dry-run' || '' }}`` reads as "pass the flag
+        when asked". That is only true while ``dry_run`` is a boolean. Declare
+        it ``type: string`` and the value becomes the text ``"false"``, which is
+        truthy in a GitHub expression, so ``--dry-run`` is passed on every run
+        and the bot silently stops writing for good. Nothing turns red.
+
+        ``allow_mass_demotion`` inverts the same way, and that direction is
+        worse: the flag would always be present, disabling the guard that stops
+        the bot deleting a large share of the database after an upstream
+        hiccup.
+
+        ``MODE`` is the third. A scheduled run must resolve to pull-request so
+        the nightly bot proposes rather than commits; the manual dropdown is the
+        only way to reach commit mode. Losing the ``github.event_name`` half of
+        that expression would let a scheduled run write straight to the default
+        branch.
+
+        All three are one-line expressions with no test of their own, and a
+        wrong one produces a green run that does the opposite of what it says.
+        """
+        workflow = (self.ROOT / ".github/workflows/sync-vorobey-hackerpolice.yml").read_text(encoding="utf-8")
+
+        for name, declared in (("dry_run", "boolean"), ("allow_mass_demotion", "boolean")):
+            self.assertRegex(
+                workflow,
+                rf"\n      {name}:\n(?:        [^\n]*\n)*?        type: {declared}\n",
+                f"{name} must stay type: {declared} -- a string makes its flag always-on",
+            )
+            self.assertIn(
+                f"${{{{ inputs.{name} && '--",
+                workflow,
+                f"{name}'s flag must stay conditional on the input",
+            )
+
+        self.assertRegex(
+            workflow,
+            r"\n      mode:\n(?:        [^\n]*\n)*?        type: choice\n",
+            "mode must stay a choice so only the listed modes are reachable",
+        )
+        self.assertIn(
+            "MODE: ${{ github.event_name == 'schedule' && 'pull-request' || inputs.mode }}",
+            workflow,
+            "a scheduled run must be forced into pull-request mode",
+        )
+
+    def test_a_dry_run_of_the_version_check_publishes_nothing(self):
+        """Every step that writes to GitHub must be gated on ``!inputs.dry_run``.
+
+        This breaks silently in two opposite directions and neither is visible
+        in a diff. Declaring the input as ``type: string`` makes
+        ``inputs.dry_run`` the text ``"false"``; a non-empty string is truthy in
+        a GitHub expression, so ``!inputs.dry_run`` is false and the pull
+        request never opens -- every run looks clean and publishes nothing.
+        Dropping the guard from one step is the mirror image: a dry run quietly
+        opens a real pull request against the default branch.
+
+        The checker's own tests never read this file -- they exercise the Python
+        that decides, not the YAML that acts on the decision -- so without this
+        the whole dry-run promise rests on a comment.
+        """
+        check = (self.ROOT / ".github/workflows/python-version-check.yml").read_text(encoding="utf-8")
+
+        self.assertRegex(
+            check,
+            r"\n      dry_run:\n(?:        [^\n]*\n)*?        type: boolean\n",
+            "dry_run must be declared type: boolean -- a string inverts every guard below",
+        )
+
+        steps = [step for step in check.split("\n      - ") if step.startswith("name: ")]
+        self.assertGreaterEqual(len(steps), 10, "the workflow stopped parsing into steps")
+        writers = [
+            step
+            for step in steps
+            if "peter-evans/create-pull-request@" in step or re.search(r"^\s*git push\b", step, re.MULTILINE)
+        ]
+        self.assertEqual(len(writers), 2, "expected exactly the pull request and its push fallback")
+
+        for step in writers:
+            title = step.split("\n", 1)[0]
+            condition = next((line for line in step.split("\n") if line.strip().startswith("if:")), "")
+            self.assertIn("!inputs.dry_run", condition, f"{title} can publish during a dry run")
+            self.assertIn(
+                "steps.check.outputs.upgrade == 'true'",
+                condition,
+                f"{title} would run without an upgrade to publish",
+            )
+
     def test_shipped_snapshot_is_a_usable_hackerpolice_list(self):
         snapshot = load_snapshot(self.ROOT / "snapshot" / "playerlist.vorobey-hackerpolice.json")
         self.assertIsNotNone(snapshot)
