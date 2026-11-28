@@ -31,10 +31,3 @@ updates:
       check-tools:
         patterns:
           - "*"
-    ignore:
-      # coverage 7.17.0 raised its floor to Python 3.11 while the matrix still
-      # tests 3.10, so a newer release cannot install on that leg. Without this
-      # the weekly run would open a pull request that always fails. Remove it
-      # together with the 3.10 matrix leg.
-      - dependency-name: "coverage"
-        versions: [">=7.17.0"]

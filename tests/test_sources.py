@@ -1677,6 +1677,82 @@ class SourceFetchTests(unittest.TestCase):
         upgraded = handler.redirect_request(request, None, 302, "Found", Message(), "https://cdn.invalid/list.json")
         self.assertEqual(upgraded.full_url, "https://cdn.invalid/list.json")
 
+    def test_a_redirect_to_another_host_does_not_carry_credentials(self):
+        """``urllib`` copies every header onto a redirected request.
+
+        ``requests`` and ``curl`` drop the credential headers as soon as the
+        host changes; ``urllib`` does not, so a redirect off GitHub would hand
+        the token to whatever host the Location names. Nothing sends a token
+        today -- this keeps adding one later from becoming a leak.
+        """
+        handler = sources._HttpsOnlyRedirectHandler()
+        secrets = {
+            "Authorization": "Bearer REDIRECT_TOKEN",
+            "Proxy-Authorization": "Basic REDIRECT_TOKEN",
+            "Cookie": "session=REDIRECT_TOKEN",
+            "User-Agent": "tf2bd",
+        }
+        request = urllib.request.Request("https://raw.githubusercontent.com/o/r/main/l.json", headers=secrets)
+        moved = handler.redirect_request(request, None, 302, "Found", Message(), "https://objects.invalid/signed")
+        carried = [*moved.headers.items(), *moved.unredirected_hdrs.items()]
+        for name, value in carried:
+            with self.subTest(header=name):
+                self.assertNotIn("REDIRECT_TOKEN", value, f"{name} followed the redirect off-host")
+        self.assertGreaterEqual(len(carried), 1, "the redirected request kept no headers at all")
+        # The identifying header is not a credential and must survive.
+        self.assertEqual(moved.get_header("User-agent"), "tf2bd")
+
+    def test_a_redirect_within_the_same_host_keeps_its_credentials(self):
+        """Stripping on every redirect would break ordinary same-host hops.
+
+        The comparison ignores letter case and the implied :443, because a
+        Location may spell either differently without changing the host.
+        """
+        handler = sources._HttpsOnlyRedirectHandler()
+        request = urllib.request.Request(
+            "https://raw.githubusercontent.com/o/r/main/l.json",
+            headers={"Authorization": "Bearer REDIRECT_TOKEN"},
+        )
+        for location in (
+            "https://raw.githubusercontent.com/o/r/main/other.json",
+            "https://RAW.GITHUBUSERCONTENT.COM/o/r/main/other.json",
+            "https://raw.githubusercontent.com:443/o/r/main/other.json",
+        ):
+            with self.subTest(location=location):
+                moved = handler.redirect_request(request, None, 302, "Found", Message(), location)
+                self.assertEqual(moved.get_header("Authorization"), "Bearer REDIRECT_TOKEN")
+        # A different port is a different endpoint, so the token stays behind.
+        other_port = handler.redirect_request(
+            request, None, 302, "Found", Message(), "https://raw.githubusercontent.com:8443/o/r/main/x.json"
+        )
+        self.assertIsNone(other_port.get_header("Authorization"))
+
+    def test_a_redirect_urllib_declines_to_follow_stays_declined(self):
+        """``urllib`` returning no request means "do not redirect".
+
+        The base class raises for the cases it refuses today, so this path is
+        defensive -- but it must stay a clean "no" rather than becoming an
+        attribute error on None if a future release starts returning it.
+        """
+        handler = sources._HttpsOnlyRedirectHandler()
+        request = urllib.request.Request("https://raw.githubusercontent.com/o/r/main/l.json")
+        with mock.patch.object(urllib.request.HTTPRedirectHandler, "redirect_request", return_value=None):
+            self.assertIsNone(
+                handler.redirect_request(request, None, 302, "Found", Message(), "https://cdn.invalid/x.json")
+            )
+
+    def test_a_malformed_port_in_a_redirect_is_treated_as_a_different_host(self):
+        """A Location whose port will not parse must not be read as "same host"."""
+        handler = sources._HttpsOnlyRedirectHandler()
+        request = urllib.request.Request(
+            "https://raw.githubusercontent.com/o/r/main/l.json",
+            headers={"Authorization": "Bearer REDIRECT_TOKEN"},
+        )
+        moved = handler.redirect_request(
+            request, None, 302, "Found", Message(), "https://raw.githubusercontent.com:99999/o/r/main/x.json"
+        )
+        self.assertIsNone(moved.get_header("Authorization"))
+
     def test_downgrade_redirect_error_redacts_credentials_in_location(self):
         handler = sources._HttpsOnlyRedirectHandler()
         request = urllib.request.Request("https://example.invalid/list.json")

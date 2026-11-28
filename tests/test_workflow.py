@@ -47,12 +47,31 @@ class WorkflowContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = cls.workflow_path.read_text(encoding="utf-8")
 
+    def workflow_files(self) -> list[Path]:
+        """Every workflow in the repository, newest rules applied to all of them.
+
+        Returning the list from one place keeps a new workflow from inheriting
+        none of the rules below, and the assertion means a glob that stops
+        matching fails loudly instead of turning every caller into a test that
+        scans nothing and passes.
+        """
+        paths = sorted((self.root / ".github" / "workflows").glob("*.yml"))
+        self.assertGreaterEqual(len(paths), 2, "expected the sync and the version check")
+        return paths
+
     def jobs(self) -> dict[str, str]:
         """Split the jobs: mapping into one string per job."""
         _, _, body = self.workflow.partition("\njobs:\n")
         self.assertTrue(body, "the workflow must declare jobs")
         parts = re.split(r"^  ([a-z][a-z-]*):$", body, flags=re.M)
         return {parts[index]: parts[index + 1] for index in range(1, len(parts) - 1, 2)}
+
+    def python_version(self) -> str:
+        """The single Python version the workflow pins, read from its one home."""
+        header, _, _ = self.workflow.partition("\njobs:\n")
+        match = re.search(r'^  PYTHON_VERSION: "([^"]+)"$', header, flags=re.M)
+        self.assertIsNotNone(match, "the workflow must declare PYTHON_VERSION above jobs:")
+        return match[1]
 
     def sync_invocation(self) -> str:
         start = self.workflow.index("python3 scripts/sync_vorobey_hackerpolice.py")
@@ -93,10 +112,19 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(read - set(written), set(), "the workflow reads an output nothing writes")
 
     def test_the_publish_steps_require_a_successful_sync(self):
-        for block in re.findall(
+        """Renaming a publishing step must not quietly exempt it from the gate.
+
+        The scan finds steps by name, so a rename would match nothing and the
+        loop below would assert nothing. Count the publishing steps a second
+        way -- anything that writes to the repository -- and require the two
+        counts to agree before trusting the result.
+        """
+        blocks = re.findall(
             r"- name: (?:Open or update pull request|Push branch|Commit directly)([\s\S]*?)(?=\n\s+- name:|\Z)",
             self.workflow,
-        ):
+        )
+        self.assertEqual(len(blocks), 3, "expected the pull request, the fallback push and the direct commit")
+        for block in blocks:
             self.assertIn("steps.sync.outcome == 'success'", block, "publishing must not run after a failed sync")
             self.assertIn("steps.sync.outputs.changed == 'true'", block)
 
@@ -112,13 +140,133 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(body.group(1), reported.group(1))
 
     def test_every_action_is_pinned_to_a_commit_and_says_which_release_it_is(self):
-        uses = re.findall(r"uses:\s*(\S+)\s*(#[^\n]*)?", self.workflow)
-        self.assertGreaterEqual(len(uses), 3)
-        for reference, comment in uses:
-            repository, _, sha = reference.partition("@")
-            self.assertRegex(repository, r"^[\w.-]+/[\w.-]+$")
-            self.assertRegex(sha, r"^[0-9a-f]{40}$", f"{reference} is not pinned to a commit SHA")
-            self.assertRegex(comment or "", r"#\s*v\d", f"{reference} needs its release tag in a comment")
+        """Scans EVERY workflow, not just the sync.
+
+        These rules were written for the sync because it was the only workflow.
+        A second one arrived and inherited none of them -- an unpinned action in
+        it would have been just as exploitable, and nothing would have said so.
+        """
+        workflows = self.workflow_files()
+        total = 0
+        for path in workflows:
+            uses = re.findall(r"uses:\s*(\S+)\s*(#[^\n]*)?", path.read_text(encoding="utf-8"))
+            total += len(uses)
+            for reference, comment in uses:
+                repository, _, sha = reference.partition("@")
+                with self.subTest(workflow=path.name, action=reference):
+                    self.assertRegex(repository, r"^[\w.-]+/[\w.-]+$")
+                    self.assertRegex(sha, r"^[0-9a-f]{40}$", f"{reference} is not pinned to a commit SHA")
+                    self.assertRegex(comment or "", r"#\s*v\d", f"{reference} needs its release tag in a comment")
+        self.assertGreaterEqual(total, 3)
+
+    def test_the_same_action_is_pinned_to_the_same_commit_everywhere(self):
+        """Two workflows on two SHAs of one action is a half-finished update.
+
+        Whichever is older keeps running, and an audit of one file says the
+        repository is current while the other is not.
+        """
+        pins: dict[str, set[str]] = {}
+        for path in self.workflow_files():
+            for reference, _ in re.findall(r"uses:\s*(\S+)\s*(#[^\n]*)?", path.read_text(encoding="utf-8")):
+                repository, _, sha = reference.partition("@")
+                pins.setdefault(repository, set()).add(sha)
+        for repository, shas in sorted(pins.items()):
+            with self.subTest(action=repository):
+                self.assertEqual(len(shas), 1, f"{repository} is pinned to {len(shas)} different commits")
+
+    def test_no_workflow_grants_permissions_globally(self):
+        """Least privilege is a property of the repository, not of one file."""
+        for path in self.workflow_files():
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(workflow=path.name):
+                self.assertIn("\npermissions: {}\n", text, f"{path.name} must start from no permissions")
+
+    def test_no_workflow_interpolates_untrusted_text_into_a_shell(self):
+        """``${{ }}`` inside run: is how a workflow gets a shell injected.
+
+        Values that an outside account can influence -- a title, a branch name,
+        a body -- must reach the shell through env:, where they stay data.
+        Static repository settings are fine, so the check lists what is allowed
+        rather than trying to recognize what is dangerous.
+        """
+        safe = re.compile(
+            r"^(env|inputs|vars|matrix|runner|job|strategy)\.[\w.-]+$"
+            r"|^(github\.(repository|repository_owner|ref|ref_name|sha|run_id|run_number|workspace|token|event_name))$"
+            r"|^steps\.[\w-]+\.(outcome|conclusion)$"
+            r"|^secrets\.[\w]+ \|\| github\.token$"
+        )
+        scanned = 0
+        for path in self.workflow_files():
+            text = path.read_text(encoding="utf-8")
+            blocks = re.findall(r"\n        run: \|?\n?([\s\S]*?)(?=\n      - |\n  [a-z]|\Z)", text)
+            # A scanner that silently matches nothing is indistinguishable from
+            # a clean repository. Count the run: steps two ways and insist the
+            # numbers agree, so a drift in the layout this regex assumes shows
+            # up as a failure here rather than as unnoticed coverage loss.
+            self.assertEqual(
+                len(blocks),
+                len(re.findall(r"^\s+run:", text, re.MULTILINE)),
+                f"the run: scan missed a step in {path.name}; its injection check is not running",
+            )
+            scanned += len(blocks)
+            for block in blocks:
+                for expression in re.findall(r"\$\{\{\s*([^}]+?)\s*\}\}", block):
+                    with self.subTest(workflow=path.name, expression=expression):
+                        self.assertRegex(expression, safe, f"{expression} reaches a shell; pass it through env:")
+        self.assertGreaterEqual(scanned, 20, "the workflows run far more shell than this; the scan is not finding it")
+
+    def test_a_step_allowed_to_fail_is_either_handled_or_declared_best_effort(self):
+        """``continue-on-error`` turns a failure into silence. Silence needs a plan.
+
+        The flag is right for two different reasons and the difference matters.
+        Evidence steps use it so the run can keep going and attach the failure
+        to a pull request a human reads -- their outcome must then be read back
+        somewhere, or the job goes green with a broken result. Housekeeping
+        steps use it because their failure genuinely does not matter, and that
+        has to be said out loud rather than inferred from the absence of a
+        reader.
+
+        Without this test the two are indistinguishable in review: adding a
+        fourth evidence step and forgetting to name it in the final gate looks
+        exactly like deliberate best-effort cleanup, and the only symptom is a
+        green tick on an upgrade nobody verified.
+
+        Read with the same plain-text scan the other checks here use: PyYAML is
+        not a dependency of this suite, and adding one so a test can read a
+        workflow would put the bot's checks at the mercy of a package it does
+        not otherwise need.
+        """
+        for path in self.workflow_files():
+            text = path.read_text(encoding="utf-8")
+            lines = text.splitlines()
+            for index, line in enumerate(lines):
+                if line.strip() != "continue-on-error: true":
+                    continue
+                name, identifier = self._enclosing_step(lines, index)
+                read_back = bool(
+                    identifier and re.search(rf"steps\.{re.escape(identifier)}\.(outcome|conclusion)", text)
+                )
+                above = lines[index - 1].strip()
+                declared = above.startswith("#") and "best-effort" in above.casefold()
+                with self.subTest(workflow=path.name, step=name):
+                    self.assertTrue(
+                        read_back or declared,
+                        f"{name!r} may fail silently: give it an id and read its outcome, "
+                        f"or say in a comment directly above continue-on-error why best-effort is correct",
+                    )
+
+    @staticmethod
+    def _enclosing_step(lines: list[str], index: int) -> tuple[str, str | None]:
+        """Name and id of the step containing ``lines[index]``, scanning upwards."""
+        name, identifier = "(unnamed)", None
+        for cursor in range(index, -1, -1):
+            stripped = lines[cursor].strip()
+            if stripped.startswith("id:") and identifier is None:
+                identifier = stripped.removeprefix("id:").strip()
+            if stripped.startswith("- name:"):
+                name = stripped.removeprefix("- name:").strip()
+                break
+        return name, identifier
 
     # Files that belong to the maintainer and not to the sync. Spelled in halves
     # so this tuple does not match itself when the scan below reads this file.
@@ -143,7 +291,9 @@ class WorkflowContractTests(unittest.TestCase):
         caused that outage sat two helpers deep and a scan of test bodies
         alone would have missed it.
         """
-        for path in sorted((self.root / "tests").glob("*.py")):
+        test_files = sorted((self.root / "tests").glob("*.py"))
+        self.assertGreaterEqual(len(test_files), 5, "the test glob matched almost nothing; this scan is not running")
+        for path in test_files:
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
@@ -171,6 +321,11 @@ class WorkflowContractTests(unittest.TestCase):
         Dependabot config may be rewritten or deleted outright and no test
         here will object, because a test that fails over one of them would
         take the bot offline over a file the bot never reads.
+
+        Both workflows are on the list. The security assertions above read
+        every file in .github/workflows, so a second workflow arriving made
+        it a file the suite reads -- and the rule in this docstring applies
+        to it the moment that became true.
         """
         block = self.workflow.split("  pull_request:\n", 1)[1].split("\npermissions:", 1)[0]
         patterns = re.findall(r'^\s+- "([^"]+)"', block, re.M)
@@ -179,12 +334,17 @@ class WorkflowContractTests(unittest.TestCase):
         def covered(name: str) -> bool:
             return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
+        # Derived, not listed: the assertions above glob this directory, so a
+        # third workflow is covered the day it is added rather than the day
+        # somebody remembers to extend a literal list.
+        workflows = [f".github/workflows/{path.name}" for path in self.workflow_files()]
+        self.assertGreaterEqual(len(workflows), 2)
         for name in (
+            *workflows,
             ".gitattributes",
             ".gitignore",
             "playerlist.garou3299.json",
             "snapshot/playerlist.vorobey-hackerpolice.json",
-            ".github/workflows/sync-vorobey-hackerpolice.yml",
             "scripts/playerlist.py",
             "tests/test_sources.py",
             "tests/test_policy.py",
@@ -317,38 +477,42 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("continue-on-error: true", block)
         self.assertIn('gh pr list --repo "$REPOSITORY" --head "$BOT_BRANCH" --state open', block)
 
-    def test_the_checks_job_tests_the_documented_python_floor(self):
-        """Keep the 3.10 floor and production 3.12 in the checks matrix.
+    def test_both_jobs_read_the_same_single_python_version(self):
+        """One pinned Python version, declared once, used by both jobs.
 
-        Without the floor leg, a 3.11+ API (``datetime.UTC``, ``tomllib``) or a
-        3.12-only f-string could pass CI while breaking the floor that
-        pyproject.toml and the lint target both declare.
-        The write-capable sync job stays on 3.12 as the production runtime.
+        The checks job used to run a 3.10 leg beside the production 3.12 one,
+        to catch a 3.11+ API reaching code an older machine might run. Nothing
+        runs these scripts off GitHub Actions -- what people download is the
+        playerlist JSON -- so the leg guarded a case that cannot happen, while
+        holding back a tool pin that could not install on 3.10.
+
+        What replaces it is this: the version lives in exactly ONE place, so
+        the gate that tests the code and the job that writes to the database
+        can never drift onto different runtimes.
         """
-        checks = self.jobs()["checks"]
-        self.assertIn("matrix:", checks)
-        self.assertIn('"3.10"', checks)  # The documented minimum supported version.
-        self.assertIn(
-            '"3.12"',
-            checks,
-        )  # The production runtime version.
-        self.assertIn("python-version: ${{ matrix.python-version }}", checks)
-        # Keep matrix legs in separate cancellation groups.
-        group = next(line for line in checks.splitlines() if line.strip().startswith("group: checks-"))
-        self.assertIn("matrix.python-version", group)
-        # The production sync job intentionally uses a single Python version.
-        self.assertNotIn("matrix:", self.jobs()["sync"])
+        version = self.python_version()
+        # Two numbers only: a third would freeze the bot on one patch release
+        # and silently skip every later security fix.
+        self.assertRegex(version, r"^3\.\d+$", "pin the series, never the patch")
 
-    def test_scripts_and_tests_parse_as_python_310(self):
-        """The documented floor applies to shipped code and the test suite."""
-        paths = sorted((self.root / "scripts").glob("*.py")) + sorted((self.root / "tests").glob("*.py"))
-        for path in paths:
-            with self.subTest(path=path.relative_to(self.root)):
-                ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10))
+        for name in ("checks", "sync"):
+            with self.subTest(job=name):
+                job = self.jobs()[name]
+                self.assertIn("python-version: ${{ env.PYTHON_VERSION }}", job)
+                # A literal version in a job is the drift this test exists to stop.
+                self.assertNotRegex(job, r'python-version:\s*"3\.\d', f"{name} pins its own Python version")
+                self.assertNotIn("matrix:", job)
 
-        # Ensure the Python 3.10 parser rejects newer syntax.
-        with self.assertRaises(SyntaxError):
-            ast.parse("type Alias = int\n", feature_version=(3, 10))
+    # Deliberately NOT tested here: that ruff's target-version in pyproject.toml
+    # equals PYTHON_VERSION above. Reading a maintainer-owned file would make a
+    # lint setting able to fail the checks, and the sync job is gated on them --
+    # see test_no_test_reads_a_file_the_bot_does_not_need for the outage that
+    # rule came from. The coupling is a comment in both files instead.
+    #
+    # target-version is a floor, so the two drift safely in one direction only:
+    # raising PYTHON_VERSION above it costs nothing, while dropping PYTHON_VERSION
+    # below it leaves source the runtime cannot parse. The note in pyproject.toml
+    # spells that out at the line itself, where anyone editing it will read it.
 
     def test_the_suite_does_not_inherit_the_runners_output_file(self):
         """GITHUB_OUTPUT is exported by every CI step, including the test step.
@@ -685,6 +849,126 @@ class RepositoryDataTests(unittest.TestCase):
             condition = [line for line in block.splitlines() if line.strip().startswith("if:")]
             self.assertEqual(len(condition), 1, f"{name} must have exactly one condition")
             self.assertIn("steps.sync.outcome == 'success'", condition[0], f"{name} can run after a failed sync")
+
+    def test_the_shell_and_the_checker_are_equally_strict_about_PYTHON_VERSION(self):
+        """Two parsers read the same line; the looser one runs first.
+
+        ``current_series`` refuses a workflow with anything but exactly one
+        PYTHON_VERSION line. The shell step that feeds setup-python reads it
+        earlier with grep, and a plain grep happily returns two matches -- the
+        step would then write a two-line ``current=`` into $GITHUB_OUTPUT and
+        fail obscurely, before the checker could report the real problem.
+        Same input, same verdict, whichever parser sees it first.
+        """
+        import python_version_check as checker
+
+        two = 'on:\n  schedule: []\n\nenv:\n  PYTHON_VERSION: "3.14"\n  PYTHON_VERSION: "3.15"\n\njobs: {}\n'
+        with self.assertRaises(sync_module.SyncError):
+            checker.current_series(two)
+        with self.assertRaises(sync_module.SyncError):
+            checker.current_series("on:\n  schedule: []\n\njobs: {}\n")
+
+        check = (self.ROOT / ".github/workflows/python-version-check.yml").read_text(encoding="utf-8")
+        step = next(
+            (s for s in check.split("\n      - ") if s.startswith("name: Read the pinned version")),
+            None,
+        )
+        self.assertIsNotNone(step, "the step that reads the pinned version is gone")
+        body = step or ""
+        guard = body.index("grep -cP")
+        emit = body.index('echo "current=')
+        self.assertLess(guard, emit, "the count must be checked before the output is written")
+        self.assertIn('!= "1" ', body, "the step must accept exactly one PYTHON_VERSION line")
+
+    def test_the_sync_inputs_cannot_silently_invert(self):
+        """Three gates in the sync job rest entirely on an input's declared type.
+
+        ``${{ inputs.dry_run && '--dry-run' || '' }}`` reads as "pass the flag
+        when asked". That is only true while ``dry_run`` is a boolean. Declare
+        it ``type: string`` and the value becomes the text ``"false"``, which is
+        truthy in a GitHub expression, so ``--dry-run`` is passed on every run
+        and the bot silently stops writing for good. Nothing turns red.
+
+        ``allow_mass_demotion`` inverts the same way, and that direction is
+        worse: the flag would always be present, disabling the guard that stops
+        the bot deleting a large share of the database after an upstream
+        hiccup.
+
+        ``MODE`` is the third. A scheduled run must resolve to pull-request so
+        the nightly bot proposes rather than commits; the manual dropdown is the
+        only way to reach commit mode. Losing the ``github.event_name`` half of
+        that expression would let a scheduled run write straight to the default
+        branch.
+
+        All three are one-line expressions with no test of their own, and a
+        wrong one produces a green run that does the opposite of what it says.
+        """
+        workflow = (self.ROOT / ".github/workflows/sync-vorobey-hackerpolice.yml").read_text(encoding="utf-8")
+
+        for name, declared in (("dry_run", "boolean"), ("allow_mass_demotion", "boolean")):
+            self.assertRegex(
+                workflow,
+                rf"\n      {name}:\n(?:        [^\n]*\n)*?        type: {declared}\n",
+                f"{name} must stay type: {declared} -- a string makes its flag always-on",
+            )
+            self.assertIn(
+                f"${{{{ inputs.{name} && '--",
+                workflow,
+                f"{name}'s flag must stay conditional on the input",
+            )
+
+        self.assertRegex(
+            workflow,
+            r"\n      mode:\n(?:        [^\n]*\n)*?        type: choice\n",
+            "mode must stay a choice so only the listed modes are reachable",
+        )
+        self.assertIn(
+            "MODE: ${{ github.event_name == 'schedule' && 'pull-request' || inputs.mode }}",
+            workflow,
+            "a scheduled run must be forced into pull-request mode",
+        )
+
+    def test_a_dry_run_of_the_version_check_publishes_nothing(self):
+        """Every step that writes to GitHub must be gated on ``!inputs.dry_run``.
+
+        This breaks silently in two opposite directions and neither is visible
+        in a diff. Declaring the input as ``type: string`` makes
+        ``inputs.dry_run`` the text ``"false"``; a non-empty string is truthy in
+        a GitHub expression, so ``!inputs.dry_run`` is false and the pull
+        request never opens -- every run looks clean and publishes nothing.
+        Dropping the guard from one step is the mirror image: a dry run quietly
+        opens a real pull request against the default branch.
+
+        The checker's own tests never read this file -- they exercise the Python
+        that decides, not the YAML that acts on the decision -- so without this
+        the whole dry-run promise rests on a comment.
+        """
+        check = (self.ROOT / ".github/workflows/python-version-check.yml").read_text(encoding="utf-8")
+
+        self.assertRegex(
+            check,
+            r"\n      dry_run:\n(?:        [^\n]*\n)*?        type: boolean\n",
+            "dry_run must be declared type: boolean -- a string inverts every guard below",
+        )
+
+        steps = [step for step in check.split("\n      - ") if step.startswith("name: ")]
+        self.assertGreaterEqual(len(steps), 10, "the workflow stopped parsing into steps")
+        writers = [
+            step
+            for step in steps
+            if "peter-evans/create-pull-request@" in step or re.search(r"^\s*git push\b", step, re.MULTILINE)
+        ]
+        self.assertEqual(len(writers), 2, "expected exactly the pull request and its push fallback")
+
+        for step in writers:
+            title = step.split("\n", 1)[0]
+            condition = next((line for line in step.split("\n") if line.strip().startswith("if:")), "")
+            self.assertIn("!inputs.dry_run", condition, f"{title} can publish during a dry run")
+            self.assertIn(
+                "steps.check.outputs.upgrade == 'true'",
+                condition,
+                f"{title} would run without an upgrade to publish",
+            )
 
     def test_shipped_snapshot_is_a_usable_hackerpolice_list(self):
         snapshot = load_snapshot(self.ROOT / "snapshot" / "playerlist.vorobey-hackerpolice.json")

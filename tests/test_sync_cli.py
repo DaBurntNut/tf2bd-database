@@ -709,6 +709,26 @@ class UnusableStdoutTests(unittest.TestCase):
         (self.root / "up.json").write_text(dumps({"players": [player("[U:1:1]", ["cheater"])]}), encoding="utf-8")
         (self.root / "db.json").write_text(dumps({"players": [player("[U:1:1]", ["suspicious"])]}), encoding="utf-8")
 
+    def test_the_parser_is_built_without_consulting_stdout(self):
+        """Python 3.14 reads stdout inside ArgumentParser.__init__.
+
+        It colourizes help and error text, and decides whether to by calling
+        ``os.isatty(sys.stdout.fileno())``. A stdout that cannot answer raises
+        there -- in ``build_parser()``, upstream of the suppressed ``print``
+        that is supposed to make a dead stdout survivable, and upstream of
+        every write. The guard sets PYTHON_COLORS, which is checked before the
+        stream is, so the question is never asked.
+
+        Pinned as an ordering test because that is the part a refactor breaks:
+        moving the guard below ``build_parser()`` restores the crash on 3.14
+        and changes nothing anywhere else.
+        """
+        source = Path(sync_module.__file__).read_text(encoding="utf-8")
+        body = source[source.index("\ndef main(") :]
+        guard = body.index("_force_plain_output()")
+        parser = body.index("build_parser()")
+        self.assertLess(guard, parser, "the colour guard must run before the parser is built")
+
     def test_a_closed_stdout_still_lets_the_database_and_report_be_written(self):
         stdout = io.StringIO()
         stdout.close()  # Every write raises ValueError, as a closed fd 1 does on flush.

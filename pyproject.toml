@@ -1,4 +1,7 @@
-# Tooling config only; runtime scripts support Python 3.10+.
+# Tooling config only. The scripts run on the ONE Python version the workflow
+# pins (PYTHON_VERSION in .github/workflows/sync-vorobey-hackerpolice.yml).
+# ruff's target-version below tracks that number as a floor -- see the note
+# above it before changing either.
 
 # Versions of the tools configured below, so a tool's settings and its version
 # live in one file. Dependabot owns this table (see .github/dependabot.yml) and
@@ -9,17 +12,27 @@ ci = [
     "ruff==0.17.6",
     "mypy==2.4.1",
     "bandit==1.9.4",
-    # Held back deliberately: coverage 7.17.0 raised its floor to Python 3.11
-    # while the matrix still tests 3.10, and there is no 7.16.3, so 7.16.2 is
-    # the last installable release. dependabot.yml ignores >=7.17.0 for this
-    # reason; drop that ignore when the 3.10 leg retires.
-    "coverage==7.16.2",
+    "coverage==7.17.5",
     "vulture==2.16",
 ]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+# The formatting FLOOR: the oldest Python this source must stay parseable by.
+# Not a runtime setting -- PYTHON_VERSION in the sync workflow decides what
+# actually executes. The monthly version check never edits this line.
+#
+# Keep this at or BELOW PYTHON_VERSION, never above. Below is harmless: ruff
+# merely withholds newer-syntax rewrites. Above is a live bug -- ruff and the
+# formatter would approve syntax the runtime cannot parse, so every check here
+# could pass while the bot died on import.
+#
+# At py314 the formatter writes PEP 758's ``except A, B:`` in two files
+# (sources.py, sync_vorobey_hackerpolice.py). No Python below 3.14 can parse
+# that, which is intended: the bot targets 3.14+ and CI runs only 3.14. Rolling
+# a future bump BACK (3.15 -> 3.14) is unaffected. Dropping PYTHON_VERSION below
+# 3.14 is the one move that now needs those two lines parenthesized again first.
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "PIE", "RUF"]
@@ -33,7 +46,7 @@ ignore = [
 "tests/*" = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["playerlist", "sources", "policy", "report", "sync_vorobey_hackerpolice"]
+known-first-party = ["playerlist", "sources", "policy", "report", "sync_vorobey_hackerpolice", "python_version_check"]
 
 # mypy is the type checker CI runs; a second, unenforced config would only drift.
 [tool.mypy]

@@ -123,13 +123,41 @@ def http_scheme(value: str) -> str:
     return scheme if scheme in {"http", "https"} else ""
 
 
+# Headers that authenticate the caller and must never follow a redirect to a
+# different host. ``urllib`` copies every header onto the new request, unlike
+# ``requests`` and ``curl``, which drop these as soon as the host changes.
+_CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie", "cookie2"})
+
+
+def _same_host(first: str, second: str) -> bool:
+    """Whether two URLs address the same host and port (scheme is HTTPS for both)."""
+    one, two = urllib.parse.urlparse(first), urllib.parse.urlparse(second)
+    try:
+        # A malformed port raises rather than comparing unequal.
+        ports = (one.port or 443, two.port or 443)
+    except ValueError:
+        return False
+    # ``hostname`` is already lower-cased by urlparse (unlike ``netloc``), so
+    # the comparison is case-insensitive without folding it again here.
+    return (one.hostname or "") == (two.hostname or "") and ports[0] == ports[1]
+
+
 class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Follow redirects, but never downgrade an HTTPS fetch to plain HTTP.
+    """Follow redirects, but never downgrade, and never carry credentials off-host.
 
     ``urllib`` happily follows an ``https://`` -> ``http://`` redirect, which
     would let anything on the network path swap the list we are about to
     snapshot (and act on: promotions come from this file). Refusing the
     downgrade keeps every fetched byte HTTPS-protected end to end.
+
+    It also copies every request header onto the redirected request, including
+    ``Authorization``. A redirect may legitimately leave the host GitHub blob
+    downloads land on ``objects.githubusercontent.com`` and other storage
+    hosts, so the target cannot be restricted without breaking the fetch; what
+    can be restricted is what travels with it. The fetch sends no credentials
+    today, so this changes nothing now -- it is here so that adding a token
+    later (for the API rate limit, the obvious next step) cannot silently hand
+    that token to whatever host a redirect names.
     """
 
     def redirect_request(
@@ -144,8 +172,16 @@ class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         if len(newurl) > _MAX_URL_PARSE_CHARS:
             raise SyncError(f"refusing to follow a redirect longer than {_MAX_URL_PARSE_CHARS:,} characters")
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and urllib.parse.urlparse(new.full_url).scheme != "https":
+        if new is None:
+            return None
+        if urllib.parse.urlparse(new.full_url).scheme != "https":
             raise SyncError(f"refusing to follow a non-HTTPS redirect to {redact_url(newurl)}")
+        if not _same_host(req.full_url, new.full_url):
+            # ``urllib`` capitalizes header names ("Proxy-authorization"), so
+            # match case-insensitively rather than by the name as written.
+            for name in [*new.headers, *new.unredirected_hdrs]:
+                if name.lower() in _CREDENTIAL_HEADERS:
+                    new.remove_header(name)
         return new
 
 
@@ -992,7 +1028,7 @@ def _unwrap_github_contents_envelope(document: dict[str, Any]) -> bytes | None:
         # Accept GitHub's MIME-style wrapping, but reject every non-Base64 character.
         compact = content.translate(str.maketrans("", "", " \t\r\n"))
         decoded = base64.b64decode(compact, validate=True)
-    except (binascii.Error, ValueError):
+    except binascii.Error, ValueError:
         return None
     # The Contents API omits large file content; try download_url or the Git Blob endpoint.
     return decoded or None

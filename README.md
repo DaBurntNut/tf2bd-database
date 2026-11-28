@@ -224,10 +224,15 @@ python3 -X warn_default_encoding -W error::EncodingWarning -m coverage run -m un
 python3 -m coverage report
 ```
 
-Python 3.10 or newer. CI checks both 3.10 and 3.12, the version the sync job runs
-on. The five scripts use nothing newer than 3.8, so 3.10 is a supported floor
-rather than a hard requirement — the 3.10 leg is what keeps an accidental 3.11+
-API out of the code that a smaller machine might still be running.
+Python 3.14 — one version, used by both the checks and the sync job, pinned as
+`PYTHON_VERSION` in the workflow. Nothing here is published as a library, so
+there is no older runtime to support: the scripts only ever run on GitHub
+Actions, and the file people download is `playerlist.garou3299.json`.
+
+That version is not bumped by hand. `.github/workflows/python-version-check.yml`
+runs monthly and opens a pull request only when **every** tool pinned in
+`pyproject.toml` declares support for a newer series, so an upgrade can never
+land ahead of the tools that have to check it.
 
 The interface (`--help` prints the long version):
 

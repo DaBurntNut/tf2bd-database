@@ -320,11 +320,17 @@ class ReportTests(unittest.TestCase):
             return len(_UNESCAPED_PIPE.findall(line)) - 1
 
         header_cells = None
+        compared = 0
         for line in report.splitlines():
             if line.startswith("| SteamID |"):
                 header_cells = cells(line)
             elif line.startswith("| `["):
                 self.assertEqual(cells(line), header_cells, line)
+                compared += 1
+        # Without this the test passes on a report that renders no rows at all:
+        # every assertion above lives inside the loop. Three changes went in, so
+        # three rows must have come back out.
+        self.assertEqual(compared, 3, "expected a row per change; the table lost rows")
 
     def test_unusable_steamid_renders_name_without_a_link(self):
         changes = (Change(steamid="nope", name="someone", before=("suspicious",), after=("cheater",)),)
@@ -2333,6 +2339,32 @@ class RenderMemoTests(unittest.TestCase):
             changes=(Change("[U:1:1]", "name", ("suspicious",), ("cheater",), evidence=("https://e.invalid/1",)),),
         )
         render_report(info)
+        self.assertEqual(report_module._EVIDENCE_STATUS_CACHE, {})
+
+    def test_a_render_that_does_not_finish_leaves_no_proof_text_either(self):
+        """The memo must be emptied on the way out, however the render ends.
+
+        Clearing it on the last line only honours the promise when nothing goes
+        wrong, and "nothing went wrong" is the case that does not need the
+        promise. Ctrl-C between the two renders -- the sync handles an interrupt
+        and exits 130 -- used to leave every proof link of a half-built report
+        sitting in a module global.
+        """
+        info = RunInfo(
+            database_path=Path("playerlist.garou3299.json"),
+            source="https://example.invalid/list.json",
+            source_total=1,
+            source_skipped=0,
+            dry_run=False,
+            changes=(Change("[U:1:1]", "name", ("suspicious",), ("cheater",), evidence=("https://e.invalid/1",)),),
+        )
+        report_module._EVIDENCE_STATUS_CACHE.clear()
+        # Raise after the first render has populated the memo, not before.
+        with (
+            mock.patch.object(report_module, "_utf8_len", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            render_report(info)
         self.assertEqual(report_module._EVIDENCE_STATUS_CACHE, {})
 
 
