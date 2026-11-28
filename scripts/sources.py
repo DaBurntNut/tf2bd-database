@@ -1028,7 +1028,7 @@ def _unwrap_github_contents_envelope(document: dict[str, Any]) -> bytes | None:
         # Accept GitHub's MIME-style wrapping, but reject every non-Base64 character.
         compact = content.translate(str.maketrans("", "", " \t\r\n"))
         decoded = base64.b64decode(compact, validate=True)
-    except (binascii.Error, ValueError):
+    except binascii.Error, ValueError:
         return None
     # The Contents API omits large file content; try download_url or the Git Blob endpoint.
     return decoded or None

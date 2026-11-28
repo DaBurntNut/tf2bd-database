@@ -507,8 +507,12 @@ class WorkflowContractTests(unittest.TestCase):
     # equals PYTHON_VERSION above. Reading a maintainer-owned file would make a
     # lint setting able to fail the checks, and the sync job is gated on them --
     # see test_no_test_reads_a_file_the_bot_does_not_need for the outage that
-    # rule came from. The coupling is a comment in both files instead; drifting
-    # costs a lint suggestion, never a missed day of publishing.
+    # rule came from. The coupling is a comment in both files instead.
+    #
+    # target-version is a floor, so the two drift safely in one direction only:
+    # raising PYTHON_VERSION above it costs nothing, while dropping PYTHON_VERSION
+    # below it leaves source the runtime cannot parse. The note in pyproject.toml
+    # spells that out at the line itself, where anyone editing it will read it.
 
     def test_the_suite_does_not_inherit_the_runners_output_file(self):
         """GITHUB_OUTPUT is exported by every CI step, including the test step.

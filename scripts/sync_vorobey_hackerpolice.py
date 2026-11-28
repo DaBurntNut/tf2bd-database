@@ -397,7 +397,7 @@ def _same_file(first: Path, second: Path) -> bool:
         if first.resolve() == second.resolve():
             return True
         return first.exists() and second.exists() and first.samefile(second)
-    except (OSError, ValueError, RuntimeError):
+    except OSError, ValueError, RuntimeError:
         # Treat path-resolution failures as non-aliases; later file operations report unusable paths.
         return False
 

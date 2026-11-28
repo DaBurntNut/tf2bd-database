@@ -1,6 +1,6 @@
 # Tooling config only. The scripts run on the ONE Python version the workflow
 # pins (PYTHON_VERSION in .github/workflows/sync-vorobey-hackerpolice.yml).
-# ruff's target-version below is deliberately NOT that number -- see the note
+# ruff's target-version below tracks that number as a floor -- see the note
 # above it before changing either.
 
 # Versions of the tools configured below, so a tool's settings and its version
@@ -18,19 +18,21 @@ ci = [
 
 [tool.ruff]
 line-length = 120
-# Deliberately BEHIND PYTHON_VERSION in the sync workflow, and the monthly
-# version check never edits this line.
+# The formatting FLOOR: the oldest Python this source must stay parseable by.
+# Not a runtime setting -- PYTHON_VERSION in the sync workflow decides what
+# actually executes. The monthly version check never edits this line.
 #
-# Matching it to the runtime looks tidier and quietly costs the rollback. At
-# py314 the formatter rewrites ``except (A, B):`` into PEP 758's ``except A, B:``
-# in two files, and no earlier Python can parse that -- so dropping
-# PYTHON_VERSION back after a bad upgrade would need a reformat first, exactly
-# when the priority is getting the bot publishing again. Staying below 3.14
-# keeps the source parseable by the runtime it might have to return to.
+# Keep this at or BELOW PYTHON_VERSION, never above. Below is harmless: ruff
+# merely withholds newer-syntax rewrites. Above is a live bug -- ruff and the
+# formatter would approve syntax the runtime cannot parse, so every check here
+# could pass while the bot died on import.
 #
-# This is a formatting floor, NOT a support claim: nothing promises the scripts
-# run on 3.13. It costs a few modernization suggestions and nothing else.
-target-version = "py313"
+# At py314 the formatter writes PEP 758's ``except A, B:`` in two files
+# (sources.py, sync_vorobey_hackerpolice.py). No Python below 3.14 can parse
+# that, which is intended: the bot targets 3.14+ and CI runs only 3.14. Rolling
+# a future bump BACK (3.15 -> 3.14) is unaffected. Dropping PYTHON_VERSION below
+# 3.14 is the one move that now needs those two lines parenthesized again first.
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "PIE", "RUF"]
